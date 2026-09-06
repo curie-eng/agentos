@@ -626,23 +626,77 @@ class ApprovalGate:
         # blocked call in the same turn must still assert that the runner asked
         # for a stop. Do not tidy this back inside the guard below.
         self.pending_halt = True
-        if self.pending_summary is None:
-            if tool_name == PUBLISH_TOOL_NAME:
-                title = tool_input.get("title")
-                body = tool_input.get("body", "")
-                if not isinstance(title, str) or not title.strip() or len(title) > 240:
-                    raise ValueError("publication title must be 1-240 characters")
-                if not isinstance(body, str) or len(body) > 65_536:
-                    raise ValueError("publication body must be at most 65536 characters")
-                self.publication_title = title.strip()
-                self.publication_body = body
-            self.pending_summary = summarize_tool_call(tool_name, tool_input)
-            self.pending_route = self.route_by_tool.get(tool_name)
-            # Provenance for the permission gate (#544, Decision C): the tool
-            # name here is the value ``can_use_tool`` itself denied -- the
-            # trusted grant target, never derived from the summary string.
-            self.pending_gate_kind = "permission"
-            self.pending_granted_tool = tool_name
+        self._record_pending(tool_name, tool_input)
+
+    def _record_pending(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+        """Write the first pending record of the turn; report whether it wrote.
+
+        Extracted from ``block`` so the stream-side observer
+        (``observe_publication``, #2294) writes the IDENTICAL record a denying
+        gate layer writes -- the worker recognizes a publication by exactly this
+        runner-stamped provenance pair (``pending_gate_kind='permission'`` plus
+        ``pending_granted_tool``), so two spellings of it would be two
+        behaviors. It does NOT touch ``pending_halt``: asking the CLI to stop is
+        the caller's decision, not the record's.
+
+        Returns False when a record already stands (first-block-wins), True when
+        this call created it. Raises ``ValueError`` on a malformed publication
+        proposal, before anything is recorded.
+        """
+
+        if self.pending_summary is not None:
+            return False
+        if tool_name == PUBLISH_TOOL_NAME:
+            title = tool_input.get("title")
+            body = tool_input.get("body", "")
+            if not isinstance(title, str) or not title.strip() or len(title) > 240:
+                raise ValueError("publication title must be 1-240 characters")
+            if not isinstance(body, str) or len(body) > 65_536:
+                raise ValueError("publication body must be at most 65536 characters")
+            self.publication_title = title.strip()
+            self.publication_body = body
+        self.pending_summary = summarize_tool_call(tool_name, tool_input)
+        self.pending_route = self.route_by_tool.get(tool_name)
+        # Provenance for the permission gate (#544, Decision C): the tool
+        # name here is the value ``can_use_tool`` itself denied -- the
+        # trusted grant target, never derived from the summary string.
+        self.pending_gate_kind = "permission"
+        self.pending_granted_tool = tool_name
+        return True
+
+    def observe_publication(self, tool_input: dict[str, Any]) -> bool:
+        """Record a publication request the runner saw on the STREAM (#2294).
+
+        The runner's own observer of a publication call, alongside the
+        PreToolUse hook (#1852) and ``can_use_tool`` (#245) rather than behind
+        them. Against the real SDK the stream reaches the session loop BEFORE
+        the CLI dispatches PreToolUse (observed live, #2294), so this is
+        normally the FIRST writer of the record and the hook's ``block`` then
+        finds it standing and only adds the halt marker; the fake tier inverts
+        that order, and there this call is the duplicate. It replaces neither
+        layer -- both still DECIDE the call, which this never does.
+
+        What it closes is the case where NEITHER layer recorded the call (a
+        hook that raised is reported and the call proceeds; a concurrently
+        dispatched bundle hook; an input shape a layer abstains on): the stream
+        still carries the ``ToolUseBlock``, and without this the turn finalizes
+        DONE with nothing for a human to approve.
+
+        It can only ever RECORD or raise -- it never returns an allow decision
+        and never mints a grant, so it cannot widen authority: ``safe_grant_tool``
+        already refuses a sandbox grant for the publish tool, and a second call
+        blocks again. It deliberately leaves ``pending_halt`` False: the runner
+        did not ask the CLI to stop this turn, and claiming otherwise would
+        relabel an unrelated failure as awaiting-approval.
+
+        Returns True when it created the pending record, False when one already
+        stands (an earlier call this turn, or a gate layer that got there first
+        on the fake tier -- exactly one record per turn either way). Raises
+        ``ValueError`` on a malformed title/body, identically to ``block``; the
+        session turns that into a fail-closed classified failure.
+        """
+
+        return self._record_pending(PUBLISH_TOOL_NAME, tool_input)
 
 
 class _GateDecision(NamedTuple):

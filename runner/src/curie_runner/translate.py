@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 from aci_protocol import (
     ErrorEvent,
@@ -38,7 +39,7 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
+from .approval import APPROVAL_TOOL_NAME, PUBLISH_TOOL_NAME, guard_reserved_summary
 from .otel import _GenerationSpan
 from .side_effects import SideEffectClassifier
 
@@ -106,6 +107,26 @@ class TurnState:
     # reported as errored *because we interrupted it*, instead of reporting a
     # failure with nothing to approve.
     approval_halt_requested: bool = False
+    # The raw ``ToolUseBlock.input`` of every publication call seen on the
+    # stream this turn (#2294), in call order. Captured here, decided in
+    # ``SessionRunner._observe_publication_calls``: this module stays pure and
+    # never touches the ApprovalGate, so the same seam serves the live turn and
+    # the offline fake. Not a rare path: against the real SDK the stream reaches
+    # the session before the CLI dispatches PreToolUse, so this list is what
+    # normally writes the record first and the hook's own block then finds it
+    # standing. It is load-bearing for the case where neither SDK layer recorded
+    # the call at all and the turn would otherwise finalize DONE with nothing to
+    # approve.
+    publication_calls: list[dict[str, Any]] = field(default_factory=list)
+    # How many of ``publication_calls`` the session has already acted on, so the
+    # observation runs exactly once per call even though it is invoked on every
+    # message of the turn.
+    publication_calls_observed: int = 0
+    # Why a publication call could NOT be recorded (a malformed proposal, or a
+    # gate that does not carry the publish tool). Runner-internal, never a wire
+    # field: the session turns it into a fail-closed classified failure, because
+    # a publication the runner cannot record must not look like a clean turn.
+    publication_unrecorded: str | None = None
 
 
 def translate_message(
@@ -172,6 +193,13 @@ def _translate_assistant(
                 # The SDK block says only that a tool interval should be
                 # inferred. It is not proof this runner executed the tool.
                 gen.tool_use(block.id, block.name)
+            if block.name == PUBLISH_TOOL_NAME:
+                # Wire-level capture only (#2294). The session decides what to
+                # do with it; recording it here would put gate state in a
+                # deliberately pure module.
+                state.publication_calls.append(
+                    block.input if isinstance(block.input, dict) else {}
+                )
             if block.name == APPROVAL_TOOL_NAME:
                 # A policy gate fired (ADR-0010). Capture the summary (and the
                 # optional route, #247) at the wire level so the real path

@@ -9,6 +9,7 @@ course, and turn 2 shows a warm prompt cache
 A third live test covers the OpenRouter path, gated on ``OPENROUTER_API_KEY``.
 """
 
+import logging
 import os
 
 import anyio
@@ -16,6 +17,15 @@ import pytest
 from aci_protocol import Event, SessionStatus, parse_ndjson
 from curie_runner import RunTracer, SideEffectClassifier, build_options
 from curie_runner.adapter import ClaudeAgentSession
+from curie_runner.approval import (
+    APPROVAL_SERVER_NAME,
+    PUBLISH_TOOL_NAME,
+    ApprovalGate,
+    build_approval_gate,
+    build_approval_hook,
+    build_approval_server,
+    build_can_use_tool,
+)
 from curie_runner.session import SessionRunner
 
 _HAS_CRED = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"))
@@ -179,8 +189,6 @@ def test_live_permission_gate_pauses_awaiting_approval() -> None:
     approval-required is intercepted by can_use_tool (never executed) and the
     turn ends awaiting-approval with the blocked call in the summary."""
 
-    from curie_runner.approval import ApprovalGate, build_can_use_tool
-
     gate = ApprovalGate(required=frozenset({"Bash"}))
     options = build_options(
         plugins=[],
@@ -230,3 +238,170 @@ def test_live_permission_gate_pauses_awaiting_approval() -> None:
     # The blocked command never executed and never produced output text
     # claiming it ran; the summary records what WOULD have run.
     assert "echo curie-gate-live" in final.approval_summary
+
+
+# --- the managed-workspace publication gate on a real model (#2294) --------------
+#
+# Both tests mount the in-process ``curie`` MCP server carrying
+# ``publish_changes`` and ask the model to call it. They differ ONLY in whether
+# the two SDK-level gate layers are wired, which is exactly the difference
+# between the production shape and the live run that lost its approval record.
+
+
+def _live_model_and_env() -> tuple[str | None, dict[str, str] | None]:
+    """The model/env pair for a live run, preferring the OpenRouter path.
+
+    Mirrors ``test_live_openrouter_cache_reuse``: the OpenRouter key is fed
+    through ``resolve_model_credential`` into the SDK ``env`` exactly as the
+    runner does in production. With only an Anthropic credential present, the
+    ambient credential and default model are used instead.
+    """
+
+    from curie_runner.sdk_auth import CREDENTIALS_ENV, resolve_model_credential
+
+    if _OPENROUTER_KEY:
+        env: dict[str, str] = {CREDENTIALS_ENV: _OPENROUTER_KEY}
+        resolve_model_credential(env)
+        return os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5"), env
+    return None, None
+
+
+_PUBLISH_PROMPT = (
+    "You are working in a git checkout and the change is finished. Call the"
+    " mcp__curie__publish_changes tool exactly once with title 'Live gate check'"
+    " and a one-sentence body, then end your turn and say the request is pending."
+)
+
+_PUBLISH_SYSTEM_PROMPT = (
+    "You are a terse test agent. When asked to publish changes, use the"
+    " mcp__curie__publish_changes tool. Do not use any other tool."
+)
+
+
+def _publish_runner(trace_name: str, *, gated: bool) -> tuple[SessionRunner, ApprovalGate]:
+    gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
+    assert gate is not None
+    model, env = _live_model_and_env()
+    options = build_options(
+        plugins=[],
+        model=model,
+        system_prompt=_PUBLISH_SYSTEM_PROMPT,
+        max_turns=6,
+        max_budget_usd=1.0,
+        resume=None,
+        env=env,
+        mcp_servers={
+            APPROVAL_SERVER_NAME: build_approval_server(gate, managed_workspace=True)
+        },
+        # The production shape wires both SDK gate layers; the second test omits
+        # them so the tool body actually executes (permission_mode falls back to
+        # bypassPermissions), which is the live shape that lost its record.
+        hooks=build_approval_hook(gate) if gated else None,
+        can_use_tool=build_can_use_tool(gate) if gated else None,
+    )
+    runner = SessionRunner(
+        session_factory=lambda: ClaudeAgentSession(options),
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name=trace_name,
+        session_id=trace_name,
+        approval_gate=gate,
+    )
+    return runner, gate
+
+
+def _live_publish_lines(runner: SessionRunner) -> list[str]:
+    async def go() -> list[str]:
+        await runner.start()
+        try:
+            return [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text=_PUBLISH_PROMPT, user="U-live", ts="1.0")
+                )
+            ]
+        finally:
+            await runner.close()
+
+    return anyio.run(go)
+
+
+@pytest.mark.skipif(
+    not (_HAS_CRED or _OPENROUTER_KEY),
+    reason="no live credential (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY / OPENROUTER_API_KEY)",
+)
+def test_live_publish_with_both_gate_layers_pauses_awaiting_approval(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """L1, the production shape: hook + can_use_tool wired.
+
+    The publish call is denied before execution, recorded once, and the turn ends
+    awaiting-approval carrying the trusted permission-gate provenance the worker
+    keys the publication path on.
+    """
+
+    runner, gate = _publish_runner("live-publish-gated", gated=True)
+
+    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+        events = parse_ndjson("".join(_live_publish_lines(runner)))
+
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status is SessionStatus.AWAITING_APPROVAL
+    assert final.approval_summary is not None
+    assert PUBLISH_TOOL_NAME in final.approval_summary
+    assert final.approval_gate_kind == "permission"
+    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.publication_title
+    # A gate layer denied the call and asked the CLI to stop the turn.
+    assert gate.pending_halt is True
+    # And therefore no layer missed it. The real SDK streams the ToolUseBlock
+    # BEFORE dispatching the PreToolUse hook, so the stream observer writes the
+    # record first even here -- "who wrote it first" must NOT be what the warning
+    # keys on, or it fires on the fully-gated production path (observed live).
+    assert not any(
+        "fallback" in record.getMessage().lower() for record in caplog.records
+    ), caplog.text
+
+
+@pytest.mark.skipif(
+    not (_HAS_CRED or _OPENROUTER_KEY),
+    reason="no live credential (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY / OPENROUTER_API_KEY)",
+)
+def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """L2, the observed failing shape (#2294): neither gate layer is wired.
+
+    With no hook and no permission callback the session runs bypassPermissions,
+    so the in-process tool body executes and returns its defensive ``is_error``
+    and the turn ends clean. The runner-owned stream observer is then the only
+    thing that can record the pending approval -- before #2294 this finalized
+    DONE with nothing to approve.
+    """
+
+    runner, gate = _publish_runner("live-publish-ungated", gated=False)
+
+    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+        events = parse_ndjson("".join(_live_publish_lines(runner)))
+
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status is SessionStatus.AWAITING_APPROVAL
+    assert final.status is not SessionStatus.DONE
+    assert final.approval_summary is not None
+    assert PUBLISH_TOOL_NAME in final.approval_summary
+    assert final.approval_gate_kind == "permission"
+    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.publication_title
+    # Nothing in this path may claim a halt the runner never requested -- and
+    # that absence is precisely what proves neither gate layer ever denied it.
+    assert gate.pending_halt is False
+    # So the operator-visible warning MUST fire here: a layer that was supposed
+    # to decide did not.
+    assert any(
+        "publication" in record.getMessage().lower()
+        and "fallback" in record.getMessage().lower()
+        for record in caplog.records
+    ), caplog.text
