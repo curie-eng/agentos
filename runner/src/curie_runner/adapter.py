@@ -21,10 +21,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
+import anyio
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
+    ResultMessage,
     SdkPluginConfig,
     StreamEvent,
     TaskBudget,
@@ -32,6 +34,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import CanUseTool, McpSdkServerConfig, PermissionMode
 
 _ALLOWED_PARTIAL_BOUNDARY_TYPES = frozenset(("message_start", "content_block_start"))
+_RESPONSE_DRAIN_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,10 @@ class StreamedToolUseBoundary:
     call_id: str = field(repr=False)
     tool_name: str
     observed_time_ns: int
+
+
+class SessionQueryBusy(RuntimeError):
+    """A query already owns admission; callers must not queue a stale steer."""
 
 
 class ModelSession(Protocol):
@@ -147,49 +154,88 @@ class ClaudeAgentSession:
     def __init__(self, options: ClaudeAgentOptions) -> None:
         self._options = options
         self._client = ClaudeSDKClient(options)
+        self._response_unfinished = False
+        self._query_lock = anyio.Lock()
 
     async def connect(self) -> None:
         await self._client.connect()
+        self._response_unfinished = False
+        self._query_lock = anyio.Lock()
 
     async def query(self, text: str) -> None:
-        await self._client.query(text)
+        # Never queue a steer behind another query's interrupted-response drain.
+        # That owning turn can fail while we wait, leaving a stale submission
+        # whose response would otherwise be consumed by a later turn.
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        try:
+            self._query_lock.acquire_nowait()
+        except anyio.WouldBlock:
+            raise SessionQueryBusy("SDK query admission is already owned") from None
+        try:
+            if self._response_unfinished:
+                # interrupt() leaves the old ResultMessage in the SDK buffer. Drain
+                # only a reader that was abandoned, never the active reader used by
+                # ordinary steering. Do not submit another query until its terminal
+                # boundary is known; a missing/failed boundary remains retryable.
+                # https://code.claude.com/docs/en/agent-sdk/python#example-using-interrupts
+                try:
+                    with anyio.fail_after(_RESPONSE_DRAIN_TIMEOUT_S):
+                        response = cast("Any", self._client.receive_response())
+                        async with contextlib.aclosing(response):
+                            async for message in response:
+                                if isinstance(message, ResultMessage):
+                                    self._response_unfinished = False
+                                    break
+                except Exception:
+                    raise RuntimeError("interrupted SDK response did not settle") from None
+                if self._response_unfinished:
+                    raise RuntimeError("interrupted SDK response ended without a result")
+            await self._client.query(text)
+        finally:
+            self._query_lock.release()
 
     def receive_turn(self) -> AsyncIterator[Any]:
         async def normalized() -> AsyncIterator[Any]:
             response = cast("Any", self._client.receive_response())
-            async with contextlib.aclosing(response):
-                async for message in response:
-                    if isinstance(message, StreamEvent):
-                        event = message.event
-                        event_type = (
-                            event.get("type") if isinstance(event, dict) else None
-                        )
-                        if event_type == "content_block_start":
-                            content_block = event.get("content_block")
-                            if isinstance(content_block, dict):
-                                call_id = content_block.get("id")
-                                tool_name = content_block.get("name")
-                                if (
-                                    content_block.get("type") == "tool_use"
-                                    and isinstance(call_id, str)
-                                    and call_id
-                                    and isinstance(tool_name, str)
-                                    and tool_name
-                                ):
-                                    yield StreamedToolUseBoundary(
-                                        call_id=call_id,
-                                        tool_name=tool_name,
-                                        observed_time_ns=time.time_ns(),
-                                    )
-                                    continue
-                        if event_type in _ALLOWED_PARTIAL_BOUNDARY_TYPES:
-                            # Do not forward the StreamEvent object: its event body,
-                            # uuid, SDK session id, and parent tool id are all
-                            # provider payload. Only this bounded type survives the
-                            # adapter seam into session telemetry.
-                            yield PartialMessageBoundary(event_type=event_type)
-                        continue
-                    yield message
+            finished = False
+            try:
+                async with contextlib.aclosing(response):
+                    async for message in response:
+                        if isinstance(message, ResultMessage):
+                            finished = True
+                        if isinstance(message, StreamEvent):
+                            event = message.event
+                            event_type = (
+                                event.get("type") if isinstance(event, dict) else None
+                            )
+                            if event_type == "content_block_start":
+                                content_block = event.get("content_block")
+                                if isinstance(content_block, dict):
+                                    call_id = content_block.get("id")
+                                    tool_name = content_block.get("name")
+                                    if (
+                                        content_block.get("type") == "tool_use"
+                                        and isinstance(call_id, str)
+                                        and call_id
+                                        and isinstance(tool_name, str)
+                                        and tool_name
+                                    ):
+                                        yield StreamedToolUseBoundary(
+                                            call_id=call_id,
+                                            tool_name=tool_name,
+                                            observed_time_ns=time.time_ns(),
+                                        )
+                                        continue
+                            if event_type in _ALLOWED_PARTIAL_BOUNDARY_TYPES:
+                                # Do not forward the StreamEvent object: its event body,
+                                # uuid, SDK session id, and parent tool id are all
+                                # provider payload. Only this bounded type survives the
+                                # adapter seam into session telemetry.
+                                yield PartialMessageBoundary(event_type=event_type)
+                            continue
+                        yield message
+            finally:
+                self._response_unfinished = not finished
 
         return normalized()
 
