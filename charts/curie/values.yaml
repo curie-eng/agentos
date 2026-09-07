@@ -610,15 +610,15 @@ clickhouse:
 sealing:
   privateKey: ""
   # BYO secret (issue #1759, the same idiom every backing store and
-  # api.githubAppExistingSecret use). Wins over privateKey when set. Not yet
-  # preserved by a plain `curie cluster up` (issue #1801) -- until that lands,
-  # re-supply it (or keep it declared in your values file) on every upgrade.
+  # api.githubAppExistingSecret use). Wins over privateKey when set. A plain
+  # `curie cluster up` preserves the reference and key without generating an
+  # unused chart private key (#1801).
   privateKeyExistingSecret: ""
   privateKeyExistingSecretKey: sealingPrivateKey
   # Set only during a rotation, so values sealed to the old key keep opening
   # while repositories are resealed. Remove it once every repository is resealed.
   previousPrivateKey: ""
-  # Same BYO escape and preservation caveat as privateKeyExistingSecret above.
+  # Same BYO escape and upgrade preservation as privateKeyExistingSecret above.
   previousPrivateKeyExistingSecret: ""
   previousPrivateKeyExistingSecretKey: sealingPreviousPrivateKey
 
@@ -1074,10 +1074,9 @@ api:
   # opening-message repository selections.
   githubRepoAllowlist: []
   # BYO secret (issue #1759, the same idiom githubAppExistingSecret below
-  # uses). Wins over githubToken when set. Not yet preserved by a plain
-  # `curie cluster up` (issue #1801) -- until that lands, re-supply it (or keep
-  # it declared in your values file) on every upgrade, same as any other
-  # values key the CLI does not manage.
+  # uses). Wins over githubToken when set. A plain `curie cluster up`
+  # preserves the reference and key; an explicit inline replacement or
+  # --clear-github-token clears the recorded external source (#1801).
   githubTokenExistingSecret: ""
   githubTokenExistingSecretKey: githubToken
   # GitHub App identity (ADR-0092). The scalable alternative to githubToken
@@ -1279,10 +1278,9 @@ dispatcher:
     # uses), one per token. Each wins over its plain value when set. curie.
     # dispatcher.enabled treats a token as present whether it arrives as the
     # plain value or via its existingSecret, so a dispatcher configured
-    # entirely through BYO Secrets still deploys. Not yet preserved by a plain
-    # `curie cluster up` (issue #1801) -- `curie cluster comms` does not know
-    # about these fields yet, so re-supply them (or keep them declared in your
-    # values file) on every upgrade.
+    # entirely through BYO Secrets still deploys. A plain `curie cluster up`
+    # preserves these references and keys; `curie cluster comms` clears the
+    # app and bot token references when replacing or disconnecting them (#1801).
     appTokenExistingSecret: ""
     appTokenExistingSecretKey: slackAppToken
     botToken: ""
@@ -1785,9 +1783,8 @@ worker:
   # BYO secret (issue #1759, the same idiom githubAppExistingSecret uses).
   # Wins over adapterCredentials when set -- the referenced key must hold the
   # already-JSON-encoded slug -> secret map, not a YAML map, since the chart
-  # never re-serializes a BYO Secret's contents. Not yet preserved by a plain
-  # `curie cluster up` (issue #1801) -- re-supply it (or keep it declared in
-  # your values file) on every upgrade.
+  # never re-serializes a BYO Secret's contents. A plain `curie cluster up`
+  # preserves the reference and key alongside the typed worker map (#1801).
   adapterCredentialsExistingSecret: ""
   adapterCredentialsExistingSecretKey: adapterCredentials
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
@@ -2045,10 +2042,9 @@ agentSandbox:
     # BYO secret (issue #1759, the same idiom githubAppExistingSecret uses),
     # for the credential that authorizes the model provider -- the most
     # sensitive value most installs carry. Wins over credentials when set.
-    # Not yet preserved by a plain `curie cluster up` (issue #1801) --
-    # `cluster up --credentials`/CURIE_MODEL_CREDENTIALS re-supply the plain
-    # value across upgrades but do not yet know about this field, so
-    # re-supply it (or keep it declared in your values file) on every upgrade.
+    # A plain `curie cluster up` preserves the reference and key. An explicit
+    # inline credential, fake model, or local model replaces the recorded
+    # external credential source (#1801).
     credentialsExistingSecret: ""
     credentialsExistingSecretKey: agentCredentials
     pluginDir: /unused

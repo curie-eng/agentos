@@ -773,7 +773,12 @@ fn plan_installation_inner(
         allow_egress_host: cfg.egress_hosts(),
         resolved_egress_cidrs: vec![],
         allow_web_egress: vec![],
-        fake_model: cfg.credentials.model.is_none(),
+        // Omission is not an explicit fake model request: apply and diff must
+        // preserve a recorded runner credential just like a plain cluster up.
+        fake_model: cfg
+            .set
+            .get(crate::ops::FAKE_MODEL_KEY)
+            .is_some_and(|value| value == "true"),
         credentials: cfg
             .credentials
             .model

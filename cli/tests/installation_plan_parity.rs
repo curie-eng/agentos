@@ -281,6 +281,10 @@ if [ "$1" = upgrade ]; then
     runner_real_mode_preserved='no'
     runner_egress_preserved='no'
     for argument in "$@"; do
+        if [ "$previous" = '-f' ] && [ -n "${CURIE_TEST_CAPTURE_ALL_VALUES:-}" ]; then
+            cat "$argument" >> "$CURIE_TEST_CAPTURE_ALL_VALUES"
+            printf '\n---\n' >> "$CURIE_TEST_CAPTURE_ALL_VALUES"
+        fi
         if [ "$previous" = '-f' ] && [ -n "${CURIE_TEST_CAPTURE_MAIL_VALUES:-}" ] && grep -Fq '"mailAdapter"' "$argument"; then
             cp "$argument" "$CURIE_TEST_CAPTURE_MAIL_VALUES"
         fi
@@ -1929,6 +1933,84 @@ fn apply_and_plain_up_preserve_omitted_mail_but_honor_explicit_source_clear() {
             "diff must disclose stripping the stale inline copy"
         );
         assert!(!fixture.calls().contains("obsolete-inline-token"));
+    }
+}
+
+#[test]
+fn existing_secret_preservation_survives_plain_cli_up_apply_and_diff() {
+    let paths = [
+        "dispatcher.slack.appToken",
+        "dispatcher.slack.botToken",
+        "dispatcher.slack.signingSecret",
+        "agentSandbox.runner.credentials",
+        "api.githubToken",
+        "sealing.privateKey",
+        "sealing.previousPrivateKey",
+        "worker.adapterCredentials",
+    ];
+    let mut existing = json!({});
+    for path in paths {
+        let mut current = &mut existing;
+        let parts: Vec<_> = path.split('.').collect();
+        for part in &parts[..parts.len() - 1] {
+            current = &mut current[*part];
+        }
+        let leaf = parts.last().unwrap();
+        current[format!("{leaf}ExistingSecret")] = json!("acme-credentials");
+        current[format!("{leaf}ExistingSecretKey")] = json!(format!("{leaf}-custom"));
+    }
+    for surface in ["up", "apply"] {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            HelmValuesResponse::Object(existing.clone()),
+        );
+        let captured = fixture.temp.path().join("all-values.yaml");
+        let env = [("CURIE_TEST_CAPTURE_ALL_VALUES", captured.to_str().unwrap())];
+        let output = if surface == "up" {
+            fixture.cluster_up_without_credentials(&env)
+        } else {
+            fixture.apply(&[], &env)
+        };
+        let visible = String::from_utf8_lossy(&output.stderr).to_string();
+        json_output(output, surface);
+        assert!(
+            !visible.contains("installing with the fake model"),
+            "BYO credential reported absent: {visible}"
+        );
+        assert!(
+            !visible.contains("generated a sealing private key"),
+            "unused sealing key generated: {visible}"
+        );
+        let body = fs::read_to_string(captured).expect("Helm consumed private values");
+        let documents: Vec<Value> = body
+            .split("\n---\n")
+            .filter(|part| !part.trim().is_empty())
+            .map(|part| serde_norway::from_str(part).unwrap())
+            .collect();
+        let diff = json_output(fixture.diff(&[]), "diff BYO references");
+        for path in paths {
+            for suffix in ["ExistingSecret", "ExistingSecretKey"] {
+                let key = format!("{path}{suffix}");
+                let pointer = format!("/{}", key.replace('.', "/"));
+                let expected = existing.pointer(&pointer).unwrap();
+                assert!(
+                    documents
+                        .iter()
+                        .any(|doc| doc.pointer(&pointer) == Some(expected)),
+                    "{surface} dropped {key}"
+                );
+                let entry = diff["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["key"] == key)
+                    .unwrap();
+                assert_eq!(
+                    entry["kind"], "preserved",
+                    "diff reports false reset for {key}: {entry}"
+                );
+            }
+        }
     }
 }
 
