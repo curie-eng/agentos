@@ -551,7 +551,8 @@ pub struct UpOpts {
     pub fake_model: bool,
     /// The model credential to install with, resolved from `CURIE_CREDENTIALS`
     /// (or the deprecated `CURIE_MODEL_CREDENTIALS`). `Some(non-empty)` enables the real model;
-    /// `None` installs sealed (fake model). A credential alone opens NO egress --
+    /// `None` leaves the inline source unset; a retained external reference can
+    /// still select the real model. A credential alone opens NO egress --
     /// the model stays unreachable behind the fail-closed sandbox until a
     /// provider (`allow_egress_host`) or a raw range (`allow_web_egress`) is
     /// named (#362).
@@ -1267,7 +1268,7 @@ pub fn model_egress_status_lines(
 /// their own paths (`cluster comms`, `CURIE_MODEL_CREDENTIALS`), not
 /// generated. `langfuse.encryptionKey` must be exactly 64 hex chars, so its 32
 /// bytes are load-bearing.
-/// Values owned by `cluster comms`, not by `cluster up`.
+/// Slack credential values retained across `cluster up`.
 ///
 /// `comms` writes these with `helm upgrade --reuse-values`; `up` does a full
 /// upgrade and therefore drops anything it does not itself pass. That silently
@@ -1346,7 +1347,8 @@ const GITHUB_TOKEN_REFERENCE_KEYS: &[&str] = &[
 ///
 /// Three states, resolved once in [`up`] and consumed by the pure builder:
 /// - `Untouched`: supply nothing. Either the operator pinned the key through
-///   `--set` (theirs to own), or there is no recorded value to keep.
+///   `--set` (theirs to own), an external reference is retained separately, or
+///   there is no recorded value to keep.
 /// - `Set`: write this value through the private 0600 `-f` values file -- an
 ///   explicit `--github-token`, or the value the last run recorded.
 /// - `Clear`: write an empty value, the same shape `comms --disconnect` writes,
@@ -1609,7 +1611,7 @@ fn effective_existing_secret(
     preserved_value(existing, &reference).is_some()
 }
 
-/// Re-supply the [`COMMS_MANAGED_KEYS`] a previous `cluster comms` recorded.
+/// Re-supply the [`COMMS_MANAGED_KEYS`] the release recorded.
 ///
 /// An operator `--set` for a key always wins, and a key helm has no record of
 /// is left alone -- so this only ever preserves, never invents.
@@ -1935,8 +1937,8 @@ const MODEL_CREDENTIAL_REFERENCE_KEYS: &[&str] = &[
     "agentSandbox.runner.credentialsExistingSecretKey",
 ];
 
-/// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
-/// present -- see `up_commands`, which pushes both inside one `if let`.
+/// Select the real model when an inline credential or an external credential
+/// reference is supplied by the completed upgrade plan.
 pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 
 const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
@@ -6558,7 +6560,9 @@ async fn run_prepared_up(
             // recorded; on a fresh install (or an existing release that never
             // had one) there is nothing to remove, so the wording must not
             // claim there was.
-            if preserved_value(existing.as_ref(), GITHUB_TOKEN_KEY).is_some() {
+            if preserved_value(existing.as_ref(), GITHUB_TOKEN_KEY).is_some()
+                || effective_existing_secret(existing.as_ref(), &[], GITHUB_TOKEN_KEY)
+            {
                 // This is an incident-response verb, not a revocation: the
                 // running API keeps the old token until it restarts, and the
                 // token stays valid at GitHub until revoked there directly.
@@ -6579,6 +6583,14 @@ async fn run_prepared_up(
             } else {
                 ui.note("preserving the GitHub credential recorded by an earlier cluster up; pass --github-token to change it or --clear-github-token to remove it");
             }
+        }
+        GithubTokenPlan::Untouched
+            if opts
+                .secrets
+                .iter()
+                .any(|(key, value)| key == GITHUB_TOKEN_REFERENCE_KEYS[0] && !value.is_empty()) =>
+        {
+            ui.note("preserving the GitHub credential reference recorded by the release; pass --github-token to replace it or --clear-github-token to remove it");
         }
         GithubTokenPlan::Untouched => {
             // Distinct wording: an empty value with nothing recorded preserves

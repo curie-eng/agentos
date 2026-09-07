@@ -2015,6 +2015,33 @@ fn existing_secret_preservation_survives_plain_cli_up_apply_and_diff() {
 }
 
 #[test]
+fn existing_secret_preservation_reports_github_reference_actions() {
+    for clear in [false, true] {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            HelmValuesResponse::Object(json!({
+                "api": {"githubTokenExistingSecret": "acme-credentials", "githubTokenExistingSecretKey": "github-custom"}
+            })),
+        );
+        let args: &[&str] = if clear {
+            &["--clear-github-token"]
+        } else {
+            &["--github-token", ""]
+        };
+        let output = fixture.cluster_up_with(args, &[]);
+        let visible = String::from_utf8_lossy(&output.stderr).to_string();
+        json_output(output, "GitHub reference action");
+        let expected = if clear {
+            "GitHub credential cleared here"
+        } else {
+            "preserving the GitHub credential reference"
+        };
+        assert!(visible.contains(expected), "{visible}");
+        assert!(!visible.contains("no GitHub credential"), "{visible}");
+    }
+}
+
+#[test]
 fn cluster_up_rerun_preserves_existing_runner_model_and_egress_configuration() {
     let fixture = HelmFixture::new(
         installation_for_the_stateful_guard(),
