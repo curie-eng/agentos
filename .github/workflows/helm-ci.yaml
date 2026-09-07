@@ -613,7 +613,9 @@ jobs:
       - name: Released retained-values rejection and removed-guard control
         env:
           KUBECONFIG: /home/runner/.kube/config
-        run: bash charts/curie/ci/runtime/reserved-env-upgrade-runtime.sh
+        # Keep runtime checks separate from the flat chart-check render inventory.
+        working-directory: charts/curie
+        run: bash ci/runtime/reserved-env-upgrade-runtime.sh
       - name: Remove owned cluster
         if: always()
         run: kind delete cluster --name curie-reserved-env

@@ -109,7 +109,7 @@ for timeout in 600 599; do
     echo "accepted legacy duplicate on upgrade" >&2; exit 1
   fi
   cat "$TMP/refusal.log"
-  rg -q 'worker.extraEnv contains chart-owned environment variable CURIE_RUNNER_TOTAL_TIMEOUT_S.*worker.runnerTotalTimeoutSeconds' "$TMP/refusal.log"
+  grep -Eq 'worker.extraEnv contains chart-owned environment variable CURIE_RUNNER_TOTAL_TIMEOUT_S.*worker.runnerTotalTimeoutSeconds' "$TMP/refusal.log"
   snapshot > "$TMP/after.json"
   cmp "$TMP/before.json" "$TMP/after.json"
   helm history acme --kube-context "$context" -n "$namespace" -o json > "$TMP/history-after.json"
