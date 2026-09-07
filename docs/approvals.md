@@ -47,10 +47,15 @@ write-capable and is classified conservatively. Publication's dedicated approval
 and the state tools remain independent.
 
 **Permission gate.** Configuration marks a tool approval-required, and the runner denies
-the call through the SDK's `can_use_tool` callback before it runs. The denied call never
-executes. Two sources name gated tools and they are unioned, never subtracted: the
-bundle manifest's `approvalPolicy`, and the `CURIE_APPROVAL_REQUIRED_TOOLS` operator
-override.
+the call through its unscoped `PreToolUse` hook, with the SDK's `can_use_tool` callback as
+the second line, before it runs. The denied call never executes. Two sources name gated
+tools and they are unioned, never subtracted: the bundle manifest's `approvalPolicy`, and
+the `CURIE_APPROVAL_REQUIRED_TOOLS` operator override. For the platform's own
+`publish_changes` tool the runner additionally records every call it sees on the model
+stream (#2294): if neither SDK layer recorded the call, the in-sandbox tool body runs and
+returns its defensive error (it carries no publication authority), the stream record still
+parks the turn awaiting approval, and a publication call that left no record ends the turn
+as a `publication-unrecorded` classified failure rather than a clean `done`.
 
 ## Declaring routes in the bundle
 
