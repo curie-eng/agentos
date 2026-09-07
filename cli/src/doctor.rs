@@ -4431,12 +4431,11 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     f.mail_channels = vec![crate::mail_channel::unavailable(namespace, release)];
     if let Ok(Some(computed)) = computed {
         f.mail_channels.clear();
-        if computed
-            .get("mailAdapter")
-            .and_then(|value| value.get("deploy"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
+        if helm_truthy(
+            computed
+                .get("mailAdapter")
+                .and_then(|value| value.get("deploy")),
+        ) {
             f.mail_channels = crate::mail_channel::observe(namespace, release).await;
             if f.mail_channels.is_empty() {
                 f.mail_channels
