@@ -2281,15 +2281,18 @@ class Kernel:
             )
             if self._is_approval_resume(qevent.event_id):
                 return TurnOutcome(terminal_ok=False, classification="runner-error")
+            # Quota accounting is operator data and stops at the log line
+            # above (#2434). The quota's name, the resource axis and the three
+            # usage numbers reached a customer Slack channel verbatim on
+            # 2026-09-06; they say nothing to the person who asked a question
+            # and they disclose cluster capacity to anyone who can talk to the
+            # bot. `rejection` is still fully logged for the operator.
             await self._reply_for(
                 qevent,
                 route,
                 (
-                    "This agent is at sandbox capacity. ResourceQuota "
-                    f"{rejection.quota_name} rejected {rejection.resource}: "
-                    f"requested {rejection.requested}, observed usage "
-                    f"{rejection.used}, hard limit {rejection.hard}. Try again "
-                    "after another conversation releases its sandbox."
+                    "This agent is at capacity right now. It frees up when "
+                    "another conversation finishes, so please try again shortly."
                 ),
             )
             return TurnOutcome(terminal_ok=True)
