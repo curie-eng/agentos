@@ -107,6 +107,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      - name: Reject chart-owned extraEnv duplicates
+        run: bash charts/curie/ci/reserved-env-assertions.sh
+
       # Prove the API Service keeps a stable NodePort when enabled, allows an
       # override, and omits the field for ClusterIP or explicit auto allocation.
       - name: helm render assertions (api service NodePort)
@@ -591,3 +594,26 @@ jobs:
           helm template "$CHART" -f "$CHART/values-dev.yaml" -f "$CHART/values-e2e-nogvisor.yaml" \
             | python3 -c "import sys, yaml; yaml.safe_dump_all(yaml.safe_load_all(sys.stdin), sys.stdout)" \
             | kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version "$KUBE_VERSION"
+
+  reserved-env-upgrade:
+    name: Reject legacy extraEnv before upgrade mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          cluster_name: curie-reserved-env
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+      - name: Install YAML parser
+        run: pip install pyyaml
+      - name: Released retained-values rejection and removed-guard control
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+        run: bash charts/curie/ci/runtime/reserved-env-upgrade-runtime.sh
+      - name: Remove owned cluster
+        if: always()
+        run: kind delete cluster --name curie-reserved-env

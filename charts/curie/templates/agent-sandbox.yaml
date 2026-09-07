@@ -602,9 +602,7 @@ spec:
               value: {{ $wf.mountPath | quote }}
             {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" $runner.extraEnv) | nindent 12 }}
-            {{- with $runner.extraEnv }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "agentSandbox.runner" "env" $runner.extraEnv) | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /healthz
