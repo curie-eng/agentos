@@ -62,8 +62,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TMP="$(mktemp -d)"
+STUB_PID=""
+GATE_PID=""
+stop_owned_processes() {
+  local pid
+  for pid in "$GATE_PID" "$STUB_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "$GATE_PID" "$STUB_PID"; do
+    [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
+  done
+  GATE_PID=""
+  STUB_PID=""
+}
 cleanup() {
-  [[ -n "${STUB_PID:-}" ]] && kill "$STUB_PID" 2>/dev/null || true
+  stop_owned_processes
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -357,15 +372,17 @@ python3 "$TMP/extract.py" "$SECURE" > "$TMP/gate-secure.sh"
 # A free port that nothing is listening on: the delayed/absent ClickHouse.
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 
-# Stub ClickHouse. $1 = seconds to stay down before binding, $2 = /ping status,
-# $3 = port, $4 = seconds each /ping response is held back (slow but healthy).
+# Stub ClickHouse. $1 = private release marker, $2 = seconds to stay down after
+# release before binding, $3 = /ping status, $4 = port, $5 = seconds each /ping
+# response is held back (slow but healthy).
 # Set STUB_TLS_CERT/STUB_TLS_KEY to serve real TLS instead of cleartext (#2314).
 cat > "$TMP/stub.py" <<'PY'
 import os, ssl, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-delay, status, port = float(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-response_delay = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+release_marker, delay = sys.argv[1], float(sys.argv[2])
+status, port = int(sys.argv[3]), int(sys.argv[4])
+response_delay = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
 tls_cert = os.environ.get("STUB_TLS_CERT")
 tls_key = os.environ.get("STUB_TLS_KEY")
 
@@ -392,6 +409,8 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+while not os.path.exists(release_marker):
+    time.sleep(0.05)
 time.sleep(delay)
 server = HTTPServer(("127.0.0.1", port), Handler)
 if tls_cert:
@@ -416,23 +435,50 @@ run_gate() {  # run_gate <gate-script> <outfile>; returns the gate's exit status
   run_gate_url "http://127.0.0.1:$PORT" "$1" "$2"
 }
 
+wait_for_gate_waiting() {  # wait_for_gate_waiting <outfile> <gate-pid>
+  local output="$1"
+  local gate_pid="$2"
+  local deadline=$((SECONDS + 10))
+  while ! grep -q "Waiting for ClickHouse readiness" "$output"; do
+    if ! kill -0 "$gate_pid" 2>/dev/null; then
+      wait "$gate_pid" 2>/dev/null || true
+      GATE_PID=""
+      fail "the gate exited before it observed a failed ClickHouse probe; the fixture remains unreleased"
+    fi
+    (( SECONDS < deadline )) \
+      || fail "the gate did not log a failed ClickHouse probe within 10s (output: $(cat "$output"))"
+    sleep 0.1
+  done
+  if ! kill -0 "$gate_pid" 2>/dev/null; then
+    wait "$gate_pid" 2>/dev/null || true
+    GATE_PID=""
+    fail "the gate exited after reporting a failed ClickHouse probe but before fixture release"
+  fi
+}
+
 echo
 echo "=== Assertion 2: a DELAYED ClickHouse is waited for, not crash-looped ==="
-python3 "$TMP/stub.py" 4 200 "$PORT" & STUB_PID=$!
+RELEASE_MARKER="$TMP/release-delayed-clickhouse"
+python3 "$TMP/stub.py" "$RELEASE_MARKER" 5 200 "$PORT" & STUB_PID=$!
 started="$(date +%s)"
-if ! run_gate "$TMP/gate-patient.sh" "$TMP/delayed.log"; then
+run_gate "$TMP/gate-patient.sh" "$TMP/delayed.log" & GATE_PID=$!
+wait_for_gate_waiting "$TMP/delayed.log" "$GATE_PID"
+touch "$RELEASE_MARKER"
+if ! wait "$GATE_PID"; then
   echo "--- gate output ---"; cat "$TMP/delayed.log"
-  fail "the gate exited non-zero against a ClickHouse that came up after 4s; a routine upgrade would still CrashLoopBackOff (#2009)"
+  GATE_PID=""
+  fail "the gate exited non-zero against a ClickHouse released after a 5s startup delay; a routine upgrade would still CrashLoopBackOff (#2009)"
 fi
+GATE_PID=""
 elapsed=$(( $(date +%s) - started ))
 kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
 grep -q "Waiting for ClickHouse readiness" "$TMP/delayed.log" \
   || fail "the gate did not report waiting; it cannot have observed the dependency being down (output: $(cat "$TMP/delayed.log"))"
 grep -q "exiting for init container restart" "$TMP/delayed.log" \
-  && fail "the gate gave up and asked for a restart instead of waiting out a 4s ClickHouse delay"
-(( elapsed >= 3 )) \
-  || fail "the gate returned after ${elapsed}s against a ClickHouse that was down for 4s -- it cannot have probed the real endpoint"
-echo "  ok: gate waited ${elapsed}s for the delayed dependency, then exited 0 in a single run (zero restarts)"
+  && fail "the gate gave up and asked for a restart instead of waiting out the controlled 5s ClickHouse startup delay"
+(( elapsed >= 4 )) \
+  || fail "the gate returned after ${elapsed}s despite the fixture's controlled 5s startup delay -- it cannot have probed the real endpoint"
+echo "  ok: gate logged a failed probe before fixture release, then waited ${elapsed}s for the delayed dependency and exited 0 in a single run (zero restarts)"
 
 echo
 echo "=== Assertion 3: a ClickHouse that never comes up fails the gate (bounded) ==="
@@ -446,7 +492,8 @@ echo "  ok: gate exits non-zero after its bounded attempts and names the endpoin
 
 echo
 echo "=== Assertion 4: reachable but not serving (HTTP 503) does not open the gate ==="
-python3 "$TMP/stub.py" 0 503 "$PORT" & STUB_PID=$!
+touch "$TMP/release-refusing-clickhouse"
+python3 "$TMP/stub.py" "$TMP/release-refusing-clickhouse" 0 503 "$PORT" & STUB_PID=$!
 sleep 1
 if run_gate "$TMP/gate-fast.sh" "$TMP/refusing.log"; then
   echo "--- gate output ---"; cat "$TMP/refusing.log"
@@ -457,7 +504,8 @@ echo "  ok: a non-200 /ping keeps the gate closed"
 
 echo
 echo "=== Assertion 5: the probe timeout is a values knob, and it is honoured ==="
-python3 "$TMP/stub.py" 0 200 "$PORT" 3 & STUB_PID=$!
+touch "$TMP/release-slow-clickhouse"
+python3 "$TMP/stub.py" "$TMP/release-slow-clickhouse" 0 200 "$PORT" 3 & STUB_PID=$!
 sleep 1
 if run_gate "$TMP/gate-fast.sh" "$TMP/slow-strict.log"; then
   echo "--- gate output ---"; cat "$TMP/slow-strict.log"
@@ -477,8 +525,9 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -subj '/CN=localhost' -addext 'subjectAltName=IP:127.0.0.1' >/dev/null 2>&1 \
   || fail "could not generate the self-signed certificate the TLS stub serves"
 
+touch "$TMP/release-tls-clickhouse"
 STUB_TLS_CERT="$TMP/cert.pem" STUB_TLS_KEY="$TMP/key.pem" \
-  python3 "$TMP/stub.py" 0 200 "$PORT" & STUB_PID=$!
+  python3 "$TMP/stub.py" "$TMP/release-tls-clickhouse" 0 200 "$PORT" & STUB_PID=$!
 sleep 1
 if ! NODE_EXTRA_CA_CERTS="$TMP/cert.pem" \
   run_gate_url "https://127.0.0.1:$PORT" "$TMP/gate-secure.sh" "$TMP/tls.log"; then
