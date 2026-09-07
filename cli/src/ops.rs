@@ -3986,8 +3986,8 @@ fn complete_up_opts_without_runner_egress(
     // this invocation makes that sealing identity change explicit.
     if preserved_value(existing, &sealing_source).is_some()
         && final_operator_value(&opts, &sealing_source).is_some_and(str::is_empty)
-        && !final_operator_value(&opts, crate::sealing::SEALING_PRIVATE_KEY)
-            .is_some_and(|value| !value.is_empty())
+        && final_operator_value(&opts, crate::sealing::SEALING_PRIVATE_KEY)
+            .is_none_or(|value| value.is_empty())
     {
         return Err(crate::exit::CliError::usage(
             "refusing to clear the active sealing private key source without an explicit replacement",
