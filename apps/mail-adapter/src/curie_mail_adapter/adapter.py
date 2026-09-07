@@ -37,6 +37,10 @@ CAUSE_MAX_CHARS = 120
 REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
 
 
+class ProviderThreadDeletedError(RuntimeError):
+    """The provider definitively rejected the thread lookup with HTTP 404."""
+
+
 class MailAdapter:
     """One AgentMail inbox bridged to one Curie channel binding."""
 
@@ -481,6 +485,8 @@ class MailAdapter:
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
         status, thread = self.client.get_thread(conversation_id)
+        if status == 404:
+            raise ProviderThreadDeletedError
         if status != 200 or not isinstance(thread, dict):
             logger.warning("thread listing -> %s; durable witness unreadable", status)
             return None
@@ -502,12 +508,25 @@ class MailAdapter:
             )
             return 200
         claim = self.state.claim_event(event_id, conversation_id, reply_ref, self.owner)
+        if claim == "deleted":
+            return 410
         if claim == "done":
             return 200
         if claim == "busy":
             return 503
         try:
-            carries = self.thread_carries(conversation_id, event_id)
+            try:
+                carries = self.thread_carries(conversation_id, event_id)
+            except ProviderThreadDeletedError:
+                exists, _text = self.state.reply_text(conversation_id, reply_ref)
+                if not exists:
+                    return 502
+                self.state.delete_event(event_id, conversation_id, reply_ref)
+                logger.warning(
+                    "reply terminal: thread deleted at provider; correlation=%s",
+                    _correlation(event_id),
+                )
+                return 410
             if carries is None:
                 return 502
             if carries:

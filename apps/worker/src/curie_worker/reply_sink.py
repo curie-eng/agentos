@@ -33,7 +33,7 @@ from uuid import UUID
 
 import aiohttp
 import curie_telemetry
-from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyPost
+from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyPost, TurnCompleted
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict
 
@@ -89,6 +89,12 @@ class RejectedAdapterResponseError(RuntimeError):
     to prevent. The aiohttp exception is never constructed, never chained, and
     never reaches a log.
     """
+
+
+class DeletedReplyTargetError(RejectedAdapterResponseError):
+    """A completion received HTTP 410: its provider thread is permanently gone."""
+
+    reason = "thread deleted at provider"
 
 
 class OversizedAdapterResponseError(RuntimeError):
@@ -339,6 +345,8 @@ class HttpReplyAdapter:
                         f"{response.status} (redirect); refusing to re-send the "
                         "egress credential to the redirect target"
                     )
+                if response.status == 410 and isinstance(event, TurnCompleted):
+                    raise DeletedReplyTargetError(DeletedReplyTargetError.reason)
                 if response.status >= 400:
                     # NOT ``raise_for_status()``: see
                     # ``RejectedAdapterResponseError``. The status is the

@@ -50,6 +50,7 @@ import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from channel_protocol.reply import TurnCompleted
@@ -137,6 +138,22 @@ if redis.call('HGET', KEYS[1], ARGV[2]) == ARGV[1] then
   return 1
 end
 return 0
+"""
+
+
+# A terminal rejection is retained in the existing bounded graveyard BEFORE the
+# owed record disappears. The generation fence covers both effects: a stale
+# sweep can neither accuse nor clear the replacement record. An XADD failure
+# leaves the outbox intact for the next sweep.
+_DEAD_LETTER_COMPLETION_LUA = """
+if redis.call('HGET', KEYS[1], ARGV[2]) ~= ARGV[1] then return 0 end
+redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
+  'event_id', ARGV[3], 'completion', ARGV[5], 'dl_reason', ARGV[6],
+  'dl_delivery_count', '1', 'dl_source', 'completion-outbox',
+  'dl_dead_lettered_at', ARGV[7])
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], ARGV[3])
+return 1
 """
 
 
@@ -409,6 +426,27 @@ class Markers:
             event_id,
         )
         return bool(cleared)
+
+    async def dead_letter_completion(
+        self, record: CompletionRecord, *, generation: str, reason: str
+    ) -> bool:
+        """Atomically retain a terminal failure and clear only its own generation."""
+        return bool(
+            await self._redis.eval(
+                _DEAD_LETTER_COMPLETION_LUA,
+                3,
+                self._config.completion_key(record.event_id),
+                self._config.completions_pending_key(),
+                self._config.dead_letter_stream_name(),
+                generation,
+                _GENERATION_FIELD,
+                record.event_id,
+                self._config.dead_letter_maxlen,
+                record.event.model_dump_json(),
+                reason,
+                datetime.now(UTC).isoformat(),
+            )
+        )
 
     async def drop_pending_member(self, event_id: str) -> None:
         """Drop ONLY the set membership, leaving whatever key state exists.
