@@ -435,8 +435,13 @@ fi
 if [[ -n "${CURIE_E2E_OTEL:-}" ]]; then
     START_ARGS+=(--otel-endpoint "$CURIE_E2E_OTEL")
 fi
-UP_OUTPUT="$("$BIN" skill up "${START_ARGS[@]}" 2>&1)"
-printf '%s\n' "$UP_OUTPUT"
+if UP_OUTPUT="$("$BIN" skill up "${START_ARGS[@]}" 2>&1)"; then
+    printf '%s\n' "$UP_OUTPUT"
+else
+    UP_STATUS=$?
+    printf '%s\n' "$UP_OUTPUT" >&2
+    exit "$UP_STATUS"
+fi
 
 # The boot panel must NAME the model path it resolved. `skill up` picks the
 # credential at boot (commands::select_passthrough_env) but used to say nothing

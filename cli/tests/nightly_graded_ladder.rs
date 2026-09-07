@@ -1665,6 +1665,10 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
         printf '%s\n' '{"release_found":true}'
         ;;
     "skill up --plugin-dir . --image curie-runner --port 7245 --name curie-e2e-runner --fake-model")
+        if [ -n "${STUB_PRIMARY_SKILL_UP_ERROR:-}" ]; then
+            printf '%s\n' "$STUB_PRIMARY_SKILL_UP_ERROR" >&2
+            exit 7
+        fi
         # The skill rung's identity surface. `skill up` packs an IMMUTABLE
         # snapshot of the source as it stands now and the runner keeps it for its
         # whole lifetime, so the digest is recorded here and replayed by
@@ -1865,6 +1869,9 @@ esac
         &dir.join("docker"),
         r#"#!/bin/sh
 set -u
+if [ -n "${STUB_DOCKER_INVOCATION_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$STUB_DOCKER_INVOCATION_LOG"
+fi
 case "$*" in
     "inspect curie-runner-local")
         # e2e.sh's ownership precondition: the standard interactive runner is
@@ -2073,6 +2080,8 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env_remove("CURIE_FAKE_MODEL")
         .env_remove("CURIE_API_KEY")
         .env_remove("CURIE_API_URL")
+        .env_remove("STUB_PRIMARY_SKILL_UP_ERROR")
+        .env_remove("STUB_DOCKER_INVOCATION_LOG")
         .env_remove("STUB_EXISTING_LOCAL_STACK")
         .env_remove("STUB_RUNS_EXTRA_JSON")
         .env_remove("STUB_UNAVAILABLE_EXIT")
@@ -2634,6 +2643,57 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
         "the ladder must name the common suite's case ids, so a reader can see \
          WHICH case set every rung shared rather than taking `parity` on \
          trust; transcript:\n{transcript}"
+    );
+}
+
+/// Ref #2423: a refused primary boot must expose its diagnostic through the real
+/// skill ladder, retain its exit status, and still remove the owned runner.
+#[test]
+fn skill_up_failure_surfaces_diagnostic_preserves_exit_and_cleans_up() {
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    let invocation_log = harness.path().join("curie-invocations.log");
+    let docker_log = harness.path().join("docker-invocations.log");
+    let diagnostic = "stub primary skill up refused: diagnostic-marker-2423";
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "skill"),
+            ("STUB_PRIMARY_SKILL_UP_ERROR", diagnostic),
+            ("STUB_INVOCATION_LOG", invocation_log.to_str().unwrap()),
+            ("STUB_DOCKER_INVOCATION_LOG", docker_log.to_str().unwrap()),
+        ],
+    );
+
+    let transcript = transcript(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the primary boot refusal must retain its exit status; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains(diagnostic),
+        "the captured skill up diagnostic must reach the operator; transcript:\n{transcript}"
+    );
+    let invocations = fs::read_to_string(invocation_log).expect("read Curie invocations");
+    let commands: Vec<_> = invocations.lines().collect();
+    let primary_up = commands
+        .iter()
+        .position(|command| {
+            *command == "skill up --plugin-dir . --image curie-runner --port 7245 --name curie-e2e-runner --fake-model"
+        })
+        .expect("the primary skill up must have been attempted");
+    assert!(
+        commands[primary_up + 1..].is_empty(),
+        "no subsequent skill, eval, or local action may follow the refused boot; invocations:\n{invocations}"
+    );
+    let docker_invocations = fs::read_to_string(docker_log).expect("read Docker invocations");
+    assert!(
+        docker_invocations
+            .lines()
+            .any(|command| command == "rm -f curie-e2e-runner"),
+        "the failure must still invoke cleanup for the owned runner; invocations:\n{docker_invocations}"
     );
 }
 
