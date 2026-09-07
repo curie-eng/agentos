@@ -444,11 +444,39 @@ case "$verb $object" in
     fi
     ;;
 'get svc')
+    if [ "${{CURIE_TEST_COMMS_ROLLOUTS:-}}" = 1 ]; then
+        case "$all" in
+            '-n parity get svc -l app.kubernetes.io/instance=parity,app.kubernetes.io/component=api -o jsonpath={{range .items[*]}}{{.metadata.name}}{{"\n"}}{{end}}')
+                printf '%s\n' 'parity-curie-api'
+                exit 0
+                ;;
+        esac
+    fi
     # The jsonpath asks for a Service NAME, so answer with one, for whichever
     # store component the caller named and nothing else.
     case "$all" in
         *'=="minio"'*) printf '%s\n' 'parity-minio' ;;
         *'=="rustfs"'*) printf '%s\n' 'parity-rustfs' ;;
+        *) unexpected ;;
+    esac
+    ;;
+'rollout restart')
+    if [ "${{CURIE_TEST_COMMS_ROLLOUTS:-}}" != 1 ]; then
+        unexpected
+    fi
+    case "$all" in
+        '-n parity rollout restart deployment/parity-curie-worker'|\
+        '-n parity rollout restart deployment/parity-curie-dispatcher') : ;;
+        *) unexpected ;;
+    esac
+    ;;
+'rollout status')
+    if [ "${{CURIE_TEST_COMMS_ROLLOUTS:-}}" != 1 ]; then
+        unexpected
+    fi
+    case "$all" in
+        '-n parity rollout status deployment/parity-curie-worker --timeout=120s'|\
+        '-n parity rollout status deployment/parity-curie-dispatcher --timeout=120s') : ;;
         *) unexpected ;;
     esac
     ;;
@@ -622,6 +650,7 @@ exit 0
             .env_remove("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE")
             .env_remove("CURIE_TEST_KUBECTL_FAIL")
             .env_remove("CURIE_TEST_KUBECTL_FORBIDDEN")
+            .env_remove("CURIE_TEST_COMMS_ROLLOUTS")
             .env_remove("CURIE_TEST_HELM_MIXED_STATEFULSETS")
             .env_remove("CURIE_TEST_RELEASE_SECRET")
             .env_remove("CURIE_TEST_SOURCE_LIST_FAIL")
@@ -2035,6 +2064,7 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
     let env = [
         ("CURIE_TEST_DECLARATIVE_APP_TOKEN", APP_TOKEN),
         ("CURIE_TEST_DECLARATIVE_BOT_TOKEN", BOT_TOKEN),
+        ("CURIE_TEST_COMMS_ROLLOUTS", "1"),
         (
             "CURIE_TEST_CAPTURE_ALL_VALUES",
             captured.to_str().expect("UTF 8 capture path"),
@@ -2090,6 +2120,17 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
             calls.contains(source),
             "the follow-up comms upgrade must consume the declared Slack replacement"
         );
+    }
+    for component in ["worker", "dispatcher"] {
+        for (action, suffix) in [("restart", ""), ("status", " --timeout=120s")] {
+            let expected = format!(
+                "KUBECTL_CALL: -n parity rollout {action} deployment/parity-curie-{component}{suffix}"
+            );
+            assert!(
+                calls.contains(&expected),
+                "the follow-up comms apply must {action} the {component} deployment:\n{calls}"
+            );
+        }
     }
 
     let retained = HelmFixture::new(
@@ -2227,7 +2268,6 @@ fn empty_inline_only_sealing_source_clear_keeps_the_recorded_identity() {
         ("/dispatcher/slack/appToken", INLINE_APP_TOKEN),
         ("/dispatcher/slack/botToken", INLINE_BOT_TOKEN),
         ("/agentSandbox/runner/credentials", INLINE_MODEL_CREDENTIAL),
-        ("/agentSandbox/runner/model", "placeholder/model"),
         ("/api/githubToken", INLINE_GITHUB_TOKEN),
     ] {
         assert!(
@@ -2237,6 +2277,14 @@ fn empty_inline_only_sealing_source_clear_keeps_the_recorded_identity() {
             "the actual Helm values lost retained {pointer}"
         );
     }
+    assert!(
+        fixture.calls().lines().any(|call| {
+            call.split_whitespace()
+                .any(|argument| argument == "agentSandbox.runner.model=placeholder/model")
+        }),
+        "the normal Helm argument must retain the recorded runner model:\n{}",
+        fixture.calls()
+    );
     assert!(
         fixture
             .calls()

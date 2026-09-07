@@ -889,6 +889,14 @@ async fn complete_installation_plan(
             "dispatcher.slack.botToken".to_string(),
             comms.bot_token.clone(),
         );
+        desired.insert(
+            "dispatcher.slack.appTokenExistingSecret".to_string(),
+            String::new(),
+        );
+        desired.insert(
+            "dispatcher.slack.botTokenExistingSecret".to_string(),
+            String::new(),
+        );
         desired.insert("worker.slackApiBaseUrl".to_string(), String::new());
     }
     Ok(EffectiveInstallationPlan {

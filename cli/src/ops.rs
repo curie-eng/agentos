@@ -1560,8 +1560,10 @@ pub(crate) fn resolve_existing_secret_ref(
     Some((secret_name, data_key))
 }
 
-/// Retain only the active credential source. Explicit source changes must not
-/// revive stale inline values or let a retained reference hide a replacement.
+/// Retain only the effective credential source. A nonempty external source
+/// suppresses any recorded inline copy, while an inline replacement clears the
+/// old reference. An empty external selector does nothing when inline is
+/// already the active source.
 fn resolve_credential_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
@@ -1577,16 +1579,13 @@ fn resolve_credential_values(
                 .strip_suffix("ExistingSecretKey")
                 .or_else(|| key.strip_suffix("ExistingSecret"))
                 .unwrap_or(key);
-            let reference = format!("{inline}ExistingSecret");
             let inline_replaced = operator_set_entries(operator_sets)
                 .into_iter()
                 .rev()
                 .find(|(name, _)| name.trim() == inline)
                 .is_some_and(|(_, value)| !value.is_empty());
             if (*key != inline && inline_replaced)
-                || (*key == inline
-                    && (overridden.contains(&reference)
-                        || preserved_value(existing, &reference).is_some()))
+                || (*key == inline && effective_existing_secret(existing, operator_sets, inline))
             {
                 return preserved_value(existing, key).map(|_| ((*key).to_string(), String::new()));
             }
@@ -3981,6 +3980,23 @@ fn complete_up_opts_without_runner_egress(
     clear_github_token: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    let sealing_source = format!("{}ExistingSecret", crate::sealing::SEALING_PRIVATE_KEY);
+    // Clearing the active external source can otherwise select a leftover
+    // recorded inline key or mint a new one. Only a replacement supplied by
+    // this invocation makes that sealing identity change explicit.
+    if preserved_value(existing, &sealing_source).is_some()
+        && final_operator_value(&opts, &sealing_source).is_some_and(str::is_empty)
+        && !final_operator_value(&opts, crate::sealing::SEALING_PRIVATE_KEY)
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Err(crate::exit::CliError::usage(
+            "refusing to clear the active sealing private key source without an explicit replacement",
+        )
+        .with_fix(
+            "set sealing.privateKey to the replacement private key before clearing its source",
+        )
+        .into());
+    }
     opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets)?;
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
