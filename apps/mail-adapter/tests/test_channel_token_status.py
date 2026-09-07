@@ -44,7 +44,9 @@ def test_token_expiry_is_visible_before_any_inbound_mail(
         assert status == 200
         assert body["channel_token"] == {"present": True, "exp": exp, "state": expected}
         assert body["last_ingress_status"] is None
-        assert get(url + "/readyz")[0] == ready
+        ready_status, ready_body = get(url + "/readyz")
+        assert ready_status == ready
+        assert ready_body == {"status": "ready" if ready == 200 else "starting"}
         assert secret not in str(body)
         assert "test-platform-key" not in str(body)
     finally:
@@ -69,7 +71,7 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
         with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
             adapter.poll_once()
             adapter.poll_once()
-        assert get(url + "/readyz")[0] == 503
+        assert get(url + "/readyz") == (503, {"status": "starting"})
         body = get(url + "/statusz")[1]
         assert body["channel_token"]["state"] == "rejected"
         assert body["last_ingress_status"] == 401
@@ -81,12 +83,12 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
         assert secret not in "\n".join(lines)
         ingress.response = (503, {"detail": "temporarily unavailable"})
         adapter.poll_once()
-        assert get(url + "/readyz")[0] == 503
+        assert get(url + "/readyz") == (503, {"status": "starting"})
         assert get(url + "/statusz")[1]["channel_token"]["state"] == "rejected"
         assert get(url + "/statusz")[1]["last_ingress_status"] == 503
         ingress.response = (200, {"queued": True})
         adapter.poll_once()
-        assert get(url + "/readyz")[0] == 200
+        assert get(url + "/readyz") == (200, {"status": "ready"})
         assert get(url + "/statusz")[1]["channel_token"]["state"] == "ok"
         assert get(url + "/statusz")[1]["last_ingress_status"] == 200
     finally:
@@ -103,7 +105,7 @@ def test_unreadable_token_fails_closed_without_exposing_input(
     try:
         adapter.startup()
         url = serve_egress(adapter)
-        assert get(url + "/readyz")[0] == 503
+        assert get(url + "/readyz") == (503, {"status": "starting"})
         body = get(url + "/statusz")[1]
         assert body["channel_token"] == {
             "present": bool(secret),
@@ -124,9 +126,9 @@ def test_expiry_is_rechecked_on_probe_without_restart_or_incoming_mail(
     try:
         adapter.startup()
         url = serve_egress(adapter)
-        assert get(url + "/readyz")[0] == 200
+        assert get(url + "/readyz") == (200, {"status": "ready"})
         time.sleep(2)
-        assert get(url + "/readyz")[0] == 503
+        assert get(url + "/readyz") == (503, {"status": "starting"})
         assert get(url + "/statusz")[1]["channel_token"]["state"] == "expired"
     finally:
         adapter.close()
@@ -140,7 +142,7 @@ def test_disabled_ingress_does_not_require_valid_token_for_egress_readiness(
     try:
         adapter.startup()
         url = serve_egress(adapter)
-        assert get(url + "/readyz")[0] == 200
+        assert get(url + "/readyz") == (200, {"status": "ready"})
         assert get(url + "/statusz")[1]["channel_token"]["state"] == "disabled"
     finally:
         adapter.close()
