@@ -12,7 +12,8 @@ silent, which is the defect that ticket closes.
 
   - ``app_mention``: the bot was @-mentioned. A human mention is always
     processed, at root or in a thread. A *bot*-authored mention is processed
-    only as a ROOT post: one carrying ``thread_ts`` is refused as
+    at root; one carrying ``thread_ts`` requires an exact sender/channel pair
+    in ``CURIE_SLACK_THREADED_BOT_ALLOWLIST`` or is refused as
     ``BOT_AUTHORED_THREAD_REPLY``, because Curie's own replies are always
     threaded and two installations in one workspace could otherwise mention-loop
     each other -- a case Bolt's self filter cannot see, since the two bot
@@ -316,7 +317,9 @@ def process_event(
         )
         return None
 
-    reason = classify(event, lane=lane)
+    reason = classify(
+        event, lane=lane, threaded_bot_allowlist=config.slack_threaded_bot_allowlist
+    )
     if reason is not None:
         drop(log, reason, event_id=slack_event_id, lane=lane)
         return None
