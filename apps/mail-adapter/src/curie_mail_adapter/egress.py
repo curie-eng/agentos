@@ -202,6 +202,8 @@ class EgressHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.error("dispatching event type=%s failed unexpectedly", event.event)
             return self._respond(500, {"detail": "adapter error"})
+        if status == 410:
+            return self._respond(status, {"detail": "thread deleted at provider"})
         self._respond(status, ReplyAck().model_dump())
 
     def dispatch(self, event: ReplyEvent) -> int:

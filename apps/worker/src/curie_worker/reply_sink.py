@@ -92,7 +92,7 @@ class RejectedAdapterResponseError(RuntimeError):
 
 
 class DeletedReplyTargetError(RejectedAdapterResponseError):
-    """A completion received HTTP 410: its provider thread is permanently gone."""
+    """The adapter explicitly reports permanent provider thread deletion."""
 
     reason = "thread deleted at provider"
 
@@ -346,7 +346,18 @@ class HttpReplyAdapter:
                         "egress credential to the redirect target"
                     )
                 if response.status == 410 and isinstance(event, TurnCompleted):
-                    raise DeletedReplyTargetError(DeletedReplyTargetError.reason)
+                    # Only this explicit classification is terminal. An unrelated
+                    # adapter's generic 410 must not be mislabeled as deletion.
+                    payload = await _read_capped(response, endpoint)
+                    try:
+                        rejection = json.loads(payload)
+                    except (ValueError, UnicodeDecodeError):
+                        rejection = None
+                    if (
+                        isinstance(rejection, dict)
+                        and rejection.get("detail") == DeletedReplyTargetError.reason
+                    ):
+                        raise DeletedReplyTargetError(DeletedReplyTargetError.reason)
                 if response.status >= 400:
                     # NOT ``raise_for_status()``: see
                     # ``RejectedAdapterResponseError``. The status is the

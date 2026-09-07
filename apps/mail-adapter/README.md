@@ -248,7 +248,9 @@ subprocess.
 A thread lookup returning HTTP 404 after admission is terminal for that reply.
 The adapter durably records deletion, logs one warning with a hashed correlation,
 and returns HTTP 410 on the first and any duplicate completion, including after
-restart. It never records the reply as delivered. The worker dead-letters the
+restart. The response body carries `{"detail":"thread deleted at provider"}`;
+HTTP 410 without that explicit classification remains retryable for other adapters.
+It never records the reply as delivered. The worker dead-letters the
 completion on the first definitive refusal (N = 1) with reason `thread deleted
 at provider`, atomically removing its owed completion from the pending index.
 The existing configured dead-letter stream and size cap apply. Earlier transient
