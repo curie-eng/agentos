@@ -1220,7 +1220,10 @@ def test_quota_capacity_is_terminal_without_retry_or_runner_turn(
 
             await h.kernel.process_event(ev)
 
-            expected = "This agent is at capacity right now. Try again in a few minutes."
+            expected = (
+                "This agent is at capacity right now. It frees up when another "
+                "conversation finishes, so please try again shortly."
+            )
             expected_updates = [("C1", "p-1", expected)]
             if not slack_no_edit_streaming:
                 expected_updates.insert(0, ("C1", "p-1", h.config.booting_text))

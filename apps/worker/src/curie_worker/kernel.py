@@ -2290,7 +2290,10 @@ class Kernel:
             await self._reply_for(
                 qevent,
                 route,
-                "This agent is at capacity right now. Try again in a few minutes.",
+                (
+                    "This agent is at capacity right now. It frees up when "
+                    "another conversation finishes, so please try again shortly."
+                ),
             )
             return TurnOutcome(terminal_ok=True)
         except WorkspaceSelectionRefused as exc:
