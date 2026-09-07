@@ -39,6 +39,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Literal
 
+from .config import ThreadedBotAdmission
+
 #: Which subscribed lane a delivery arrived on. The manifest
 #: (``apps/dispatcher/slack-app-manifest.yaml``) subscribes to exactly two bot
 #: events, so this is the complete set of lanes -- not an open string.
@@ -88,7 +90,8 @@ DROP_RATIONALES: Mapping[DropReason, str] = MappingProxyType(
             "are always threaded, so admitting a bot-authored mention that carries "
             "a thread timestamp would let two Curie installations in one workspace "
             "mention-loop each other indefinitely, which Bolt's self filter cannot "
-            "stop because the two bot identities differ."
+            "stop because the two bot identities differ. Only an explicitly trusted "
+            "sender/channel pair may bypass this refusal."
         ),
         DropReason.NON_CONTENT_SUBTYPE: (
             "The subtype marks something other than new user content: an edit, a "
@@ -191,7 +194,12 @@ def missing_envelope_fields(required: Mapping[str, object]) -> tuple[str, ...]:
     )
 
 
-def classify(event: dict[str, Any], *, lane: Lane) -> DropReason | None:
+def classify(
+    event: dict[str, Any],
+    *,
+    lane: Lane,
+    threaded_bot_allowlist: tuple[ThreadedBotAdmission, ...] = (),
+) -> DropReason | None:
     """The reason this event must not become a turn, or None to admit it.
 
     Args:
@@ -214,11 +222,14 @@ def classify(event: dict[str, Any], *, lane: Lane) -> DropReason | None:
     # own posts are already gone -- Bolt's IgnoringSelfEvents dropped them
     # before this listener ran.
     #
-    # Accepted cost, stated rather than discovered later: an alert bot that
-    # replies INSIDE a thread with a mention is not ingested. Root-only
-    # admission is what separates the ticket's case from the cross-installation
-    # loop without a new schema field or a bot allowlist.
+    # Only an exact pair from operator configuration may bypass this refusal.
+    # These identities come from the Slack event, never message text or a user
+    # field. Bolt's self-event middleware has already run and remains mandatory.
     if lane == "mention" and event.get("bot_id") and event.get("thread_ts"):
-        return DropReason.BOT_AUTHORED_THREAD_REPLY
+        if not any(
+            pair.channel_id == event.get("channel") and pair.bot_id == event.get("bot_id")
+            for pair in threaded_bot_allowlist
+        ):
+            return DropReason.BOT_AUTHORED_THREAD_REPLY
 
     return None
