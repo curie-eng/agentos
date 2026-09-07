@@ -80,6 +80,76 @@ fn generate_rsa_pem(path: &Path) {
     std::fs::write(path, output.stdout).expect("write generated PEM");
 }
 
+/// Derive the public half of a generated key, so a signature can be checked
+/// against something other than the library that produced it.
+fn rsa_public_pem(private_key: &Path, out: &Path) {
+    let output = Command::new("openssl")
+        .args(["rsa", "-pubout", "-in"])
+        .arg(private_key)
+        .arg("-out")
+        .arg(out)
+        .output()
+        .unwrap_or_else(|e| panic!("openssl rsa -pubout: {e}"));
+    assert!(
+        output.status.success(),
+        "openssl rsa -pubout failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Verify the JWT's RS256 signature with openssl rather than with
+/// `jsonwebtoken`.
+///
+/// Decoding the claims (`jwt_payload`) proves only that the CLI emitted three
+/// dot-separated segments with the right `iss`; a backend that produced a
+/// malformed, truncated, or wrongly-padded signature would satisfy every
+/// claim assertion in this file and be rejected only by GitHub, in
+/// production. That mattered when #2381 moved the RS256 implementation from
+/// the pure-Rust `rsa` crate to `aws-lc-rs`: the swap is exactly the kind
+/// that a claims-only test cannot see. openssl is used deliberately because
+/// verifying an `aws-lc-rs` signature with `aws-lc-rs` would be circular.
+fn assert_rs256_signature_verifies(authorization: &str, private_key: &Path, dir: &Path) {
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .unwrap_or_else(|| panic!("Authorization is not a Bearer token: {authorization}"));
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(
+        parts.len(),
+        3,
+        "a JWS compact serialization has exactly three segments: {token}"
+    );
+    let signature =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[2])
+            .unwrap_or_else(|e| panic!("JWT signature is not base64url: {e}"));
+    assert!(
+        !signature.is_empty(),
+        "JWT carries an empty signature: {token}"
+    );
+
+    let public_key = dir.join("app.pub.pem");
+    rsa_public_pem(private_key, &public_key);
+    let signing_input = dir.join("jwt.signing-input");
+    std::fs::write(&signing_input, format!("{}.{}", parts[0], parts[1]))
+        .expect("write JWT signing input");
+    let signature_path = dir.join("jwt.sig");
+    std::fs::write(&signature_path, &signature).expect("write JWT signature");
+
+    let output = Command::new("openssl")
+        .args(["dgst", "-sha256", "-verify"])
+        .arg(&public_key)
+        .arg("-signature")
+        .arg(&signature_path)
+        .arg(&signing_input)
+        .output()
+        .unwrap_or_else(|e| panic!("openssl dgst -verify: {e}"));
+    assert!(
+        output.status.success(),
+        "the App JWT's RS256 signature does not verify against its own key: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn b64(bytes: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
 }
@@ -271,6 +341,7 @@ fn assert_probed_matching_app(probe: &Probe) {
         Some(MATCHING_APP_ID),
         "JWT iss must be the requested App id: {claims}"
     );
+    assert_rs256_signature_verifies(auth, &PathBuf::from(probe.private_key()), probe.dir.path());
 }
 
 #[test]
