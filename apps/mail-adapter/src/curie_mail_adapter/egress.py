@@ -154,7 +154,7 @@ class EgressHandler(BaseHTTPRequestHandler):
             )
             return self._respond(
                 200 if ready else 503,
-                {**status, "status": "ready" if ready else "not_ready"},
+                {"status": "ready" if ready else "starting"},
             )
         self._respond(404, {"detail": "not found"})
 
