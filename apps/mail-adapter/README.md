@@ -148,10 +148,34 @@ API), or when ingress is enabled with an empty allow-list.
 
 `GET /healthz` answers 200 with a fixed body and reveals nothing about the
 install. `GET /readyz` stays non-200 until SQLite has opened and the first-start
-prime or restart confirmation has completed. After startup it checks local state
-only: an AgentMail outage does not flap readiness. `POST` to either path is not
-special-cased; it requires the egress secret like every other POST, so a probe
-path cannot become an unauthenticated write.
+prime or restart confirmation has completed. It also returns 503 when ingress is
+enabled and the configured channel token is missing, malformed, expired, or was
+rejected with HTTP 401. Expiry is checked on every probe, including before any
+inbound mail. An AgentMail outage does not flap readiness. Liveness remains 200
+so an expired credential does not create a restart loop.
+
+`GET /statusz` returns safe diagnostic metadata: token presence, the unverified
+`exp` claim as Unix seconds, state (`ok`, `expiring` within five minutes,
+`expired`, `rejected`, `missing`, `invalid`, or `disabled`), and the last platform
+ingress HTTP status since process start. It never returns the token or its
+channel identity. The adapter cannot verify the signature: `ok` means the
+decoded expiry is in the future and no 401 has been observed, not proof that
+the platform will accept the token. A 401 latches rejection until a successful
+ingress response or process restart. `POST` to a probe path still requires the
+egress secret like every other POST.
+
+`curie cluster status --json` includes these diagnostics on the mail pod and
+reports unhealthy for an unusable token. `curie doctor --json` reports a mail
+channel check with expiry, last ingress status, and a recovery command. Both
+read the adapter through Kubernetes pod proxy access, so diagnostics remain
+reachable after readiness removes the pod from Service endpoints. Unavailable
+diagnostics report unknown instead of healthy.
+
+For recovery, mint a replacement via `POST /channels/token` using the platform
+`X-API-Key` and the bound email address, install `response.token` in the Secret
+key supplying `CURIE_CHANNEL_TOKEN`, then restart the mail-adapter Deployment.
+The doctor output includes the curl and rollout commands. No platform signing
+key is given to the adapter.
 
 ## Operations notes
 

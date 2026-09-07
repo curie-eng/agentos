@@ -28,6 +28,7 @@ pub mod guide;
 pub mod installation;
 pub mod interactive;
 pub mod local;
+pub mod mail_channel;
 pub mod message;
 pub mod migrate_store;
 pub mod modelpin;

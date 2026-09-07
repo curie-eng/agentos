@@ -1883,6 +1883,7 @@ fn doctor_output_validates() {
         slack_app_token: true,
         slack_bot_token: true,
         clone_credential: Some("github app (app_id=1234567)".to_string()),
+        mail_channels: vec![],
         api_exposure: None,
         agents: Some(vec![("bot".to_string(), None)]),
     };
@@ -1953,6 +1954,7 @@ fn doctor_ready_tracks_the_checks() {
         slack_app_token: true,
         slack_bot_token: true,
         clone_credential: Some("github app (secret=gh-app)".to_string()),
+        mail_channels: vec![],
         api_exposure: Some("NodePort 30799".to_string()),
         agents: Some(vec![("bot".to_string(), Some("acme/bot".to_string()))]),
     };
@@ -2387,6 +2389,7 @@ fn cluster_status_output_validates_both_variants() {
         release_found: true,
         release_missing_note: None,
         pods: vec![PodRow {
+            mail_channel: None,
             name: "curie-worker-0".to_string(),
             ready: "1/1".to_string(),
             status: "Running".to_string(),
@@ -2399,6 +2402,22 @@ fn cluster_status_output_validates_both_variants() {
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());
+    let mut with_mail = out.to_json();
+    with_mail["pods"]["rows"][0]["mail_channel"] =
+        serde_json::to_value(curie::mail_channel::Report {
+            pod: "acme-mail-0".to_string(),
+            channel_token: Some(curie::mail_channel::Token {
+                present: true,
+                exp: Some(1_800_000_000),
+                state: curie::mail_channel::TokenState::Expired,
+            }),
+            last_ingress_status: None,
+            detail: "mail channel token: expired".to_string(),
+            fix: Some("re-mint".to_string()),
+        })
+        .unwrap();
+    assert_valid("cluster-status.schema.json", &with_mail);
+
     let dry = ClusterStatusOutput::DryRun(DryRunPlan {
         lines: vec!["helm status".to_string()],
     });

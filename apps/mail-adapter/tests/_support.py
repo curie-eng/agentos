@@ -20,6 +20,7 @@ about production. See `MailState.visible` for the behavior and its sources.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
@@ -40,7 +41,10 @@ from curie_mail_adapter.egress import ADAPTER_SECRET_HEADER
 
 INBOX = "sandbox@agentmail.to"
 AGENTMAIL_API_KEY = "amk-tst"
-CHANNEL_TOKEN = "chn-tst"
+# Diagnostic claims use the real platform token shape; signature verification
+# belongs to platform ingress, not the adapter status reader.
+_CHANNEL_TOKEN_PAYLOAD = base64.urlsafe_b64encode(b'{"exp":4102444800}').decode().rstrip("=")
+CHANNEL_TOKEN = f"chn.{_CHANNEL_TOKEN_PAYLOAD}.test-signature"
 EGRESS_SECRET = "egr-tst"
 ALLOWED_SENDER = "human@example.com"
 STRANGER = "stranger@evil.example"
