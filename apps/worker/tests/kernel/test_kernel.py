@@ -1220,11 +1220,7 @@ def test_quota_capacity_is_terminal_without_retry_or_runner_turn(
 
             await h.kernel.process_event(ev)
 
-            expected = (
-                "This agent is at sandbox capacity. ResourceQuota curie-sandbox-quota "
-                "rejected limits.cpu: requested 2, observed usage 7, hard limit 8. "
-                "Try again after another conversation releases its sandbox."
-            )
+            expected = "This agent is at capacity right now. Try again in a few minutes."
             expected_updates = [("C1", "p-1", expected)]
             if not slack_no_edit_streaming:
                 expected_updates.insert(0, ("C1", "p-1", h.config.booting_text))
@@ -1234,6 +1230,64 @@ def test_quota_capacity_is_terminal_without_retry_or_runner_turn(
             assert h.runner.opened == []
             assert h.kernel._order_locks == {}
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_quota_refusal_keeps_operator_accounting_out_of_the_reply(
+    make_harness, caplog
+) -> None:
+    """The quota's identity and numbers go to the log, never to the person.
+
+    #2434: the reply body interpolated `quota_name`, `resource`, `requested`,
+    `used` and `hard` verbatim, and on 2026-09-06 that reached a customer Slack
+    channel three times. Those five fields are operator data -- they say nothing
+    to whoever asked the question, and they disclose cluster capacity to anyone
+    who can talk to the bot.
+
+    Asserted as absence of the VALUES rather than equality with the new
+    sentence, so rewording the refusal cannot silently reintroduce them. The
+    second half pins the other side of the boundary: the operator loses nothing,
+    so there is no pressure to put any of it back in the reply.
+    """
+
+    async def go() -> None:
+        async with make_harness(max_attempts=3, claim_timeout_seconds=0.05) as h:
+            h.fake_k8s.quota_rejection = QuotaRejection(
+                quota_name="curie-sandbox-quota",
+                resource="limits.cpu",
+                requested="2",
+                used="7",
+                hard="8",
+            )
+
+            with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                await h.kernel.process_event(_qevent("go"))
+
+            reply = h.sink.updates[-1][2]
+            for leaked in ("curie-sandbox-quota", "limits.cpu", "ResourceQuota"):
+                assert leaked not in reply, (
+                    f"the capacity refusal must not carry {leaked!r}: it is operator "
+                    f"data and this text is read by a customer. Got: {reply!r}"
+                )
+            assert "quota" not in reply.lower(), (
+                f"the capacity refusal must not name the quota mechanism at all. "
+                f"Got: {reply!r}"
+            )
+
+            logged = "\n".join(record.getMessage() for record in caplog.records)
+            for kept in (
+                "curie-sandbox-quota",
+                "limits.cpu",
+                "requested=2",
+                "used=7",
+                "hard=8",
+            ):
+                assert kept in logged, (
+                    f"the operator log must still carry {kept!r}: taking it out of "
+                    f"the reply must not cost the operator the diagnosis. "
+                    f"Got: {logged!r}"
+                )
 
     asyncio.run(go())
 
