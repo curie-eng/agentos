@@ -6843,7 +6843,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
 
     // (b) Pod health.
     let (ok, out, _) = pods_read?;
-    let (pods, ready, total, mut unhealthy) = if ok {
+    let (mut pods, ready, total, mut unhealthy) = if ok {
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&out)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
@@ -6852,6 +6852,22 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     } else {
         (Vec::new(), 0, 0, Vec::new())
     };
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&out) {
+        if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
+            for report in
+                crate::mail_channel::observe_pods(&opts.namespace, &opts.release, items).await
+            {
+                if !report.healthy() {
+                    unhealthy.push(format!("{}: {}", report.pod, report.detail));
+                }
+                if let Some(row) = pods.iter_mut().find(|row| row.name == report.pod) {
+                    row.status = format!("{}; {}", row.status, report.detail);
+                    row.mail_channel = Some(report);
+                }
+            }
+        }
+    }
 
     // The same target-manifest check gates up/apply and this read surface.
     // Keep the existing JSON schema: diagnoses use its unhealthy string list.
@@ -7593,11 +7609,17 @@ pub struct PodRow {
     pub name: String,
     pub ready: String,
     pub status: String,
+    pub mail_channel: Option<crate::mail_channel::Report>,
 }
 
 impl PodRow {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({"pod": self.name, "ready": self.ready, "status": self.status})
+        let mut value =
+            serde_json::json!({"pod": self.name, "ready": self.ready, "status": self.status});
+        if let Some(report) = &self.mail_channel {
+            value["mail_channel"] = serde_json::to_value(report).expect("mail status serializes");
+        }
+        value
     }
 }
 
@@ -7670,6 +7692,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
             name: name.clone(),
             ready: ready_col,
             status: display_status.to_string(),
+            mail_channel: None,
         });
         if phase == "Succeeded" || reason == "Completed" || terminating {
             continue;

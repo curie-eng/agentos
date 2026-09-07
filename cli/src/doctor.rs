@@ -168,6 +168,7 @@ pub struct Facts {
     /// mechanism the chart knows about is in place -- which is NOT proof it is
     /// unreachable, since a load balancer or tunnel in front is invisible here.
     pub api_exposure: Option<String>,
+    pub mail_channels: Vec<crate::mail_channel::Report>,
 }
 
 fn ok(id: &'static str, title: &'static str, detail: impl Into<String>) -> Check {
@@ -875,6 +876,27 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             out.push(skipped(id, title, reason));
         }
         return out;
+    }
+
+    if f.mail_channels.is_empty() {
+        out.push(skipped(
+            "mail-channel",
+            "Mail channel token",
+            "mail adapter not deployed",
+        ));
+    }
+    for report in &f.mail_channels {
+        out.push(Check {
+            id: "mail-channel",
+            title: "Mail channel token",
+            state: if report.healthy() {
+                State::Ok
+            } else {
+                State::Missing
+            },
+            detail: report.detail.clone(),
+            fix: report.fix.clone(),
+        });
     }
 
     // Socket mode needs BOTH tokens, and this check used to read only the bot
@@ -4405,7 +4427,22 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         crate::ops::fetch_release_values(&common),
     );
 
+    // Failed values reads must not claim that the mail adapter is disabled.
+    f.mail_channels = vec![crate::mail_channel::unavailable(namespace, release)];
     if let Ok(Some(computed)) = computed {
+        f.mail_channels.clear();
+        if computed
+            .get("mailAdapter")
+            .and_then(|value| value.get("deploy"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            f.mail_channels = crate::mail_channel::observe(namespace, release).await;
+            if f.mail_channels.is_empty() {
+                f.mail_channels
+                    .push(crate::mail_channel::unavailable(namespace, release));
+            }
+        }
         // The key travels with the id: the chart reads one of two, and a fix
         // naming the other one is a command that changes nothing.
         if let Some((model, key)) = runner_model_from_values(&computed) {
