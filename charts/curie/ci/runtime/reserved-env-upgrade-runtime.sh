@@ -104,7 +104,7 @@ for timeout in 600 599; do
   # mutate both deployments if Helm reached its apply phase.
   if helm upgrade acme "$CHART" --kube-context "$context" -n "$namespace" \
       -f "$TMP/retained.yaml" --set worker.runnerTotalTimeoutSeconds="$timeout" \
-      --set worker.upgradeDrain.enabled=true --set-string api.podAnnotations.upgrade-probe=changed \
+      --set worker.upgradeDrain.enabled=true --set-string placement.platform.annotations.upgrade-probe=changed \
       > "$TMP/refusal.log" 2>&1; then
     echo "accepted legacy duplicate on upgrade" >&2; exit 1
   fi
