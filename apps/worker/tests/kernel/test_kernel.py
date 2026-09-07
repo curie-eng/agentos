@@ -1256,19 +1256,33 @@ def test_quota_refusal_keeps_operator_accounting_out_of_the_reply(
 
     async def go() -> None:
         async with make_harness(max_attempts=3, claim_timeout_seconds=0.05) as h:
-            h.fake_k8s.quota_rejection = QuotaRejection(
+            # Multi-digit and distinctive on purpose. The reply assertions below
+            # are substring checks, so a single-digit "2" would collide with any
+            # unrelated number a future refusal might legitimately carry (a wait
+            # time, say) and fail for the wrong reason.
+            rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
                 resource="limits.cpu",
-                requested="2",
-                used="7",
-                hard="8",
+                requested="11",
+                used="47",
+                hard="53",
             )
+            h.fake_k8s.quota_rejection = rejection
 
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                 await h.kernel.process_event(_qevent("go"))
 
+            # Read off the rejection rather than retyping literals, so the two
+            # halves of the boundary cannot drift apart.
             reply = h.sink.updates[-1][2]
-            for leaked in ("curie-sandbox-quota", "limits.cpu", "ResourceQuota"):
+            for leaked in (
+                rejection.quota_name,
+                rejection.resource,
+                rejection.requested,
+                rejection.used,
+                rejection.hard,
+                "ResourceQuota",
+            ):
                 assert leaked not in reply, (
                     f"the capacity refusal must not carry {leaked!r}: it is operator "
                     f"data and this text is read by a customer. Got: {reply!r}"
@@ -1280,11 +1294,11 @@ def test_quota_refusal_keeps_operator_accounting_out_of_the_reply(
 
             logged = "\n".join(record.getMessage() for record in caplog.records)
             for kept in (
-                "curie-sandbox-quota",
-                "limits.cpu",
-                "requested=2",
-                "used=7",
-                "hard=8",
+                f"quota={rejection.quota_name}",
+                f"resource={rejection.resource}",
+                f"requested={rejection.requested}",
+                f"used={rejection.used}",
+                f"hard={rejection.hard}",
             ):
                 assert kept in logged, (
                     f"the operator log must still carry {kept!r}: taking it out of "
