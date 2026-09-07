@@ -320,6 +320,9 @@ Each has an integration test under `apps/worker/tests/`:
    preventing replacement replicas from racing through the delivery budget;
    unknown older consumers retain `XAUTOCLAIM` as the compatibility backstop
    ([`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`](apps/worker/src/curie_worker/stream_consumer.py)).
+   The same `_reclaim_once` also transfers a delivery whose lease has expired even
+   when its PEL consumer is still alive, so a live handler that raised and released
+   its lease is not stuck waiting for a peer to be proven dead.
    A restarted generation first recovers rows under its own stable consumer name.
    The runs consumer group is created at `$`, so a cold worker never replays ancient
    backlog ([`apps/worker/src/curie_worker/consumer.py::Consumer.ensure_group`](apps/worker/src/curie_worker/consumer.py)).

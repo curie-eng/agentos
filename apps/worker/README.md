@@ -121,7 +121,10 @@ Runtime rules (each has a provoking integration test in `tests/eval/test_stream.
 - **XACK only after the report POST attempt completes** (success, or terminally failed
   after bounded retries and logged). A worker crash before that leaves the entry
   pending. The shared runs/eval liveness path promptly transfers a capable dead
-  consumer's PEL after two lease-absence observations; unknown older consumers
+  consumer's PEL after two lease-absence observations. A live consumer's own
+  stranded row (delivery state present, delivery lease expired) is separately
+  recovered by the lease-expiry pass after about one lease TTL. Unknown older
+  consumers, or an entry with no delivery state at all,
   retain the 15-minute `XAUTOCLAIM` fallback. A restarted generation first
   recovers rows under its own stable consumer name. The entry is re-run, so
   delivery is **at-least-once** with a best-effort
@@ -152,9 +155,11 @@ the Slack thread by editing the placeholder in place, and gets every failure
 mode right.
 
 ```
-XREADGROUP curie:runs        Consumer (consumer group; XAUTOCLAIM reclaims a
-   -> QueuedTurn                  dead consumer's pending entries after an idle
-   -> Kernel.process_event        timeout, then reprocesses them idempotently)
+XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
+   -> QueuedTurn                  reclaimed by proof of death, by lease expiry,
+   -> Kernel.process_event        or as a compatibility backstop by XAUTOCLAIM
+                                  after an idle timeout, then reprocessed
+                                  idempotently)
         -> SlackSink     chat.update placeholder to booting text (best effort)
         -> substrate.lookup/claim/resume   (sandbox substrate)
         -> RunnerClient  POST /v1/event | /v1/steer | /v1/interrupt   (runner)
@@ -202,7 +207,11 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   A renewable worker lease distinguishes process death from ordinary consumer
   idle. After two absent observations, one replacement wins a Valkey arbitration
   lease and transfers the dead consumer's pending entries without racing other
-  replicas through the delivery budget. Unknown older consumers retain the
+  replicas through the delivery budget. A delivery whose handler raised released
+  its lease and left its entry pending under a consumer that is still alive; the
+  lease-expiry pass recovers that row after about one lease TTL
+  (`CURIE_LEASE_EXPIRED_IDLE_MS`) rather than leaving it to the backstop.
+  Unknown older consumers, and any entry with no delivery state, retain the
   15-minute `XAUTOCLAIM` fallback; a restarted generation also recovers pending
   rows left under its own stable consumer name. The markers make reprocessing safe.
 - **Bounded delivery + a dead-letter graveyard** (ADR-0039, an Architecture
@@ -314,7 +323,9 @@ Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
 `CURIE_STREAM` / `CURIE_CONSUMER_GROUP` / `CURIE_CONSUMER_NAME`,
 `CURIE_MAX_ATTEMPTS`, `CURIE_MAX_DELIVERY` / `CURIE_DEAD_LETTER_STREAM` /
 `CURIE_DEAD_LETTER_MAXLEN` (approximate graveyard cap, default `10000`, minimum
-`1`), plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for
+`1`), `CURIE_LEASE_EXPIRED_IDLE_MS` (the lease-expiry reclaim threshold, default
+one delivery lease TTL) and `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
+when a delivery's handler raises), plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for
 the substrate. Run with `python -m curie_worker`.
 
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
