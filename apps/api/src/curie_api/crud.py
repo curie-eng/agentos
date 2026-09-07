@@ -208,6 +208,27 @@ async def agent_has_active_deployment(session: AsyncSession, agent_id: uuid.UUID
     return result is not None
 
 
+async def version_has_active_deployment(session: AsyncSession, version_id: uuid.UUID) -> bool:
+    """Whether an active deployment row ALREADY points at this version (#2436).
+
+    The version-scoped sibling of ``agent_has_active_deployment``, and the
+    condition that makes the approval-route gate on a bundle attachment
+    conditional. An ordinary pre-deployment upload stays unrestricted, because
+    the CLI's ``prepare_deploy`` uploads before ``curie <tier> approvals`` binds;
+    an attachment onto a version the worker's resolve query can already boot
+    (``curie_worker.binding`` joins ``deployments.status = 'active'`` to
+    ``agent_versions.bundle_ref``) is the moment the bundle goes live, so it is
+    gated like a deployment.
+    """
+
+    result = await session.scalar(
+        select(Deployment.id)
+        .where(Deployment.version_id == version_id, Deployment.status == "active")
+        .limit(1)
+    )
+    return result is not None
+
+
 async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     # Remove child rows first, then the agent. Bulk deletes bypass the ORM
     # relationship cascade (which would emit an async lazy-load during flush) and
@@ -661,6 +682,40 @@ async def get_active_deployment(
         .limit(1)
     )
     return result
+
+
+async def list_active_deployment_versions(
+    session: AsyncSession, agent_id: uuid.UUID
+) -> list[AgentVersion]:
+    """Every DISTINCT version the agent has an active deployment of, one query.
+
+    Deliberately NOT built on ``get_active_deployment`` (#2436). That helper
+    returns only the NEWEST active row per environment, which is the right answer
+    to "what is current" and the wrong set for "what can this write strand":
+    git-flow appends a new active row per push without superseding older ones,
+    ``end_deployment`` marks exactly one row stopped, and the worker's resolve
+    query orders over ALL active rows
+    (``apps/worker/src/curie_worker/binding.py``). So several active rows
+    routinely coexist in one environment, and a check built on "newest per
+    environment" would let an operator end the newest deployment and immediately
+    unbind a route an older, still-active, still-bootable row declares.
+
+    Rows sharing a version share one bundle object, so the join collapses them
+    here rather than leaving the caller to de-duplicate a row list: each version
+    comes back once, ordered by the earliest active row pointing at it.
+
+    ``get_active_deployment`` is left unchanged: ``create_deployment_row``'s
+    ``workspace_enabled`` inheritance depends on its "newest" semantics.
+    """
+
+    result = await session.scalars(
+        select(AgentVersion)
+        .join(Deployment, Deployment.version_id == AgentVersion.id)
+        .where(Deployment.agent_id == agent_id, Deployment.status == "active")
+        .group_by(AgentVersion.id)
+        .order_by(func.min(Deployment.deployed_at))
+    )
+    return list(result)
 
 
 async def list_deployments(

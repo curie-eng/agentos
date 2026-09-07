@@ -15,7 +15,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from .. import bundles, crud
+from .. import bundles, crud, deploy
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
@@ -150,7 +150,9 @@ async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)
-async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep) -> AgentOut:
+async def update_agent(
+    agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep, store: StoreDep
+) -> AgentOut:
     # No binding key here since ADR-0118: an agent may hold several bindings, so
     # "move the agent's channel" has no referent and the write surface is the
     # `/agents/{agent_id}/channels` subresource below. A caller still sending the
@@ -158,6 +160,42 @@ async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionD
     agent = await crud.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    # The declared/bound approval-route join, judged BEFORE the first mutation
+    # (#2436). A write to `approval_routes` is a full replacement (`--route`,
+    # `--routes-from` and `--clear-routes` all replace the whole map), so
+    # dropping a route a live bundle declares strands the human its gate exists
+    # to reach exactly as effectively as a bad deploy does; ADR-0050's bounded
+    # residual has to hold on this side of the join too.
+    #
+    # It is a PREFLIGHT rather than a check beside the write further down
+    # because the field blocks below commit through independently committing
+    # helpers, so a refusal placed at the `approval_routes` block would leave
+    # `model`, `thinking`, `memory` and `approval_required_tools` persisted from
+    # a request this handler answered 422.
+    #
+    # EVERY active row is judged, in both environments: git-flow appends a new
+    # active row per push without superseding older ones and `end_deployment`
+    # stops exactly one row, so several coexist and the worker boots from an
+    # ordering over all of them. Rows sharing a version share one bundle object,
+    # so `list_active_deployment_versions` collapses them to one version each --
+    # which turns the common case of repeated pushes of one version into a
+    # single fetch.
+    if data.approval_routes is not None:
+        proposed = {name: b.model_dump() for name, b in data.approval_routes.items()}
+        for version in await crud.list_active_deployment_versions(session, agent_id):
+            try:
+                await deploy.check_approval_route_bindings(store, version, proposed)
+            except deploy.BundleTooLarge as exc:
+                # Learning what a live bundle declares means extracting it, so
+                # this preflight inherits the caps question even when the write
+                # keeps every declared route bound. Unlike `POST /deployments`,
+                # nothing here calls `revalidate_stored_bundle` first, so this is
+                # where an over-cap stored bundle surfaces -- as the same
+                # actionable 422 that endpoint returns (ADR-0059 decision 3),
+                # never a 500.
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            except deploy.ApprovalRoutesUnbound as exc:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     # Presence, not truthiness (#1310). `is not None` conflates "the client did
     # not mention this field" with "the client explicitly sent null", so setting
     # either override used to be a one-way door: nothing could put it back to the
@@ -181,6 +219,9 @@ async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionD
         agent = await crud.update_agent_approval_tools(session, agent, data.approval_required_tools)
     if data.approval_routes is not None:
         # Omitted leaves the bindings unchanged; an explicit {} clears them (#247).
+        # Only the write: the preflight at the top of this handler has already
+        # judged this same map against every active deployment's declared routes
+        # (#2436), because by here four other fields are already committed.
         agent = await crud.update_agent_approval_routes(
             session,
             agent,

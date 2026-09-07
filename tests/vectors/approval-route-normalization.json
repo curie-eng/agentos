@@ -1,0 +1,98 @@
+{
+  "description": "The frozen declared-approval-route normalization, executed from BOTH sides of the deploy-time/runtime seam (#2436). `gates` is the manifest `approvalPolicy.gates` list, or null for a manifest that declares no `approvalPolicy` at all. `expected` is either the SORTED list of route names the bundle declares, or the string \"rejected\" for the fail-closed case where a declared gate arms no tool. The API reader (`curie_api.bundles.declared_approval_routes`) must return the set for a route list and the None poison value for \"rejected\"; the runtime loader (`curie_runner.approval.resolve_approval_policy`) must return a `route_by_tool` map whose values are that same set, and must RAISE `ApprovalPolicyError` for \"rejected\". Code cannot be shared -- packages/plugin-format is frozen and the API must not import curie_runner -- so this file is the shared rule, following the pattern of runner/tests/test_approval.py::test_route_normalization_agrees_between_validator_and_runner. Note the declared set is `set(route_by_tool.values())` and NOT the union of every gate's route: the loader's map is last-wins per tool, so an earlier route for a repeated tool can never be raised at runtime.",
+  "cases": [
+    {
+      "id": "plain-route",
+      "gates": [{"gate": "Bash", "route": "ops"}],
+      "expected": ["ops"]
+    },
+    {
+      "id": "padded-route",
+      "gates": [{"gate": "Bash", "route": "  ops  "}],
+      "expected": ["ops"]
+    },
+    {
+      "id": "padded-gate",
+      "gates": [{"gate": "  Bash  ", "route": "ops"}],
+      "expected": ["ops"]
+    },
+    {
+      "id": "blank-gate",
+      "gates": [{"gate": "   ", "route": "ops"}],
+      "expected": "rejected"
+    },
+    {
+      "id": "empty-gate",
+      "gates": [{"gate": "", "route": "ops"}],
+      "expected": "rejected"
+    },
+    {
+      "id": "blank-route",
+      "gates": [{"gate": "Bash", "route": "   "}],
+      "expected": "rejected"
+    },
+    {
+      "id": "empty-route",
+      "gates": [{"gate": "Bash", "route": ""}],
+      "expected": "rejected"
+    },
+    {
+      "id": "one-unarmed-gate-among-valid-ones",
+      "gates": [
+        {"gate": "Bash", "route": "ops"},
+        {"gate": "Write", "route": "   "}
+      ],
+      "expected": "rejected"
+    },
+    {
+      "id": "same-tool-twice-last-route-wins",
+      "gates": [
+        {"gate": "Bash", "route": "alpha"},
+        {"gate": "Bash", "route": "omega"}
+      ],
+      "expected": ["omega"]
+    },
+    {
+      "id": "same-tool-twice-padded-duplicate-of-one-route",
+      "gates": [
+        {"gate": "Bash", "route": "ops"},
+        {"gate": "Bash", "route": " ops "}
+      ],
+      "expected": ["ops"]
+    },
+    {
+      "id": "duplicate-identical-route-across-two-gates",
+      "gates": [
+        {"gate": "Bash", "route": "ops"},
+        {"gate": "Write", "route": "ops"}
+      ],
+      "expected": ["ops"]
+    },
+    {
+      "id": "two-tools-two-routes",
+      "gates": [
+        {"gate": "Bash", "route": "ops"},
+        {"gate": "Write", "route": "finance"}
+      ],
+      "expected": ["finance", "ops"]
+    },
+    {
+      "id": "routes-differing-only-by-case-are-two-routes",
+      "gates": [
+        {"gate": "Bash", "route": "ops"},
+        {"gate": "Write", "route": "Ops"}
+      ],
+      "expected": ["Ops", "ops"]
+    },
+    {
+      "id": "no-approval-policy",
+      "gates": null,
+      "expected": []
+    },
+    {
+      "id": "empty-gates-list",
+      "gates": [],
+      "expected": []
+    }
+  ]
+}
