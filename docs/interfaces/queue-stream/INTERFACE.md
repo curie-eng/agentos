@@ -203,8 +203,9 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   The resume reconciler only acts on stream-consumer rows with a `payload` and
   the expected resume metadata, so it skips completion-outbox rows. The API
   re-derives the graveyard name as `<stream>:dead` rather than reading the
-  worker's config. A second broker must account for both dead-letter writers and
-  these two API-side readers, none of which go through a port today.
+  worker's config. The PEL writer already uses `StreamBroker.xadd`; a second
+  broker must additionally account for the off-port completion-outbox writer
+  and these two API-side readers.
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its
