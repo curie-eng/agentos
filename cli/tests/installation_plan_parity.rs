@@ -2015,6 +2015,365 @@ fn existing_secret_preservation_survives_plain_cli_up_apply_and_diff() {
 }
 
 #[test]
+fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserves_them() {
+    const APP_TOKEN: &str = "xapp-PLACEHOLDER-1801";
+    const BOT_TOKEN: &str = "xoxb-PLACEHOLDER-1801";
+    let existing = json!({
+        "dispatcher": {"slack": {
+            "appTokenExistingSecret": "acme-declarative-app-source",
+            "appTokenExistingSecretKey": "custom-app-selector",
+            "botTokenExistingSecret": "acme-declarative-bot-source",
+            "botTokenExistingSecretKey": "custom-bot-selector"
+        }}
+    });
+    let config = format!(
+        "{}comms:\n  slack:\n    app_token: CURIE_TEST_DECLARATIVE_APP_TOKEN\n    bot_token: CURIE_TEST_DECLARATIVE_BOT_TOKEN\n",
+        installation_for_the_stateful_guard()
+    );
+    let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing.clone()));
+    let captured = fixture.temp.path().join("declarative-comms-values.yaml");
+    let env = [
+        ("CURIE_TEST_DECLARATIVE_APP_TOKEN", APP_TOKEN),
+        ("CURIE_TEST_DECLARATIVE_BOT_TOKEN", BOT_TOKEN),
+        (
+            "CURIE_TEST_CAPTURE_ALL_VALUES",
+            captured.to_str().expect("UTF 8 capture path"),
+        ),
+    ];
+
+    let diff_output = fixture.diff(&env);
+    let diff_visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&diff_output.stdout),
+        String::from_utf8_lossy(&diff_output.stderr)
+    );
+    let diff = json_output(diff_output, "diff with declarative Slack replacement");
+    for source in [
+        "dispatcher.slack.appTokenExistingSecret",
+        "dispatcher.slack.botTokenExistingSecret",
+    ] {
+        let source_entry = entry(&diff, source);
+        assert_eq!(source_entry["kind"], "change", "{source_entry}");
+        assert_eq!(source_entry["to"], "<secret>", "{source_entry}");
+    }
+    for token in [APP_TOKEN, BOT_TOKEN] {
+        assert!(
+            !diff_visible.contains(token),
+            "a declarative Slack token leaked from diff: {diff_visible}"
+        );
+    }
+
+    let apply_output = fixture.apply(&[], &env);
+    let apply_visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply_output.stdout),
+        String::from_utf8_lossy(&apply_output.stderr)
+    );
+    let apply = json_output(apply_output, "apply with declarative Slack replacement");
+    assert_eq!(apply["comms"], true, "{apply}");
+    for token in [APP_TOKEN, BOT_TOKEN] {
+        assert!(
+            !apply_visible.contains(token),
+            "a declarative Slack token leaked from apply: {apply_visible}"
+        );
+    }
+    let calls = fixture.calls();
+    let app_assignment = format!("dispatcher.slack.appToken={APP_TOKEN}");
+    let bot_assignment = format!("dispatcher.slack.botToken={BOT_TOKEN}");
+    for source in [
+        "dispatcher.slack.appTokenExistingSecret=",
+        "dispatcher.slack.botTokenExistingSecret=",
+        app_assignment.as_str(),
+        bot_assignment.as_str(),
+    ] {
+        assert!(
+            calls.contains(source),
+            "the follow-up comms upgrade must consume the declared Slack replacement"
+        );
+    }
+
+    let retained = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(existing.clone()),
+    );
+    let retained_capture = retained.temp.path().join("retained-byo-comms-values.yaml");
+    let retained_env = [(
+        "CURIE_TEST_CAPTURE_ALL_VALUES",
+        retained_capture.to_str().expect("UTF 8 capture path"),
+    )];
+    let retained_diff = json_output(
+        retained.diff(&retained_env),
+        "diff without comms declaration",
+    );
+    for source in [
+        "dispatcher.slack.appTokenExistingSecret",
+        "dispatcher.slack.botTokenExistingSecret",
+    ] {
+        assert_eq!(entry(&retained_diff, source)["kind"], "preserved");
+    }
+    json_output(
+        retained.apply(&[], &retained_env),
+        "apply without comms declaration",
+    );
+    let documents: Vec<Value> = fs::read_to_string(&retained_capture)
+        .expect("plain apply Helm values")
+        .split("\n---\n")
+        .filter(|document| !document.trim().is_empty())
+        .map(|document| serde_norway::from_str(document).expect("private Helm values JSON"))
+        .collect();
+    for source in [
+        "/dispatcher/slack/appTokenExistingSecret",
+        "/dispatcher/slack/botTokenExistingSecret",
+    ] {
+        let expected = existing.pointer(source).expect("recorded BYO source");
+        assert!(
+            documents
+                .iter()
+                .any(|document| document.pointer(source) == Some(expected)),
+            "plain apply must retain {source}"
+        );
+    }
+    assert!(
+        !retained
+            .calls()
+            .contains("dispatcher.slack.appTokenExistingSecret="),
+        "an omitted comms declaration must not clear the app source:\n{}",
+        retained.calls()
+    );
+    assert!(
+        !retained
+            .calls()
+            .contains("dispatcher.slack.botTokenExistingSecret="),
+        "an omitted comms declaration must not clear the bot source:\n{}",
+        retained.calls()
+    );
+}
+
+#[test]
+fn empty_inline_only_sealing_source_clear_keeps_the_recorded_identity() {
+    const INLINE_APP_TOKEN: &str = "xapp-inline-placeholder-1801";
+    const INLINE_BOT_TOKEN: &str = "xoxb-inline-placeholder-1801";
+    const INLINE_MODEL_CREDENTIAL: &str = "model-credential-placeholder-1801";
+    const INLINE_GITHUB_TOKEN: &str = "github-token-placeholder-1801";
+    let existing = json!({
+        "dispatcher": {"slack": {
+            "appToken": INLINE_APP_TOKEN,
+            "botToken": INLINE_BOT_TOKEN
+        }},
+        "agentSandbox": {"runner": {
+            "credentials": INLINE_MODEL_CREDENTIAL,
+            "model": "placeholder/model"
+        }},
+        "api": {"githubToken": INLINE_GITHUB_TOKEN},
+        "sealing": {"privateKey": PRESERVED_SEALING_KEY}
+    });
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(existing),
+    );
+    let captured = fixture.temp.path().join("inline-sealing-values.yaml");
+    let env = [(
+        "CURIE_TEST_CAPTURE_ALL_VALUES",
+        captured.to_str().expect("UTF 8 capture path"),
+    )];
+    let output = fixture.cluster_up_with(
+        &[
+            "--set",
+            "sealing.privateKeyExistingSecret=",
+            "--set",
+            "dispatcher.slack.appTokenExistingSecret=",
+            "--set",
+            "dispatcher.slack.botTokenExistingSecret=",
+            "--set",
+            "agentSandbox.runner.credentialsExistingSecret=",
+            "--set",
+            "api.githubTokenExistingSecret=",
+        ],
+        &env,
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(
+        output,
+        "cluster up with an empty inline-only sealing source clear",
+    );
+    assert!(
+        !visible.contains("generated a sealing private key"),
+        "an empty source selector must not rotate sealing identity: {visible}"
+    );
+    for value in [
+        PRESERVED_SEALING_KEY,
+        INLINE_APP_TOKEN,
+        INLINE_BOT_TOKEN,
+        INLINE_MODEL_CREDENTIAL,
+        INLINE_GITHUB_TOKEN,
+    ] {
+        assert!(
+            !visible.contains(value),
+            "a retained private value leaked into CLI output: {visible}"
+        );
+    }
+    let documents: Vec<Value> = fs::read_to_string(captured)
+        .expect("cluster up Helm values")
+        .split("\n---\n")
+        .filter(|document| !document.trim().is_empty())
+        .map(|document| serde_norway::from_str(document).expect("private Helm values JSON"))
+        .collect();
+    for (pointer, expected) in [
+        ("/sealing/privateKey", PRESERVED_SEALING_KEY),
+        ("/dispatcher/slack/appToken", INLINE_APP_TOKEN),
+        ("/dispatcher/slack/botToken", INLINE_BOT_TOKEN),
+        ("/agentSandbox/runner/credentials", INLINE_MODEL_CREDENTIAL),
+        ("/agentSandbox/runner/model", "placeholder/model"),
+        ("/api/githubToken", INLINE_GITHUB_TOKEN),
+    ] {
+        assert!(
+            documents.iter().any(|document| {
+                document.pointer(pointer).and_then(Value::as_str) == Some(expected)
+            }),
+            "the actual Helm values lost retained {pointer}"
+        );
+    }
+    assert!(
+        fixture
+            .calls()
+            .contains("sealing.privateKeyExistingSecret="),
+        "the explicit empty source clear must reach Helm:\n{}",
+        fixture.calls()
+    );
+}
+
+#[test]
+fn clearing_an_active_sealing_byo_without_an_inline_replacement_refuses_before_mutation() {
+    const LEFTOVER_INLINE_KEY: &str = "LEFTOVER_INLINE_SEALING_KEY";
+    for (copy, inline) in [
+        ("no inline copy", None),
+        ("leftover inline copy", Some(LEFTOVER_INLINE_KEY)),
+    ] {
+        for surface in ["cluster up", "apply"] {
+            let mut sealing = json!({
+                "privateKeyExistingSecret": "acme-active-sealing-source",
+                "privateKeyExistingSecretKey": "active-sealing-selector"
+            });
+            if let Some(inline) = inline {
+                sealing["privateKey"] = json!(inline);
+            }
+            let existing = json!({"sealing": sealing});
+            let config = if surface == "apply" {
+                format!(
+                    "{}set:\n  sealing.privateKeyExistingSecret: \"\"\n",
+                    installation_for_the_stateful_guard()
+                )
+            } else {
+                installation_for_the_stateful_guard().to_string()
+            };
+            let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing));
+            let output = if surface == "cluster up" {
+                fixture.cluster_up_with(&["--set", "sealing.privateKeyExistingSecret="], &[])
+            } else {
+                fixture.apply(&[], &[])
+            };
+            let visible = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let error = json_error(output, &format!("{surface} with {copy}"));
+            assert!(
+                error.is_object(),
+                "the refusal must be one structured JSON object: {error}"
+            );
+            assert_eq!(
+                error["error"],
+                "refusing to clear the active sealing private key source without an explicit replacement"
+            );
+            assert_eq!(
+                error["fix"],
+                "set sealing.privateKey to the replacement private key before clearing its source"
+            );
+            assert!(
+                !fixture.calls().contains("HELM_CALL: upgrade "),
+                "{surface} with {copy} must stop before Helm mutation:\n{}",
+                fixture.calls()
+            );
+            assert!(
+                !visible.contains("acme-active-sealing-source"),
+                "the external Secret name leaked in the refusal: {visible}"
+            );
+            assert!(
+                !visible.contains(LEFTOVER_INLINE_KEY),
+                "the stale inline key leaked in the refusal: {visible}"
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_inline_sealing_replacement_allows_an_active_byo_clear_without_generation() {
+    let existing = json!({
+        "sealing": {
+            "privateKeyExistingSecret": "acme-active-sealing-source",
+            "privateKeyExistingSecretKey": "active-sealing-selector"
+        }
+    });
+    for surface in ["cluster up", "apply"] {
+        let config = if surface == "apply" {
+            format!(
+                "{}set:\n  sealing.privateKeyExistingSecret: \"\"\n  \
+                 sealing.privateKey: {PRESERVED_SEALING_KEY:?}\n",
+                installation_for_the_stateful_guard()
+            )
+        } else {
+            installation_for_the_stateful_guard().to_string()
+        };
+        let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing.clone()));
+        let replacement = format!("sealing.privateKey={PRESERVED_SEALING_KEY}");
+        let output = if surface == "cluster up" {
+            fixture.cluster_up_with(
+                &[
+                    "--set",
+                    "sealing.privateKeyExistingSecret=",
+                    "--set",
+                    replacement.as_str(),
+                ],
+                &[],
+            )
+        } else {
+            fixture.apply(&[], &[])
+        };
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        json_output(
+            output,
+            &format!("{surface} with explicit sealing replacement"),
+        );
+        assert!(
+            !visible.contains("generated a sealing private key"),
+            "the supplied replacement must prevent a second generated key: {visible}"
+        );
+        assert!(
+            !visible.contains(PRESERVED_SEALING_KEY),
+            "the replacement private key leaked into CLI output: {visible}"
+        );
+        let calls = fixture.calls();
+        assert!(
+            calls.contains("sealing.privateKeyExistingSecret="),
+            "{surface} must clear the active external source: {calls}"
+        );
+        assert!(
+            calls.contains(&replacement),
+            "{surface} must consume the exact replacement private key: {calls}"
+        );
+    }
+}
+
+#[test]
 fn existing_secret_preservation_reports_github_reference_actions() {
     for clear in [false, true] {
         let fixture = HelmFixture::new(

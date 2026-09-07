@@ -12282,13 +12282,23 @@ mod tests {
         for path in BYO_PRESERVATION_PATHS {
             let reference = format!("{path}ExistingSecret");
             let key = format!("{path}ExistingSecretKey");
-            let opts = completed_dev_up(
-                Some(&existing),
-                vec![format!("{reference}="), format!("{key}=replacement")],
-            );
+            let mut set = vec![format!("{reference}="), format!("{key}=replacement")];
+            if *path == "sealing.privateKey" {
+                // A selector override is not sealing replacement material.
+                set.push(format!(
+                    "{path}=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+                ));
+            }
+            let opts = completed_dev_up(Some(&existing), set);
             let plan = up_value_plan(&opts).effective_values();
             assert_eq!(plan.get(&reference).map(String::as_str), Some(""));
             assert_eq!(plan.get(&key).map(String::as_str), Some("replacement"));
+            if *path == "sealing.privateKey" {
+                assert_eq!(
+                    plan.get(*path).map(String::as_str),
+                    Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+                );
+            }
             assert!(secret_for(&opts, &reference).is_none());
             assert!(secret_for(&opts, &key).is_none());
         }
