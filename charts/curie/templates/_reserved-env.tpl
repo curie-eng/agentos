@@ -5,11 +5,15 @@
 {{- $sets := .root.Files.Get "files/reserved-env.yaml" | fromYaml -}}
 {{- $reserved := index $sets .workload -}}
 {{- if not $reserved -}}{{- fail (printf "missing reserved env set for %s" .workload) -}}{{- end -}}
+{{- $additionalReserved := .additionalReserved | default dict -}}
 {{- $seen := dict -}}
 {{- range .env -}}
 {{- $name := .name -}}
 {{- if hasKey $reserved $name -}}
 {{- fail (printf "%s.extraEnv contains chart-owned environment variable %s; remove it from extraEnv and configure %s instead." $.workload $name (index $reserved $name)) -}}
+{{- end -}}
+{{- if hasKey $additionalReserved $name -}}
+{{- fail (printf "%s.extraEnv contains chart-owned environment variable %s; remove it from extraEnv and configure %s instead." $.workload $name (index $additionalReserved $name)) -}}
 {{- end -}}
 {{- if hasKey $seen $name -}}
 {{- fail (printf "%s.extraEnv repeats environment variable %s; keep exactly one entry." $.workload $name) -}}

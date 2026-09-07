@@ -150,6 +150,12 @@ roleRef:
 {{- define "curie.sandboxTemplate" -}}
 {{- $agent := .agent -}}
 {{- $secrets := .secrets -}}
+{{- $connectorReservedEnv := dict -}}
+{{- if $agent -}}
+{{- range $name := keys $secrets -}}
+{{- $_ := set $connectorReservedEnv $name (printf "agentSandbox.connectorSecrets.%s.%s" $agent $name) -}}
+{{- end -}}
+{{- end -}}
 {{- with .root }}
 {{- $runner := .Values.agentSandbox.runner }}
 {{- $bf := $runner.bundleFetch }}
@@ -602,7 +608,7 @@ spec:
               value: {{ $wf.mountPath | quote }}
             {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" $runner.extraEnv) | nindent 12 }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "agentSandbox.runner" "env" $runner.extraEnv) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "agentSandbox.runner" "env" $runner.extraEnv "additionalReserved" $connectorReservedEnv) | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /healthz
