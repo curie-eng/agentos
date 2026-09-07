@@ -39,6 +39,14 @@ def envs(output, filename, container):
                 yield from walk(child)
     return next(env for doc in docs for env in walk(doc))
 
+def sandbox_runner_envs(output, template_name):
+    docs = yaml.safe_load_all((output / "curie/templates/agent-sandbox.yaml").read_text())
+    templates = [doc for doc in docs if doc and doc.get("kind") == "SandboxTemplate" and doc["metadata"]["name"] == template_name]
+    assert len(templates) == 1, f"expected one SandboxTemplate named {template_name}"
+    runners = [container for container in templates[0]["spec"]["podTemplate"]["spec"]["containers"] if container["name"] == "runner"]
+    assert len(runners) == 1, f"expected one runner in {template_name}"
+    return runners[0]["env"]
+
 with tempfile.TemporaryDirectory() as tmp:
     tmp = pathlib.Path(tmp)
     values = tmp / "values.yaml"
@@ -81,6 +89,26 @@ with tempfile.TemporaryDirectory() as tmp:
     env = envs(output, "worker.yaml", "worker")
     assert [e for e in env if e["name"] == "ACME_EXTENSION"] == [{"name": "ACME_EXTENSION", "value": "preserved"}]
     assert [e for e in env if e["name"] == "CURIE_API_URL"] == [{"name": "CURIE_API_URL", "value": "https://api.example.com"}]
+    # Dynamic connector names belong to the per-agent template, not the generic
+    # runner selected by envs(). Pin both templates by name for these controls.
+    connector_name = "GITHUB_PERSONAL_ACCESS_TOKEN"
+    connector_path = f"agentSandbox.connectorSecrets.acme-a.{connector_name}"
+    _, output = render(chart, "--set", f"agentSandbox.runner.extraEnv[0].name={connector_name}", "--set-string", "agentSandbox.runner.extraEnv[0].value=example-extension")
+    generic_env = sandbox_runner_envs(output, "acme-curie-runner")
+    assert [entry for entry in generic_env if entry["name"] == connector_name] == [{"name": connector_name, "value": "example-extension"}]
+    _, output = render(chart, "--set-string", f"{connector_path}=example-secret", "--set", "agentSandbox.runner.extraEnv[0].name=ACME_CONNECTOR_EXTENSION", "--set-string", "agentSandbox.runner.extraEnv[0].value=preserved")
+    for template_name in ("acme-curie-runner", "acme-curie-agent-acme-a-runner"):
+        runner_env = sandbox_runner_envs(output, template_name)
+        assert [entry for entry in runner_env if entry["name"] == "ACME_CONNECTOR_EXTENSION"] == [{"name": "ACME_CONNECTOR_EXTENSION", "value": "preserved"}]
+        connector_entries = [entry for entry in runner_env if entry["name"] == connector_name]
+        if template_name == "acme-curie-runner":
+            assert connector_entries == [], connector_entries
+        else:
+            assert connector_entries == [{"name": connector_name, "valueFrom": {"secretKeyRef": {"name": "acme-curie-agent-acme-a-connector-secrets", "key": connector_name, "optional": False}}}], connector_entries
+    for value in ("example-secret", "example-conflict"):
+        result, _ = render(chart, "--set-string", f"{connector_path}=example-secret", "--set", f"agentSandbox.runner.extraEnv[0].name={connector_name}", "--set-string", f"agentSandbox.runner.extraEnv[0].value={value}", ok=False)
+        assert result.returncode != 0, f"accepted per-agent connector duplicate with extraEnv value {value}"
+        assert "agentSandbox.runner.extraEnv" in result.stderr and connector_path in result.stderr, result.stderr
     mutant = tmp / "mutant"
     shutil.copytree(chart, mutant)
     helper = mutant / "templates/_reserved-env.tpl"
