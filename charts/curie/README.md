@@ -1546,3 +1546,18 @@ by the CLI's preserved-values mechanism (the same one `COMMS_MANAGED_KEYS` and
 explicitly re-supply -- set one of these fields today and keep it declared in
 the values file you pass to every `cluster up`/`helm upgrade`, the same way you
 would for any other values key the CLI does not manage yet.
+
+### Reserved environment variables
+
+Every workload accepting `extraEnv` uses the reserved names and replacement
+values in `files/reserved-env.yaml`. An entry colliding with a chart-owned name
+fails Helm rendering before upgrade hooks or resources are applied, even when
+its value equals the chart value. For example, remove
+`CURIE_RUNNER_TOTAL_TIMEOUT_S` from `worker.extraEnv` and set
+`worker.runnerTotalTimeoutSeconds` instead. Apply that edit to retained values
+before upgrading a release that previously configured the timeout via `extraEnv`.
+
+The existing OTEL overrides and worker `CURIE_API_URL` / `CURIE_API_KEY`
+overrides remain supported: their helpers omit the chart entry, so each name
+appears once. Repeating any name within `extraEnv` itself is refused. Workloads
+without an `extraEnv` surface cannot append entries to their chart-owned env.

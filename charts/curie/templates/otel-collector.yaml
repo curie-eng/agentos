@@ -112,9 +112,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.otlpAuthHeaderSecretName" . }}
                   key: otlpAuthHeader
-            {{- with .Values.otelCollector.extraEnv }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "otelCollector" "env" .Values.otelCollector.extraEnv) | nindent 12 }}
           ports:
             - name: otlp-grpc
               containerPort: 4317

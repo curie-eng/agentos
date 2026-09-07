@@ -252,9 +252,7 @@ spec:
             # the setting an operator is trying to make.
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ .Values.api.slackUsergroupCacheTtlSeconds | quote }}
-            {{- with .Values.api.extraEnv }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv) | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000
