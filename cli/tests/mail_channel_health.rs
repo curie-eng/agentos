@@ -10,6 +10,10 @@ struct Fixture(tempfile::TempDir);
 
 impl Fixture {
     fn new(state: &str) -> Self {
+        Self::with_mail_adapter_deploy(state, serde_json::json!(true))
+    }
+
+    fn with_mail_adapter_deploy(state: &str, mail_adapter_deploy: Value) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::write(
@@ -39,6 +43,16 @@ impl Fixture {
         )
         .unwrap();
         fs::write(
+            root.join("values.json"),
+            serde_json::json!({
+                "mailAdapter": {"deploy": mail_adapter_deploy},
+                "dispatcher": {"slack": {"appToken": "x", "botToken": "x"}},
+                "api": {"ingress": {"enabled": true}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
             root.join("converged.sh"),
             include_str!("data/converged-installation-read.sh"),
         )
@@ -58,7 +72,7 @@ case "${0##*/}:$*" in
     exit 0 ;;
   helm:version*) printf '%s\n' 'v3.14.0'; exit 0 ;;
   helm:list*) printf '%s\n' '[{"name":"acme","chart":"curie-0.8.7"}]'; exit 0 ;;
-  helm:"get values"*) printf '%s\n' '{"mailAdapter":{"deploy":true},"dispatcher":{"slack":{"appToken":"x","botToken":"x"}},"api":{"ingress":{"enabled":true}}}'; exit 0 ;;
+  helm:"get values"*) cat "${0%/*}/values.json"; exit 0 ;;
   docker:*) exit 0 ;;
 esac
 . "${0%/*}/converged.sh"
@@ -127,6 +141,32 @@ fn expired_mail_token_is_visible_on_status_and_doctor_and_valid_token_recovers()
             }
         }
     }
+}
+
+#[test]
+fn doctor_observes_expired_mail_status_for_go_truthy_string_deploy_value() {
+    // `--set-string mailAdapter.deploy=true` leaves Helm with a non-empty
+    // string, so the chart renders the adapter. Doctor must follow that same
+    // Go-template truthiness rather than calling the channel not applicable.
+    let fixture = Fixture::with_mail_adapter_deploy("expired", serde_json::json!("true"));
+    let output = fixture.run("doctor");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let check = value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "mail-channel")
+        .expect("mail check");
+
+    assert_eq!(check["state"], "missing", "{value}");
+    assert!(check["detail"].as_str().unwrap().contains("expired"));
+    assert_eq!(value["ready"], false, "{value}");
 }
 
 #[test]
