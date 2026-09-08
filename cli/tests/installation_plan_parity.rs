@@ -5372,3 +5372,67 @@ fn diff_answers_the_same_against_an_explicitly_passed_chart() {
         "the overridden chart must actually be the one rendered:\n{calls}"
     );
 }
+
+/// #2459: `--fake-model` must IGNORE a recorded BYO credential reference, not
+/// erase it.
+///
+/// `cluster up` is a FULL upgrade rather than `--reuse-values`, so a blank
+/// supplied here is what Helm records, and the next plain `up` preserves the
+/// blank -- the operator's Secret wiring is gone for good. This drives the real
+/// binary and reads the values files it actually hands helm, so a plan that
+/// preserved the reference internally and dropped it on the way out still reds.
+#[test]
+fn fake_model_up_preserves_a_recorded_byo_credential_reference() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({
+            "agentSandbox": {"runner": {
+                "credentialsExistingSecret": "acme-runner-source",
+                "credentialsExistingSecretKey": "runner-selector"
+            }}
+        })),
+    );
+    let captured = fixture.temp.path().join("all-values.json");
+    json_output(
+        fixture.cluster_up_with(
+            &["--fake-model"],
+            &[("CURIE_TEST_CAPTURE_ALL_VALUES", captured.to_str().unwrap())],
+        ),
+        "fake-model up over a recorded BYO credential reference",
+    );
+
+    let supplied = fs::read_to_string(&captured).expect("helm received at least one values file");
+    let runner: Vec<Value> = supplied
+        .split("\n---\n")
+        .filter(|chunk| !chunk.trim().is_empty())
+        .filter_map(|chunk| serde_json::from_str::<Value>(chunk).ok())
+        .filter_map(|values| values["agentSandbox"]["runner"].as_object().cloned())
+        .map(Value::Object)
+        .collect();
+
+    let reference = runner
+        .iter()
+        .find_map(|values| values["credentialsExistingSecret"].as_str())
+        .unwrap_or_else(|| {
+            panic!("--fake-model dropped the recorded reference entirely:\n{supplied}")
+        });
+    assert_eq!(
+        reference, "acme-runner-source",
+        "--fake-model supplies no replacement, so it must not blank the reference:\n{supplied}"
+    );
+    assert_eq!(
+        runner
+            .iter()
+            .find_map(|values| values["credentialsExistingSecretKey"].as_str()),
+        Some("runner-selector"),
+        "the key travels with the name; half a reference is not one:\n{supplied}"
+    );
+
+    // Preserving it must not turn the fake model back into the real one. The
+    // CLI only ever pins this key to `false`, so its absence is the assertion.
+    let visible = format!("{}\n{supplied}", fixture.calls());
+    assert!(
+        !visible.contains("fakeModel"),
+        "--fake-model must not select the real model off the value it preserved:\n{visible}"
+    );
+}
