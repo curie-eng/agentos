@@ -162,6 +162,43 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
+{{/* Per-driver TLS query suffix for a Postgres DSN (#2431). ONE helper,
+     included from BOTH curie.env.postgres (SQLAlchemy/asyncpg: ?ssl=require)
+     and curie.langfuse.env (Prisma/node-postgres: ?sslmode=no-verify): the
+     two driver families disagree on the spelling, so an operator cannot put
+     a suffix in postgres.auth.database.
+
+     Empty (the default, and a missing key on --reuse-values of a release
+     created before this existed) renders nothing, so an existing in-cluster
+     install is byte-identical on upgrade. "require" is the only other
+     accepted value; everything else, including false and 0, which Sprig
+     default would swallow, fails at render naming postgres.sslMode. The
+     value is read raw for that reason.
+
+     Why the deploy guard. The in-chart Postgres StatefulSet serves no TLS
+     listener, so sslMode=require against it would break every consumer at
+     once behind a healthy-looking manifest. Refuse at render, naming both
+     keys. Neither rendered suffix verifies the server certificate; a
+     verify-full mode needs a mounted CA bundle and is a second step. */}}
+{{- define "curie.postgres.dsnParams" -}}
+{{- $root := required "curie.postgres.dsnParams requires root" .root -}}
+{{- $driver := required "curie.postgres.dsnParams requires driver" .driver -}}
+{{- if not (has $driver (list "asyncpg" "prisma")) -}}
+{{- fail (printf "curie.postgres.dsnParams driver must be asyncpg or prisma, got %q" $driver) -}}
+{{- end -}}
+{{- $mode := index $root.Values.postgres "sslMode" -}}
+{{- $empty := or (not (hasKey $root.Values.postgres "sslMode")) (kindIs "invalid" $mode) (and (kindIs "string" $mode) (eq $mode "")) -}}
+{{- if $empty -}}
+{{- else if eq (toString $mode) "require" -}}
+{{- if $root.Values.postgres.deploy -}}
+{{- fail "postgres.sslMode is require but postgres.deploy is also true: the in-chart Postgres serves no TLS listener, so every consumer would fail to connect. Set postgres.deploy=false and point postgres.host at your external TLS store, or leave postgres.sslMode empty." -}}
+{{- end -}}
+{{- if eq $driver "asyncpg" -}}?ssl=require{{- else -}}?sslmode=no-verify{{- end -}}
+{{- else -}}
+{{- fail (printf "postgres.sslMode must be empty or \"require\", got %q" (printf "%v" $mode)) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.valkey.host" -}}
 {{- if .Values.valkey.deploy -}}
 {{- printf "%s-valkey" (include "curie.fullname" .) -}}
@@ -868,7 +905,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
       name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
       key: postgresPassword
 - name: DATABASE_URL
-  value: postgresql+asyncpg://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}
+  value: postgresql+asyncpg://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}{{ include "curie.postgres.dsnParams" (dict "root" . "driver" "asyncpg") }}
 - name: DB_SCHEMA
   value: curie
 {{- end -}}
@@ -1032,7 +1069,7 @@ livenessProbe:
       name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
       key: postgresPassword
 - name: DATABASE_URL
-  value: postgresql://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}
+  value: postgresql://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}{{ include "curie.postgres.dsnParams" (dict "root" . "driver" "prisma") }}
 - name: SALT
   valueFrom:
     secretKeyRef:

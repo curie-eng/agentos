@@ -337,7 +337,8 @@ langfuse:
 # ---------------------------------------------------------------------------
 # Postgres. Langfuse's transactional store AND the app-state DB (agents,
 # versions, deployments). BYO: deploy=false + host/port/auth (or existingSecret
-# with key postgresPassword).
+# with key postgresPassword), plus sslMode=require for a managed store that
+# enforces TLS.
 # ---------------------------------------------------------------------------
 postgres:
   deploy: true
@@ -356,6 +357,15 @@ postgres:
     password: postgres
     database: postgres
   existingSecret: ""
+  # TLS query parameter on every Postgres DSN (#2431). Empty (the default)
+  # renders no suffix, so an in-cluster install is unchanged on upgrade.
+  # "require" is for a BYO store that enforces TLS: SQLAlchemy/asyncpg gets
+  # ?ssl=require, Prisma/Langfuse gets ?sslmode=no-verify. Neither suffix
+  # verifies the server certificate; verify-full needs a mounted CA bundle
+  # and is a second step. require with deploy=true fails the render: the
+  # in-chart StatefulSet serves no TLS listener. Any other value fails at
+  # render. Read raw: Sprig default would swallow false and 0.
+  sslMode: ""
   # fsGroup that owns the mounted data volume: the gid (and uid) of the
   # `postgres` user INSIDE the pinned image above, read with
   # `docker run --rm --entrypoint id <image> -g postgres`. Asserted against the
