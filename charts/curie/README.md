@@ -557,6 +557,20 @@ is encrypted but not authenticated; a `verify-full` mode needs a mounted CA
 bundle and is a second step. Leave `sslMode` empty (the default) for the
 in-cluster store: the rendered DSNs stay suffix-free.
 
+Flipping `postgres.deploy` to `false` removes the in-cluster StatefulSet and
+Service. Helm does not delete a StatefulSet PVC, so if
+`postgres.persistence.enabled` was true (the default) the volume
+`data-<release>-postgres-0` stays Bound and billed. A later `helm rollback`
+re-binds that claim by name: that is a free rollback onto the in-cluster data,
+and also a second copy of every credential until you remove it. Once the
+managed database is the source of truth and you no longer want that rollback
+path, delete the leftover volume:
+
+```bash
+kubectl delete pvc -n <namespace> data-<release>-postgres-0
+```
+
+
 Toggles (all default `true`): `langfuse.deploy`, `postgres.deploy`,
 `valkey.deploy`, `clickhouse.deploy`, `rustfs.deploy`, `otelCollector.deploy`.
 Flipping any to `false` removes its resources from the render; consumers
