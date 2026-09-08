@@ -3572,15 +3572,18 @@ pin_local_source_images() {
 }
 
 # Affinity reuses a live sandbox across worker recreation. Reap so the next
-# claim cold-boots with the injected (or restored) model env. The substrate
-# label is host-wide; this control only runs inside the local OTel case.
+# claim cold-boots with the injected (or restored) model env. Match the
+# task-owned sink endpoint, not the host-wide substrate label alone, so a
+# concurrent session's runners are left alone.
 reap_local_runner_sandboxes() {
-    local runners
-    runners="$(docker ps -aq --filter "label=$SANDBOX_LABEL" 2>/dev/null || true)"
-    if [[ -n "$runners" ]]; then
-        # shellcheck disable=SC2086
-        docker rm -f $runners >/dev/null 2>&1 || true
-    fi
+    local runner
+    [[ -n "$LOCAL_OTEL_ENDPOINT" ]] || return 0
+    while IFS= read -r runner; do
+        [[ -n "$runner" ]] || continue
+        if [[ "$(container_env_value "$runner" OTEL_EXPORTER_OTLP_ENDPOINT)" == "$LOCAL_OTEL_ENDPOINT" ]]; then
+            docker rm -f "$runner" >/dev/null 2>&1 || true
+        fi
+    done < <(docker ps -aq --filter "label=$SANDBOX_LABEL" --format '{{.Names}}' 2>/dev/null)
 }
 
 inject_local_runner_failure() {

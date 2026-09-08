@@ -396,6 +396,8 @@ def test_injected_runner_failure_does_not_depend_on_prompt_or_live_model() -> No
 
     assert "SANDBOX_LABEL" in reap
     assert "docker rm -f" in reap
+    assert "LOCAL_OTEL_ENDPOINT" in reap
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" in reap
     assert "reap_local_runner_sandboxes" in inject
     assert "reap_local_runner_sandboxes" in restore
     assert case.index("inject_local_runner_failure") < case.index(
@@ -416,6 +418,10 @@ def _stub_docker_path(tmp_path: Path) -> tuple[Path, Path, Path]:
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'if [ "$1" = "ps" ]; then printf "fake-sandbox\\n"; exit 0; fi\n'
+        'if [ "$1" = "inspect" ]; then\n'
+        '  printf "OTEL_EXPORTER_OTLP_ENDPOINT=http://otel.example:4318\\n"\n'
+        "  exit 0\n"
+        "fi\n"
         'if [ "$1" = "compose" ]; then\n'
         f'  n=0; [ -f "{env_dir}/n" ] && n="$(cat "{env_dir}/n")"\n'
         f'  printf "%s" "$((n + 1))" > "{env_dir}/n"\n'
@@ -443,7 +449,8 @@ def test_inject_local_runner_failure_blanks_live_credentials_and_reaps(
     """Execute the real inject/restore helpers against a stub docker."""
 
     source = LADDER_PATH.read_text()
-    script = _shell_function(source, "reap_local_runner_sandboxes")
+    script = _shell_function(source, "container_env_value")
+    script += _shell_function(source, "reap_local_runner_sandboxes")
     script += _shell_function(source, "inject_local_runner_failure")
     script += _shell_function(source, "restore_local_runner_health")
     script += """
