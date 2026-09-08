@@ -6230,6 +6230,87 @@ async fn run_install_with_gvisor_observer(
     }
 }
 
+/// Whether the aborted gVisor preflight attempt left a Helm release that must
+/// be removed before the `security.gvisor.mode=off` retry.
+///
+/// A history with no `deployed`/`superseded` revision never reached a
+/// known-good install. Retrying with `helm upgrade --install` is then an
+/// *upgrade*, which fires the pre-upgrade drain hook against Secrets the
+/// cancelled revision never rendered (#2347). An empty history (Helm has not
+/// recorded the release yet) is the same case: uninstall is a no-op if the
+/// release is already absent.
+///
+/// A history that already contains a known-good revision is an in-place
+/// upgrade of a real install and must be left intact.
+fn should_discard_failed_gvisor_install(history: &[HelmRevision]) -> bool {
+    !history
+        .iter()
+        .any(|row| is_eligible_rollback_status(&row.status))
+}
+
+/// Remove a never-deployed failed revision left by the aborted first Helm
+/// attempt so the gVisor-off retry is a clean install (#2347).
+async fn discard_failed_gvisor_install_if_never_deployed(
+    cl: &crate::ui::Checklist,
+    common: &CommonOpts,
+) -> Result<()> {
+    let ui = crate::ui::ui();
+    let history_cmd = helm_history_cmd(common);
+    ui.plumbing(&format!("+ {}", history_cmd.display()));
+    let (ok, out, err) = run_capture(&history_cmd).await?;
+    let history = if !ok {
+        if helm_release_is_absent(&err) || helm_release_is_absent(&out) {
+            Vec::new()
+        } else {
+            return Err(crate::exit::CliError::failure(format!(
+                "could not read helm history for release {} in namespace {} before the gVisor retry: {}",
+                common.release,
+                common.namespace,
+                err.trim()
+            ))
+            .with_fix(format!(
+                "inspect `helm history {} -n {}` and rerun `curie cluster up`",
+                common.release, common.namespace
+            ))
+            .into());
+        }
+    } else if out.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse_helm_history(&out)?
+    };
+    if !should_discard_failed_gvisor_install(&history) {
+        return Ok(());
+    }
+
+    let cmds = down_commands(common);
+    let uninstall = &cmds[0];
+    ui.plumbing(&format!("+ {}", uninstall.display()));
+    let step = cl.step("discarding failed Helm revision");
+    let (ok, out, err) = run_capture(uninstall).await?;
+    for line in out.lines().chain(err.lines()) {
+        ui.plumbing(line);
+    }
+    if ok {
+        step.done("removed");
+        Ok(())
+    } else if err.contains("not found") || out.contains("not found") {
+        step.done("already absent");
+        Ok(())
+    } else {
+        step.fail("failed");
+        Err(crate::exit::CliError::failure(format!(
+            "helm uninstall of the failed gVisor preflight revision failed: {}",
+            err.trim()
+        ))
+        .with_fix(format!(
+            "helm uninstall {} -n {} && curie cluster up --set security.gvisor.mode=off",
+            common.release, common.namespace
+        ))
+        .into())
+    }
+}
+
 /// Run one command under a checklist `step` labeled `label`, capturing its
 /// stdio. Echoes the masked command line and replays the captured output as dim
 /// plumbing (both no-ops unless `--debug`, so default runs stay quiet and the
@@ -6812,6 +6893,11 @@ async fn run_prepared_up(
                     step.warn("retrying");
                     value_plan.set(GVISOR_MODE_KEY, "off");
                     ClusterUpInference::GvisorOff.render(ui);
+                    if let Err(error) =
+                        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common).await
+                    {
+                        return Err(convergence::installation_failure(&opts.common, error).await);
+                    }
                     let retry = up_commands_with_plan(&opts, &value_plan)
                         .into_iter()
                         .next()
@@ -7464,10 +7550,14 @@ impl RollbackTarget {
 /// whose status is `deployed` or `superseded`.
 ///
 /// This is the whole fix for #1899. A `cluster up` against a cluster with no
-/// `runsc` RuntimeClass records a FAILED revision before its successful retry,
-/// so the history alternates failed/superseded and the immediately preceding
-/// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
-/// ineligible statuses is what stops an operator having to know that.
+/// `runsc` RuntimeClass used to record a FAILED revision before its successful
+/// retry, so the history alternated failed/superseded and the immediately
+/// preceding revision -- the one bare `helm rollback` targets -- was a failed
+/// one. Skipping ineligible statuses is what stops an operator having to know
+/// that. Issue #2347 now discards a never-deployed failed revision before that
+/// retry, so a current first-install recovery no longer leaves the pair.
+/// Rollback still has to skip ineligible statuses: a later upgrade can fail,
+/// and releases installed by an older CLI still carry the pair.
 ///
 /// Pure by construction so the decision is unit-testable with no cluster.
 pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarget> {
@@ -9564,6 +9654,46 @@ mod tests {
     /// `chart_fullname_tests::the_default_release_is_a_byte_identical_no_op`.
     fn fullname() -> ReleaseFullname {
         chart_fullname("curie")
+    }
+
+    fn history_row(revision: u32, status: &str) -> HelmRevision {
+        HelmRevision {
+            revision,
+            status: status.to_string(),
+            chart: "curie-0.0.0".to_string(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn gvisor_retry_discards_a_history_that_never_deployed() {
+        assert!(should_discard_failed_gvisor_install(&[]));
+        assert!(should_discard_failed_gvisor_install(&[history_row(
+            1, "failed"
+        )]));
+        assert!(should_discard_failed_gvisor_install(&[
+            history_row(1, "failed"),
+            history_row(2, "pending-install"),
+        ]));
+        assert!(should_discard_failed_gvisor_install(&[history_row(
+            1,
+            "pending-upgrade"
+        )]));
+    }
+
+    #[test]
+    fn gvisor_retry_keeps_a_history_with_a_known_good_revision() {
+        assert!(!should_discard_failed_gvisor_install(&[history_row(
+            1, "deployed"
+        )]));
+        assert!(!should_discard_failed_gvisor_install(&[
+            history_row(1, "superseded"),
+            history_row(2, "failed"),
+        ]));
+        assert!(!should_discard_failed_gvisor_install(&[
+            history_row(1, "deployed"),
+            history_row(2, "pending-upgrade"),
+        ]));
     }
 
     #[test]
