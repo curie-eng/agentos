@@ -30,8 +30,10 @@ class MemoryStore(Protocol):
 ```
 
 A `MemoryRecord` is `content: str` plus a `Provenance`
-(`learned_from_session_id`, `source_trace_ids`, `recorded_at`) — the
-entry→source-traces link. `SessionConfig.memory_ref`
+(`learned_from_session_id`, `source_trace_ids`, `recorded_at`, optional `source`) —
+the entry→source-traces link. `Provenance.source` (`runner/src/curie_runner/memory.py::Provenance`)
+is `"operator"` for a CLI/API-seeded record (#1904) and `None`/absent for a learned
+record. `SessionConfig.memory_ref`
 (`packages/aci-protocol/src/aci_protocol/session.py::SessionConfig`, `CURIE_MEMORY_REF`) is
 resolved to a concrete `MemoryStore` at runner boot by `resolve_memory`. The
 frozen ACI field is unchanged; the state-API bearer is a runner-local knob

@@ -7,8 +7,9 @@ loop free.
 
 ## The port
 
-``ObjectStore`` (this module) is the storage port: the five operations the bundle
-pipeline needs, plus the **write-once/no-mutation key discipline** promoted here
+``ObjectStore`` (this module) is the storage port: the four operations the bundle
+pipeline needs (`ensure_bucket` / `exists` / `put` / `get`), plus the
+**write-once/no-mutation key discipline** promoted here
 from convention into the contract (see the Protocol docstring). ``BundleStore``
 is the one concrete backing today, the S3/RustFS client. Consumers
 (``deps``/``gitflow``/``deploy``) type against ``ObjectStore``, so a future

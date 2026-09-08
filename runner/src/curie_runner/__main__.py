@@ -15,7 +15,7 @@ from pathlib import Path
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+from claude_agent_sdk import ClaudeAgentOptions
 from curie_telemetry import bootstrap_service_telemetry
 
 from . import __version__
@@ -52,7 +52,7 @@ from .history import (
     format_conversation_preamble,
     resolve_history,
 )
-from .hooks import load_bundle_hooks
+from .hooks import _merge_pre_tool_use_hooks, load_bundle_hooks
 from .mcp_tool_capability import probe_mcp_tool_capability
 from .memory import MemoryRecord, MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
@@ -115,35 +115,6 @@ def _compose_system_prompt(
     model_preamble = f"Configured model: {model}" if model else None
     parts = [p for p in (memory_preamble, conversation_preamble, base, model_preamble) if p]
     return "\n\n".join(parts) if parts else None
-
-
-def _merge_pre_tool_use_hooks(
-    approval_hooks: dict[str, list[HookMatcher]] | None,
-    bundle_hooks: dict[str, list[HookMatcher]] | None,
-) -> dict[str, list[HookMatcher]] | None:
-    """Merge the approval gate's PreToolUse matcher with the bundle's own (#1852).
-
-    Merge, never replace: dropping the bundle's declared PreToolUse guardrails
-    (#272) would silently disarm them, and dropping the approval matcher leaves
-    the gate bypassable by any permission rule -- the #1852 defect itself. The
-    approval matcher is placed first for determinism of our own construction;
-    the CLI dispatches matchers on one event CONCURRENTLY
-    (claude_agent_sdk/types.py:1956-1961), so list position is not a runtime
-    precedence guarantee and nothing here relies on it.
-
-    Returns None when neither side contributes anything: ``ClaudeAgentOptions``
-    takes ``hooks=None`` to mean "no hooks declared", which is not the same as
-    an empty matcher list, and ``load_bundle_hooks`` returning None for a bundle
-    with no hooks is the common case rather than an error.
-    """
-
-    merged: dict[str, list[HookMatcher]] = {}
-    for source in (approval_hooks, bundle_hooks):
-        if not source:
-            continue
-        for event, matchers in source.items():
-            merged.setdefault(event, []).extend(matchers)
-    return merged or None
 
 
 def build_runner(

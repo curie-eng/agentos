@@ -190,3 +190,32 @@ def load_bundle_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcher]] | 
     if not matchers:
         return None
     return {"PreToolUse": matchers}
+
+
+def _merge_pre_tool_use_hooks(
+    approval_hooks: dict[str, list[HookMatcher]] | None,
+    bundle_hooks: dict[str, list[HookMatcher]] | None,
+) -> dict[str, list[HookMatcher]] | None:
+    """Merge the approval gate's PreToolUse matcher with the bundle's own (#1852).
+
+    Merge, never replace: dropping the bundle's declared PreToolUse guardrails
+    (#272) would silently disarm them, and dropping the approval matcher leaves
+    the gate bypassable by any permission rule -- the #1852 defect itself. The
+    approval matcher is placed first for determinism of our own construction;
+    the CLI dispatches matchers on one event CONCURRENTLY
+    (claude_agent_sdk/types.py:1956-1961), so list position is not a runtime
+    precedence guarantee and nothing here relies on it.
+
+    Returns None when neither side contributes anything: ``ClaudeAgentOptions``
+    takes ``hooks=None`` to mean "no hooks declared", which is not the same as
+    an empty matcher list, and ``load_bundle_hooks`` returning None for a bundle
+    with no hooks is the common case rather than an error.
+    """
+
+    merged: dict[str, list[HookMatcher]] = {}
+    for source in (approval_hooks, bundle_hooks):
+        if not source:
+            continue
+        for event, matchers in source.items():
+            merged.setdefault(event, []).extend(matchers)
+    return merged or None

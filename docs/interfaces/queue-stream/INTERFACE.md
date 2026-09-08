@@ -23,7 +23,7 @@ The seam is the Valkey Stream wire contract between the dispatcher (producer) an
 worker (consumer): a named stream carrying a frozen one-field payload. As of #284 /
 ADR-0027 the stream verbs are drawn behind a thin **broker port** at the two non-sacred
 seams — a `StreamPublisher` `Protocol` on the producer (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`:
-`xadd` + the `SET NX EX` dedupe-claim) and a `StreamBroker` `Protocol` on the consumer
+`xadd` + the `SET NX EX` dedupe-claim + `delete` / `release_event`) and a `StreamBroker` `Protocol` on the consumer
 transport (`apps/worker/src/curie_worker/broker.py::StreamBroker`:
 `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`/`xinfo_consumers`/`xclaim`/`xpending_range`/`xrange`/`xadd`).
 The routing, consumer-group concurrency, dedupe, and reclaim rules stay opinionated
@@ -143,8 +143,8 @@ Drawn only at the **non-sacred** seams; the sacred concurrency kernel
 `apps/worker/src/curie_worker/threadlock.py` / `apps/worker/src/curie_worker/markers.py`)
 is not touched:
 
-- **Producer** — `StreamPublisher` (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`): `xadd` and the
-  `SET NX EX` dedupe-claim. `enqueue`/`claim_event` type against it.
+- **Producer** — `StreamPublisher` (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`): `xadd`, the
+  `SET NX EX` dedupe-claim, and `delete` (the `release_event` path). `enqueue`/`claim_event`/`release_event` type against it.
 - **Consumer transport** — `StreamBroker` (`apps/worker/src/curie_worker/broker.py::StreamBroker`):
   `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`, plus — since the bounded-delivery
   dead-letter path (#505, ADR-0039) — `xpending_range`/`xrange`/`xadd`, plus — since
@@ -179,7 +179,8 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   operator thread-reset feature (#713, #812) needs Valkey Set semantics, which
   `StreamBroker` deliberately does not cover, so the sacred consumer keeps a second,
   concretely-typed `redis.asyncio.Redis` handle onto the same connection
-  (`self._valkey`) and calls `SPOP`/`SADD`/`SREM` on it in
+  (`self._valkey`) and claims a member with `EVAL` Lua (`SPOP`+`SADD` atomic,
+  `_THREAD_RESET_CLAIM_LUA`) plus `SREM` on it in
   `apps/worker/src/curie_worker/consumer.py::Consumer._drain_thread_reset_requests`.
   The API half is the same shape: `SADD`/`SISMEMBER` in
   `apps/api/src/curie_api/threadreset.py::ThreadResetRequests`. A second broker that
@@ -234,4 +235,4 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 - **Epic(s):** #85 — vision: make the broker itself swappable behind the stream contract
 - **Epic(s):** #7 — payload promotion into `packages/aci-protocol` (overlaps the channel seam, landed)
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — opinionated core (`curie:runs` stream), not one of the six swap jobs
-- **ADR(s):** [ADR-0027](../../adr/0027-thin-broker-port-defer-second-broker.md) — the broker port at the non-sacred seams; [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — adopt-not-build (Valkey adopted; second broker deferred); [ADR-0039](../../adr/0039-bounded-delivery-and-a-dead-letter-graveyard.md) — the delivery cap and dead-letter graveyard that added `xpending_range`/`xrange`/`xadd` to the port
+- **ADR(s):** [ADR-0027](../../adr/0027-thin-broker-port-defer-second-broker.md) — the broker port at the non-sacred seams; [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — adopt-not-build (Valkey adopted; second broker deferred); [ADR-0039](../../adr/0039-bounded-delivery-and-a-dead-letter-graveyard.md) — the delivery cap and dead-letter graveyard that added `xpending_range`/`xrange`/`xadd` to the port; [ADR-0131](../../adr/0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) — an adjacent fenced-owner store for delivery liveness and the execution budget, not a `StreamBroker` verb

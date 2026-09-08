@@ -251,16 +251,15 @@ model attribute the backend recognizes for the span to ingest as a generation ra
 an untyped span, and the Langfuse read-side integration test seeds both spellings
 (`apps/api/tests/test_langfuse_integration.py`). A second backend inherits the duplicate.
 
-The read side duplicates two of the keys as its own string literals rather than importing
-the closed enum: `_SANDBOX_ATTR` (`apps/api/src/curie_api/langfuse.py::_SANDBOX_ATTR`) and
-`_APPROVAL_DECISION_ATTR`
-(`apps/api/src/curie_api/langfuse.py::_APPROVAL_DECISION_ATTR`), read by
-`hoist_sandbox_id` and `hoist_approval_decision`
-(`apps/api/src/curie_api/langfuse.py::hoist_approval_decision`). The drift gate covers
-only the runner's enum against its committed mirror, so a rename on the producer side
-passes CI while silently breaking these two readers. That is the concrete leak a second
-implementation trips over: the schema is closed for the writer and open-coded for the
-reader.
+The two hoist readers bind those keys through the closed enum:
+`_SANDBOX_ATTR` (`apps/api/src/curie_api/langfuse.py::_SANDBOX_ATTR`) is
+`SpanAttributeKey.CURIE_SANDBOX_ID.value` and `_APPROVAL_DECISION_ATTR`
+(`apps/api/src/curie_api/langfuse.py::_APPROVAL_DECISION_ATTR`) is
+`SpanAttributeKey.APPROVAL_DECISION.value`, read by `hoist_sandbox_id` and
+`hoist_approval_decision`
+(`apps/api/src/curie_api/langfuse.py::hoist_approval_decision`). The remaining leak
+is the three `langfuse.*` writer attributes (`langfuse.trace.name`,
+`langfuse.session.id`, `langfuse.user.id`) and the `/langfuse` URL namespace.
 
 ## Cross-links
 
