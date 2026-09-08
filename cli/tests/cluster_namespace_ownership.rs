@@ -65,9 +65,12 @@ def option(*names):
     return None
 
 def ns_json(name, record):
-    return {"apiVersion":"v1", "kind":"Namespace", "metadata":{
+    metadata = {
         "name":name, "labels":record.get("labels", {}), "uid":record["uid"],
-        "resourceVersion":record["resourceVersion"]}}
+        "resourceVersion":record["resourceVersion"]}
+    if "deletionTimestamp" in record:
+        metadata["deletionTimestamp"] = record["deletionTimestamp"]
+    return {"apiVersion":"v1", "kind":"Namespace", "metadata":metadata}
 
 def matches(labels, selector):
     if not selector:
@@ -132,6 +135,11 @@ if program == "helm":
     fail("unexpected helm invocation: " + " ".join(args), 64)
 
 namespaces = state["namespaces"]
+if args[:2] == ["get", "apiservices.apiregistration.k8s.io"]:
+    if state.get("apiservices_error"):
+        fail("Error from server (Forbidden): apiservices.apiregistration.k8s.io is forbidden")
+    print(json.dumps(state["apiservices"])); raise SystemExit(0)
+
 if args[:2] in (["get", "namespace"], ["get", "namespaces"]):
     name = args[2]
     record = namespaces.get(name)
@@ -255,6 +263,8 @@ impl Fixture {
             "adoption_guarded": false, "inventory_error": inventory_error,
             "version_conflict": version_conflict, "discovery_calls": 0,
             "hook_delete_error": false,
+            "apiservices_error": false,
+            "apiservices": {"apiVersion":"apiregistration.k8s.io/v1", "kind":"APIServiceList", "items":[]},
             "inventory_seen": [],
             "resources": ["serviceaccounts", "configmaps", "secrets", "events", "jobs.batch", "deployments.apps"],
             "defaults": Self::default_furniture()
@@ -370,6 +380,14 @@ impl Fixture {
         fs::write(&self.state, serde_json::to_vec(&state).unwrap()).expect("update fake state");
     }
 
+    fn set_apiservices(&self, document: Value, read_error: bool) {
+        let mut state = self.state();
+        state["apiservices"] = document;
+        state["apiservices_error"] = json!(read_error);
+        fs::write(&self.state, serde_json::to_vec(&state).unwrap())
+            .expect("update APIService state");
+    }
+
     fn run_resume(&self, command: &str) -> Output {
         let mut paths = vec![self.bin_dir.clone()];
         paths.extend(std::env::split_paths(
@@ -432,6 +450,164 @@ fn annotated_job(name: &str, labels: Value, annotations: Value) -> Value {
     json!({"apiVersion":"batch/v1", "kind":"Job", "metadata":{
         "name":name, "namespace":NS, "labels":labels, "annotations":annotations
     }})
+}
+
+fn remote_apiservice(available: &str) -> Value {
+    json!({
+        "apiVersion":"apiregistration.k8s.io/v1", "kind":"APIService",
+        "metadata":{"name":"v1alpha1.metrics.example.com"},
+        "spec":{
+            "group":"metrics.example.com", "version":"v1alpha1",
+            "groupPriorityMinimum":1000, "versionPriority":15,
+            "service":{"namespace":"extension-system", "name":"metrics-adapter"}
+        },
+        "status":{"conditions":[{
+            "type":"Available", "status":available, "reason":"FixtureCondition"
+        }]}
+    })
+}
+
+#[test]
+fn empty_namespace_adoption_fails_closed_on_unavailable_remote_apiservices() {
+    // Observed on Kubernetes v1.31: after a remote APIService is advertised,
+    // `kubectl api-resources` may exit 0, omit that unavailable aggregated API
+    // group from its partial output, and emit no stderr. The APIService inventory
+    // is therefore an independent fail-closed prerequisite for empty adoption.
+    let empty = Fixture::default_furniture();
+    let fixture = |document: Value, read_error: bool| {
+        let fixture = Fixture::new(
+            json!({NS: Fixture::namespace(json!({}), empty.clone())}),
+            json!({}),
+            false,
+            false,
+        );
+        fixture.set_apiservices(document, read_error);
+        fixture
+    };
+    let list = |items: Value| {
+        json!({
+            "apiVersion":"apiregistration.k8s.io/v1",
+            "kind":"APIServiceList",
+            "items":items
+        })
+    };
+
+    let unavailable = fixture(list(json!([remote_apiservice("False")])), false);
+    let output = unavailable.up();
+    assert!(
+        !output.status.success(),
+        "unavailable remote APIService was accepted"
+    );
+    let state = unavailable.state();
+    assert_eq!(
+        state["helm_upgrades"], 0,
+        "Helm ran after an incomplete discovery surface"
+    );
+    assert_eq!(
+        state["adoption_guarded"], false,
+        "ownership changed before APIService readiness"
+    );
+    assert_eq!(
+        state["namespaces"][NS]["labels"],
+        json!({}),
+        "refusal changed namespace labels"
+    );
+
+    for blocked in [
+        fixture(
+            json!({"apiVersion":"apiregistration.k8s.io/v1", "kind":"APIServiceList"}),
+            false,
+        ),
+        fixture(list(json!([])), true),
+    ] {
+        let output = blocked.up();
+        assert!(
+            !output.status.success(),
+            "unreadable or malformed APIService inventory was accepted"
+        );
+        let state = blocked.state();
+        assert_eq!(state["helm_upgrades"], 0);
+        assert_eq!(state["adoption_guarded"], false);
+        assert_eq!(state["namespaces"][NS]["labels"], json!({}));
+    }
+
+    let local = json!({
+        "apiVersion":"apiregistration.k8s.io/v1", "kind":"APIService",
+        "metadata":{"name":"v1.local"},
+        "spec":{"groupPriorityMinimum":18000, "versionPriority":1}
+    });
+    for allowed in [
+        fixture(list(json!([remote_apiservice("True")])), false),
+        fixture(list(json!([local])), false),
+    ] {
+        let output = allowed.up();
+        assert!(
+            !output.status.success(),
+            "the fixture Helm hook must still fail after adoption"
+        );
+        let state = allowed.state();
+        assert_eq!(
+            state["adoption_guarded"], true,
+            "safe APIService inventory blocked adoption"
+        );
+        assert_eq!(
+            state["helm_upgrades"], 1,
+            "normal install did not continue after guarded adoption"
+        );
+    }
+}
+
+#[test]
+fn terminating_namespace_blocks_up_but_down_still_cleans_owned_hooks() {
+    let mut terminating = Fixture::namespace(json!({}), Fixture::default_furniture());
+    terminating["deletionTimestamp"] = json!("2026-09-08T14:30:00Z");
+    let target =
+        json!({"app.kubernetes.io/instance":RELEASE, "app.kubernetes.io/managed-by":"Helm"});
+    let fixture = Fixture::new(
+        json!({NS: terminating}),
+        json!({NS: [
+            job("terminating-owned-hook", target.clone(), true),
+            job("terminating-non-hook", target, false),
+            job("terminating-foreign-hook", json!({
+                "app.kubernetes.io/instance":"other-release",
+                "app.kubernetes.io/managed-by":"Helm"
+            }), true)
+        ]}),
+        false,
+        false,
+    );
+
+    let up = fixture.up();
+    assert_blocked_before_helm(&fixture, &up, "terminating");
+
+    let down = fixture.down();
+    let commands = fs::read_to_string(&fixture.log).expect("read terminating cleanup log");
+    assert!(
+        commands
+            .contains("kubectl delete job terminating-owned-hook -n agent-ns --ignore-not-found"),
+        "down must attempt selective hook deletion even while the namespace terminates: {commands}"
+    );
+    assert!(
+        down.status.success(),
+        "selective cleanup on a terminating namespace must complete: {}",
+        shown(&down)
+    );
+    let state = fixture.state();
+    assert!(
+        state["namespaces"].get(NS).is_some(),
+        "the ownership sweep may retain the terminating namespace"
+    );
+    let names: Vec<_> = state["jobs"][NS]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["metadata"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["terminating-non-hook", "terminating-foreign-hook"],
+        "down must retain non-hook and foreign-release controls"
+    );
 }
 
 #[test]
@@ -713,4 +889,9 @@ fn failed_install_cleanup_and_empty_namespace_adoption() {
         other_ns.state()["namespaces"].get(NS).is_some(),
         "same release in another namespace was swept"
     );
+
+    // Keep the declared issue fix-pin selector comprehensive while both review
+    // regressions remain independently runnable by their focused test names.
+    terminating_namespace_blocks_up_but_down_still_cleans_owned_hooks();
+    empty_namespace_adoption_fails_closed_on_unavailable_remote_apiservices();
 }

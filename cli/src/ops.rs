@@ -5922,6 +5922,7 @@ struct NamespaceRecord {
     labels: BTreeMap<String, String>,
     uid: String,
     resource_version: String,
+    terminating: bool,
 }
 
 enum NamespaceProbe {
@@ -5945,12 +5946,9 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
     if metadata.get("name").and_then(serde_json::Value::as_str) != Some(namespace) {
         bail!("kubectl returned metadata for a different namespace while inspecting `{namespace}`");
     }
-    if metadata
+    let terminating = metadata
         .get("deletionTimestamp")
-        .is_some_and(|value| !value.is_null())
-    {
-        bail!("namespace `{namespace}` is terminating and cannot be used for an install");
-    }
+        .is_some_and(|value| !value.is_null());
     let labels = match metadata.get("labels") {
         None | Some(serde_json::Value::Null) => BTreeMap::new(),
         Some(value) => serde_json::from_value(value.clone())
@@ -5972,6 +5970,7 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
         labels,
         uid,
         resource_version,
+        terminating,
     }))
 }
 
@@ -6045,6 +6044,18 @@ fn namespaced_resources_cmd() -> OpsCommand {
             plain("--verbs=list"),
             plain("-o"),
             plain("name"),
+        ],
+    )
+}
+
+fn apiservices_cmd() -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("apiservices.apiregistration.k8s.io"),
+            plain("-o"),
+            plain("json"),
         ],
     )
 }
@@ -6166,7 +6177,84 @@ fn is_root_ca_config_map(item: &serde_json::Value, namespace: &str) -> bool {
     })
 }
 
+async fn verify_remote_apiservices_available(namespace: &str) -> Result<()> {
+    let (ok, output, err) = run_capture(&apiservices_cmd()).await?;
+    if !ok {
+        bail!(
+            "could not read APIService availability before adopting `{namespace}`: {}",
+            failure_reason(&err)
+        );
+    }
+    let document: serde_json::Value =
+        serde_json::from_str(&output).context("parsing APIService availability inventory")?;
+    if document
+        .get("apiVersion")
+        .and_then(serde_json::Value::as_str)
+        != Some("apiregistration.k8s.io/v1")
+        || document.get("kind").and_then(serde_json::Value::as_str) != Some("APIServiceList")
+    {
+        bail!("APIService availability inventory has an unexpected object shape");
+    }
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("APIService availability inventory has no items array")?;
+    for item in items {
+        if item.get("apiVersion").and_then(serde_json::Value::as_str)
+            != Some("apiregistration.k8s.io/v1")
+            || item.get("kind").and_then(serde_json::Value::as_str) != Some("APIService")
+        {
+            bail!("APIService availability inventory contains a malformed item");
+        }
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("APIService availability inventory contains an item without a name")?;
+        let spec = item
+            .get("spec")
+            .and_then(serde_json::Value::as_object)
+            .with_context(|| format!("APIService `{name}` has no spec object"))?;
+        let service = match spec.get("service") {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(service) => service.as_object().with_context(|| {
+                format!("remote APIService `{name}` has a malformed service reference")
+            })?,
+        };
+        if service
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .is_none()
+            || service
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            bail!("remote APIService `{name}` has an incomplete service reference");
+        }
+        let available = item
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition.get("type").and_then(serde_json::Value::as_str) == Some("Available")
+                        && condition.get("status").and_then(serde_json::Value::as_str)
+                            == Some("True")
+                })
+            });
+        if !available {
+            bail!(
+                "remote APIService `{name}` is not Available=True; APIService availability must be complete before adopting namespace `{namespace}`"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
+    verify_remote_apiservices_available(namespace).await?;
     let (ok, discovered, err) = run_capture(&namespaced_resources_cmd()).await?;
     if !ok {
         bail!(
@@ -6286,6 +6374,12 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
             }
         }
         NamespaceProbe::Present(record) => {
+            if record.terminating {
+                bail!(
+                    "namespace `{}` is terminating and cannot be used for an install",
+                    o.namespace
+                );
+            }
             let created_by = record.labels.get(CREATED_BY_LABEL);
             let created_in = record.labels.get(CREATED_IN_LABEL);
             if created_by.map(String::as_str) == Some(o.release.as_str())

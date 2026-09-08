@@ -211,7 +211,13 @@ safe inventory proves it is empty apart from the default ServiceAccount and
 other objects, or a foreign, partially owned, or otherwise conflicting
 namespace, is refused with a reason. The shared
 `agent-sandbox-system` namespace keeps its create-only behavior and is never
-adopted.
+adopted. The inventory is a point-in-time observation. The adoption patch
+compares the Namespace UID and metadata resource version, but creation of a
+namespaced object does not change that resource version, so the patch does not
+serialize other writers; keep an unowned namespace unused by other writers
+through adoption. An unavailable remote APIService registration, or inability
+to read APIService availability, blocks empty-namespace adoption. A terminating
+namespace is readable but is refused for `cluster up`.
 
 The first gVisor preflight keeps the chart default. Only the exact admission
 result `RuntimeClass "gvisor" not found` authorizes
@@ -266,6 +272,8 @@ only namespaces bearing this release's ownership pair. Hook cleanup still runs
 when the namespace is retained or Helm uninstall reports a failure. An
 unlabeled or foreign namespace is retained with a warning, and retained Agent
 Sandbox CRDs and the pre-existing shared controller namespace are untouched.
+During namespace termination, `cluster down` can still inspect the namespace
+and remove matching retained hook Jobs.
 
 A release is identified by its name AND the namespace it was installed into,
 and namespace cleanup requires both ownership labels. If you run a second
