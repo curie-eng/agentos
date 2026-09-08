@@ -4382,21 +4382,24 @@ impl UpValuePlan {
 }
 
 fn model_credential_source_is_set(opts: &UpOpts) -> bool {
-    // `--fake-model` wins over every credential source, exactly as it already
-    // wins over an environment credential in `resolve_up_credentials`. Without
-    // this, preserving a recorded `credentialsExistingSecret` (#2459) would make
-    // the caller pin `fakeModel=false` off the very value it just preserved, and
-    // `--fake-model` would silently install the real model instead.
-    if opts.fake_model {
-        return false;
-    }
     opts.credentials.is_some()
         || final_operator_value(opts, MODEL_CREDENTIAL_REFERENCE_KEYS[0])
             .is_some_and(|value| !value.is_empty())
-        || opts
-            .secrets
-            .iter()
-            .any(|(key, value)| key == MODEL_CREDENTIAL_REFERENCE_KEYS[0] && !value.is_empty())
+        // The `opts.secrets` entry may be a reference this run PRESERVED rather
+        // than one anybody supplied for it (#2459). Counting a preserved value
+        // as a credential source would make the caller pin `fakeModel=false`
+        // off the very value it just carried forward, so `--fake-model` would
+        // silently install the real model.
+        //
+        // Only this lane is suppressed. An operator `--set` (the lane above)
+        // and an explicit credential still win over `--fake-model` exactly as
+        // they did before: an operator naming a credential secret and asking
+        // for a fake model in one command is a contradiction, and which side
+        // wins there is not this fix's decision to change.
+        || (!opts.fake_model
+            && opts.secrets.iter().any(|(key, value)| {
+                key == MODEL_CREDENTIAL_REFERENCE_KEYS[0] && !value.is_empty()
+            }))
 }
 
 /// The ordered chart values supplied by one `cluster up`. Both the Helm command
@@ -15101,6 +15104,31 @@ mod tests {
             secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
             None,
             "the operator set the key, so the CLI supplies nothing for it"
+        );
+    }
+
+    /// #2459: `--fake-model` beats a PRESERVED reference and nothing else.
+    ///
+    /// An operator naming a credential secret and asking for a fake model in
+    /// one command is a contradiction; the operator's `--set` has always won it
+    /// and still does. Suppressing that lane too would have been a second,
+    /// undeclared precedence change riding on this fix.
+    #[test]
+    fn fake_model_does_not_beat_an_operator_supplied_credential_reference() {
+        let mut input = completed_dev_up(
+            None,
+            vec!["agentSandbox.runner.credentialsExistingSecret=acme-operator".into()],
+        );
+        input.fake_model = true;
+        let opts = complete_up_opts_without_runner_egress(input, None, None, false).unwrap();
+
+        assert_eq!(
+            up_value_plan(&opts)
+                .effective_values()
+                .get(FAKE_MODEL_KEY)
+                .map(String::as_str),
+            Some("false"),
+            "an explicitly set credential reference still selects the real model"
         );
     }
 }
