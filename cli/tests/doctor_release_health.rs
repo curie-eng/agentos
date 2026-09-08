@@ -39,12 +39,15 @@ fn install_tools(tools: &Path) {
         r#"#!/bin/sh
 case "$*" in
   "config current-context") printf '%s\n' 'doctor-stub-context' ;;
-  *"app.kubernetes.io/instance=curie-demo"*) printf '%s\n' "$CURIE_TEST_DOCTOR_WORKLOADS" ;;
+  *"get deployments,statefulsets"*"app.kubernetes.io/instance=curie-demo"*)
+    printf '%s\n' "$CURIE_TEST_DOCTOR_WORKLOADS"
+    ;;
   *"get deployments,statefulsets"*)
     # Namespace-wide listing would count a neighbor release. Returning a
     # ready replica here makes a forgotten selector look healthy.
     printf '%s\n' '{"items":[{"kind":"Deployment","status":{"readyReplicas":9}}]}'
     ;;
+  *"component=worker"*) printf '%s\n' '{"items":[]}' ;;
   *) printf 'unexpected kubectl invocation: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#,

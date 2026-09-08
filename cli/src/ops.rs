@@ -605,6 +605,10 @@ pub struct RollbackOpts {
     /// without this flag, since helm never finished applying such a revision.
     pub allow_failed_revision: bool,
     pub yes: bool,
+    /// Test-only negative control for #2296: skip the schema compatibility
+    /// gate so the status filter's unsafe v0.8.4 target is handed to Helm.
+    /// The clap path never sets this.
+    pub disable_schema_gate: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -6230,6 +6234,87 @@ async fn run_install_with_gvisor_observer(
     }
 }
 
+/// Whether the aborted gVisor preflight attempt left a Helm release that must
+/// be removed before the `security.gvisor.mode=off` retry.
+///
+/// A history with no `deployed`/`superseded` revision never reached a
+/// known-good install. Retrying with `helm upgrade --install` is then an
+/// *upgrade*, which fires the pre-upgrade drain hook against Secrets the
+/// cancelled revision never rendered (#2347). An empty history (Helm has not
+/// recorded the release yet) is the same case: uninstall is a no-op if the
+/// release is already absent.
+///
+/// A history that already contains a known-good revision is an in-place
+/// upgrade of a real install and must be left intact.
+fn should_discard_failed_gvisor_install(history: &[HelmRevision]) -> bool {
+    !history
+        .iter()
+        .any(|row| is_eligible_rollback_status(&row.status))
+}
+
+/// Remove a never-deployed failed revision left by the aborted first Helm
+/// attempt so the gVisor-off retry is a clean install (#2347).
+async fn discard_failed_gvisor_install_if_never_deployed(
+    cl: &crate::ui::Checklist,
+    common: &CommonOpts,
+) -> Result<()> {
+    let ui = crate::ui::ui();
+    let history_cmd = helm_history_cmd(common);
+    ui.plumbing(&format!("+ {}", history_cmd.display()));
+    let (ok, out, err) = run_capture(&history_cmd).await?;
+    let history = if !ok {
+        if helm_release_is_absent(&err) || helm_release_is_absent(&out) {
+            Vec::new()
+        } else {
+            return Err(crate::exit::CliError::failure(format!(
+                "could not read helm history for release {} in namespace {} before the gVisor retry: {}",
+                common.release,
+                common.namespace,
+                err.trim()
+            ))
+            .with_fix(format!(
+                "inspect `helm history {} -n {}` and rerun `curie cluster up`",
+                common.release, common.namespace
+            ))
+            .into());
+        }
+    } else if out.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse_helm_history(&out)?
+    };
+    if !should_discard_failed_gvisor_install(&history) {
+        return Ok(());
+    }
+
+    let cmds = down_commands(common);
+    let uninstall = &cmds[0];
+    ui.plumbing(&format!("+ {}", uninstall.display()));
+    let step = cl.step("discarding failed Helm revision");
+    let (ok, out, err) = run_capture(uninstall).await?;
+    for line in out.lines().chain(err.lines()) {
+        ui.plumbing(line);
+    }
+    if ok {
+        step.done("removed");
+        Ok(())
+    } else if err.contains("not found") || out.contains("not found") {
+        step.done("already absent");
+        Ok(())
+    } else {
+        step.fail("failed");
+        Err(crate::exit::CliError::failure(format!(
+            "helm uninstall of the failed gVisor preflight revision failed: {}",
+            err.trim()
+        ))
+        .with_fix(format!(
+            "helm uninstall {} -n {} && curie cluster up --set security.gvisor.mode=off",
+            common.release, common.namespace
+        ))
+        .into())
+    }
+}
+
 /// Run one command under a checklist `step` labeled `label`, capturing its
 /// stdio. Echoes the masked command line and replays the captured output as dim
 /// plumbing (both no-ops unless `--debug`, so default runs stay quiet and the
@@ -6812,6 +6897,11 @@ async fn run_prepared_up(
                     step.warn("retrying");
                     value_plan.set(GVISOR_MODE_KEY, "off");
                     ClusterUpInference::GvisorOff.render(ui);
+                    if let Err(error) =
+                        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common).await
+                    {
+                        return Err(convergence::installation_failure(&opts.common, error).await);
+                    }
                     let retry = up_commands_with_plan(&opts, &value_plan)
                         .into_iter()
                         .next()
@@ -7032,22 +7122,20 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     require_on_path("helm")?;
     require_on_path("kubectl")?;
 
-    // Five independent reads, issued as ONE stage.
+    // Seven independent top-level probes, issued as ONE stage.
     //
     // Safe because none of them consumes another's output: the helm status
-    // line, the pod list, the convergence observation, the release's rendered
-    // fullname and the node host each depend only on `opts`. Awaiting them in
-    // turn made an operator wait through five round trips to a cluster that
-    // could have answered all five at once, and the report is assembled below
-    // in exactly the order it was before -- concurrency here changes when the
-    // answers arrive, never which answer wins.
+    // line, pod list, convergence observation, rendered fullname, node host,
+    // computed-values gate and worker selection each depend only on `opts`.
+    // The report is assembled below in its established order -- concurrency
+    // here changes when the answers arrive, never which answer wins.
     //
     // `?` is applied to the helm result FIRST and the pod result second, so the
     // error an unreachable cluster surfaces is the same one it surfaced when
     // these ran in sequence.
     let helm_status = helm_status_cmd(&opts);
     let pods = pods_cmd(&opts);
-    let (helm, pods_read, observed, fullname, host, computed) = tokio::join!(
+    let (helm, pods_read, observed, fullname, host, computed, worker_claim_probe) = tokio::join!(
         run_capture(&helm_status),
         run_capture(&pods),
         convergence::observe(&opts),
@@ -7064,6 +7152,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
             VALUES_READ_FOR_GATE_TIMEOUT,
             fetch_release_computed_values(&opts),
         ),
+        crate::worker_claims::select_cluster(&opts.namespace, &opts.release),
     );
     let computed = computed.unwrap_or_else(|_| {
         Err(crate::exit::CliError::failure("timed out reading computed Helm values").into())
@@ -7151,8 +7240,9 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     // The same target-manifest check gates up/apply and this read surface.
     // Keep the existing JSON schema: diagnoses use its unhealthy string list.
     // Consumed here, in the position it was awaited in before, so the
-    // `unhealthy` list keeps its order: pod-summary entries, then the
-    // convergence verdict, then the listing failure.
+    // `unhealthy` list keeps its existing order: pod-summary entries, then the
+    // convergence verdict, then the listing failure. The claim diagnosis is
+    // appended after those existing entries.
     match observed {
         Ok(observation) => unhealthy.extend(observation.issues),
         Err(error) => unhealthy.push(format!("convergence could not be verified: {error}")),
@@ -7163,14 +7253,34 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
 
     // (c) URL discovery. The release's rendered fullname and the node host were
     // resolved in the stage above -- both are live-branch only, and `--dry-run`
-    // returned before reaching any of it. The two Service reads DO consume the
-    // fullname, so they wait for that stage and then fan out against each other
-    // rather than queueing up one behind the other.
-    let (ui_url, langfuse_url) = tokio::join!(
+    // returned before reaching any of it. The two Service reads and the worker
+    // exec consume results from that stage, so all three fan out here rather
+    // than queueing behind each other.
+    let (ui_url, langfuse_url, worker_claims) = tokio::join!(
         resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
         resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false),
+        worker_claim_probe.observe(),
     );
     let urls = vec![ui_url, langfuse_url];
+
+    match &worker_claims.state {
+        crate::worker_claims::ClaimsState::ClaimsEnabled => {
+            if let Some(row) = worker_claims
+                .worker_pod
+                .as_deref()
+                .and_then(|pod| pods.iter_mut().find(|row| row.name == pod))
+            {
+                row.status.push_str("; claims enabled");
+            }
+        }
+        crate::worker_claims::ClaimsState::Quiescing { .. }
+        | crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => {
+            unhealthy.push(worker_claims.state.status_diagnosis());
+        }
+        crate::worker_claims::ClaimsState::Unknown => {
+            warnings.push(worker_claims.state.status_diagnosis());
+        }
+    }
 
     let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
@@ -7328,15 +7438,29 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
 // `cluster rollback` (#1899)
 // ---------------------------------------------------------------------------
 
-/// One row of `helm history -o json`. Only the fields the rollback decision
-/// needs are modelled; helm adds others (`updated`, `app_version`) that are
-/// deliberately ignored so a helm version bump cannot break parsing.
+/// One row of `helm history -o json`. Unknown fields (`updated`, and anything
+/// a newer helm adds) are ignored so a helm version bump cannot break parsing.
+/// `app_version` is kept because the schema gate (#2296) needs the target
+/// application's identity; it is optional and empty when helm omitted it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelmRevision {
     pub revision: u32,
     pub status: String,
     pub chart: String,
+    pub app_version: String,
     pub description: String,
+}
+
+impl HelmRevision {
+    /// Application version this Helm revision installed: `app_version` when
+    /// helm supplied it, otherwise the trailing version on `chart` (`curie-0.8.4`).
+    pub fn application_version(&self) -> Option<String> {
+        let app = self.app_version.trim();
+        if !app.is_empty() {
+            return Some(crate::schema_window::normalize_app_version(app));
+        }
+        crate::schema_window::version_from_chart(&self.chart)
+    }
 }
 
 /// The revision statuses it is safe to roll back TO. Everything else
@@ -7464,10 +7588,14 @@ impl RollbackTarget {
 /// whose status is `deployed` or `superseded`.
 ///
 /// This is the whole fix for #1899. A `cluster up` against a cluster with no
-/// `runsc` RuntimeClass records a FAILED revision before its successful retry,
-/// so the history alternates failed/superseded and the immediately preceding
-/// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
-/// ineligible statuses is what stops an operator having to know that.
+/// `runsc` RuntimeClass used to record a FAILED revision before its successful
+/// retry, so the history alternated failed/superseded and the immediately
+/// preceding revision -- the one bare `helm rollback` targets -- was a failed
+/// one. Skipping ineligible statuses is what stops an operator having to know
+/// that. Issue #2347 now discards a never-deployed failed revision before that
+/// retry, so a current first-install recovery no longer leaves the pair.
+/// Rollback still has to skip ineligible statuses: a later upgrade can fail,
+/// and releases installed by an older CLI still carry the pair.
 ///
 /// Pure by construction so the decision is unit-testable with no cluster.
 pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarget> {
@@ -7583,6 +7711,7 @@ pub fn parse_helm_history(json: &str) -> Result<Vec<HelmRevision>> {
             revision,
             status,
             chart: field("chart"),
+            app_version: field("app_version"),
             description: field("description"),
         });
     }
@@ -7622,6 +7751,29 @@ pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
+/// `kubectl exec` into the running API pod for `alembic current`. The live
+/// database revision is what the target image's migrate init container will
+/// see; reading it here is the pre-mutation half of #2296.
+pub fn live_schema_revision_cmd(o: &CommonOpts) -> OpsCommand {
+    let deploy = chart_fullname(&o.release).resource("api");
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("exec"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain(format!("deploy/{deploy}")),
+            plain("-c"),
+            plain("api"),
+            plain("--"),
+            plain("alembic"),
+            plain("-c"),
+            plain("alembic.ini"),
+            plain("current"),
+        ],
+    )
+}
+
 /// `helm rollback` to an explicit revision. Always explicit: the whole point of
 /// the verb is that helm's own default target (the immediately preceding
 /// revision) is the wrong one on a failed/superseded history.
@@ -7650,12 +7802,16 @@ fn helm_rollback_cmd_to(o: &CommonOpts, revision: String) -> OpsCommand {
 }
 
 /// The commands `curie cluster rollback` runs (and prints under `--dry-run`):
-/// the history read that decides the target, then the rollback itself. A `None`
-/// revision is one the caller has not resolved yet, and stands in the argv as
-/// [`SELECTED_REVISION`].
+/// the history read that decides the target, the live-schema probe, then the
+/// rollback itself. A `None` revision is one the caller has not resolved yet,
+/// and stands in the argv as [`SELECTED_REVISION`].
 pub fn rollback_commands(o: &CommonOpts, revision: Option<u32>) -> Vec<OpsCommand> {
     let target = revision.map_or_else(|| SELECTED_REVISION.to_string(), |r| r.to_string());
-    vec![helm_history_cmd(o), helm_rollback_cmd_to(o, target)]
+    vec![
+        helm_history_cmd(o),
+        live_schema_revision_cmd(o),
+        helm_rollback_cmd_to(o, target),
+    ]
 }
 
 /// One printed plan line. `display()` everywhere, except that it shell-quotes
@@ -7800,6 +7956,60 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         }
         None => select_rollback_revision(&history)?.require_eligible()?,
     };
+
+    if !opts.disable_schema_gate {
+        require_on_path("kubectl")?;
+        let target_row = history
+            .iter()
+            .find(|row| row.revision == choice.to_revision);
+        let target_app = target_row.and_then(HelmRevision::application_version);
+        let history_apps: Vec<String> = history
+            .iter()
+            .filter_map(HelmRevision::application_version)
+            .collect();
+        let probe = live_schema_revision_cmd(&opts.common);
+        ui.plumbing(&format!("+ {}", probe.display()));
+        let (ok, probe_out, probe_err) = run_capture(&probe).await?;
+        if !ok {
+            let detail = crate::schema_window::redact_probe_text(
+                probe_err
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("kubectl exec exited nonzero with no message"),
+            );
+            return Err(crate::exit::CliError::failure(format!(
+                "refusing rollback: could not read the live database revision from the API pod: {detail}"
+            ))
+            .with_fix(format!(
+                "confirm the API is running with `curie cluster status --release {} --namespace {}` and retry",
+                opts.common.release, opts.common.namespace
+            ))
+            .into());
+        }
+        let live =
+            crate::schema_window::parse_alembic_current_output(&probe_out).ok_or_else(|| {
+                crate::exit::CliError::failure(
+                    "refusing rollback: the API pod did not report a live database revision",
+                )
+                .with_fix("confirm the API is running with `curie cluster status` and retry")
+            })?;
+        let Some(target_app) = target_app else {
+            return Err(crate::exit::CliError::failure(format!(
+                "refusing rollback to Helm revision {}: no application version on that revision",
+                choice.to_revision
+            ))
+            .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
+            .into());
+        };
+        if let Err(refusal) =
+            crate::schema_window::check_target_schema(&target_app, &live, &history_apps)
+        {
+            return Err(crate::exit::CliError::failure(refusal.message)
+                .with_fix(refusal.fix)
+                .into());
+        }
+    }
 
     // Disclosed BEFORE the prompt, and on stderr like `cluster down` does it:
     // the operator confirms knowing both the target and what was passed over,
@@ -8310,7 +8520,7 @@ pub enum SlackApiBase {
 /// `nameOverride`/`fullnameOverride` move it again. Guessing the name is the
 /// defect `release_secret_name` already avoids by selecting on labels, and this
 /// selects the same way for the same reason.
-fn worker_deployment_selector(release: &str) -> String {
+pub(crate) fn worker_deployment_selector(release: &str) -> String {
     component_selector(release, "worker")
 }
 
@@ -9564,6 +9774,47 @@ mod tests {
     /// `chart_fullname_tests::the_default_release_is_a_byte_identical_no_op`.
     fn fullname() -> ReleaseFullname {
         chart_fullname("curie")
+    }
+
+    fn history_row(revision: u32, status: &str) -> HelmRevision {
+        HelmRevision {
+            revision,
+            status: status.to_string(),
+            chart: "curie-0.0.0".to_string(),
+            app_version: String::new(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn gvisor_retry_discards_a_history_that_never_deployed() {
+        assert!(should_discard_failed_gvisor_install(&[]));
+        assert!(should_discard_failed_gvisor_install(&[history_row(
+            1, "failed"
+        )]));
+        assert!(should_discard_failed_gvisor_install(&[
+            history_row(1, "failed"),
+            history_row(2, "pending-install"),
+        ]));
+        assert!(should_discard_failed_gvisor_install(&[history_row(
+            1,
+            "pending-upgrade"
+        )]));
+    }
+
+    #[test]
+    fn gvisor_retry_keeps_a_history_with_a_known_good_revision() {
+        assert!(!should_discard_failed_gvisor_install(&[history_row(
+            1, "deployed"
+        )]));
+        assert!(!should_discard_failed_gvisor_install(&[
+            history_row(1, "superseded"),
+            history_row(2, "failed"),
+        ]));
+        assert!(!should_discard_failed_gvisor_install(&[
+            history_row(1, "deployed"),
+            history_row(2, "pending-upgrade"),
+        ]));
     }
 
     #[test]

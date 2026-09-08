@@ -42,6 +42,7 @@ pub mod retired;
 pub mod runner;
 pub mod scaffold;
 pub mod schema;
+pub mod schema_window;
 pub mod schemas;
 pub mod seal;
 pub mod sealing;
@@ -50,6 +51,7 @@ pub mod slack;
 pub mod spec;
 pub mod state;
 pub mod ui;
+pub(crate) mod worker_claims;
 
 pub use retired::retired_hint;
 

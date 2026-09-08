@@ -1210,3 +1210,76 @@ def test_the_turn_not_started_text_is_operator_overridable(
 
     monkeypatch.setenv("CURIE_TURN_NOT_STARTED_TEXT", "Sorry, please resend that.")
     assert WorkerConfig().turn_not_started_text == "Sorry, please resend that."
+
+
+# --- Installation-scoped upgrade drain authority (#2374) --------------------
+
+
+def test_upgrade_drain_identity_defaults_preserve_standalone_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compose and a bare worker have no Helm installation boundary.
+
+    Blank identity remains the deliberate legacy-key mode, while the hook-only
+    revision and compatibility inputs default away so ``--mode status`` can
+    construct its config in every worker process.
+    """
+    _clear_all_config_env(monkeypatch)
+
+    config = WorkerConfig(key_prefix="curie:worker")
+
+    assert config.installation_id == ""
+    assert config.upgrade_revision is None
+    assert config.upgrade_legacy_quiesce is False
+    assert config.upgrade_quiesce_key() == "curie:worker:upgrade:quiesce"
+
+
+def test_upgrade_drain_identity_reads_only_its_three_curie_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("INSTALLATION_ID", "stray-install")
+    monkeypatch.setenv("UPGRADE_REVISION", "99")
+    monkeypatch.setenv("UPGRADE_LEGACY_QUIESCE", "false")
+    monkeypatch.setenv("CURIE_INSTALLATION_ID", "install-env")
+    monkeypatch.setenv("CURIE_UPGRADE_REVISION", "10")
+    monkeypatch.setenv("CURIE_UPGRADE_LEGACY_QUIESCE", "true")
+
+    config = WorkerConfig(key_prefix="curie:worker")
+
+    assert config.installation_id == "install-env"
+    assert config.upgrade_revision == 10
+    assert config.upgrade_legacy_quiesce is True
+    assert (
+        config.upgrade_quiesce_key()
+        == "curie:worker:upgrade:quiesce:install-env"
+    )
+
+
+@pytest.mark.parametrize("revision", ["nine", "9.5", "0", "-1"])
+def test_upgrade_revision_must_be_a_positive_decimal_integer(
+    monkeypatch: pytest.MonkeyPatch,
+    revision: str,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_UPGRADE_REVISION", revision)
+
+    with pytest.raises(ValidationError, match="CURIE_UPGRADE_REVISION"):
+        WorkerConfig()
+
+
+def test_deliberately_blank_installation_id_keeps_the_legacy_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+
+    config = WorkerConfig(
+        key_prefix="test:standalone",
+        installation_id="",
+        upgrade_revision=9,
+        upgrade_legacy_quiesce=False,
+    )
+
+    assert config.installation_id == ""
+    assert config.upgrade_revision == 9
+    assert config.upgrade_quiesce_key() == "test:standalone:upgrade:quiesce"

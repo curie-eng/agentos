@@ -20,7 +20,7 @@ import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
-from sqlalchemy import func, select, text
+from sqlalchemy import Text, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import crud, sandbox_token
@@ -234,21 +234,48 @@ async def _enforce_caps(
             f"{settings.state_max_value_bytes}-byte per-value cap",
         )
 
-    others = await session.scalars(
-        select(WorkflowStateEntry.value).where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.binding_scope == scope,
-            WorkflowStateEntry.namespace == namespace,
-            WorkflowStateEntry.key != key,
-        )
+    # Cap unit is compact json.dumps (ensure_ascii=True). jsonb::text is not
+    # byte-identical: object whitespace makes it an *upper* bound for ASCII
+    # JSON, but UTF-8 output is shorter than ensure_ascii escapes, so a
+    # multibyte sibling must take the exact fallback. The aggregates return
+    # two scalars; fetching sibling values is only the over-bound path.
+    sibling_filter = (
+        WorkflowStateEntry.agent_id == agent_id,
+        WorkflowStateEntry.binding_scope == scope,
+        WorkflowStateEntry.namespace == namespace,
+        WorkflowStateEntry.key != key,
     )
-    namespace_bytes = value_bytes + sum(_json_size(v) for v in others)
-    if namespace_bytes > settings.state_max_namespace_bytes:
-        raise HTTPException(
-            413,
-            f"namespace {namespace!r} would be {namespace_bytes} bytes, over the "
-            f"{settings.state_max_namespace_bytes}-byte per-namespace cap",
+    sibling_text = (
+        select(cast(WorkflowStateEntry.value, Text).label("json_text"))
+        .where(*sibling_filter)
+        .subquery()
+    )
+    sibling_bound, has_multibyte = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(func.octet_length(sibling_text.c.json_text)), 0),
+                func.coalesce(
+                    func.bool_or(
+                        func.octet_length(sibling_text.c.json_text)
+                        != func.length(sibling_text.c.json_text)
+                    ),
+                    False,
+                ),
+            )
         )
+    ).one()
+    sibling_bound_bytes = int(sibling_bound or 0)
+    if bool(has_multibyte) or (
+        value_bytes + sibling_bound_bytes > settings.state_max_namespace_bytes
+    ):
+        others = await session.scalars(select(WorkflowStateEntry.value).where(*sibling_filter))
+        namespace_bytes = value_bytes + sum(_json_size(v) for v in others)
+        if namespace_bytes > settings.state_max_namespace_bytes:
+            raise HTTPException(
+                413,
+                f"namespace {namespace!r} would be {namespace_bytes} bytes, over the "
+                f"{settings.state_max_namespace_bytes}-byte per-namespace cap",
+            )
 
     # Per-agent namespace-count cap (#852): refuse only a NEW namespace, and only
     # once the agent is at its limit -- writes to an existing namespace never hit
@@ -273,7 +300,7 @@ async def _enforce_caps(
     #    COMMIT or the ROLLBACK with no explicit unlock and no leak path when
     #    the 403 below propagates. This REQUIRES a transaction to already be
     #    open -- outside one the lock would be released immediately and this
-    #    guard would be vacuous. The byte-cap ``others`` SELECT above runs
+    #    guard would be vacuous. The byte-cap SQL bound SELECT above runs
     #    unconditionally and autobegins it; moving this block above those
     #    queries would silently make the lock meaningless.
     #

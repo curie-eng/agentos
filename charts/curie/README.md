@@ -85,6 +85,22 @@ it after the upgrade even when Helm fails. The commands below use
 `--reuse-values` only for same chart configuration changes, not a chart version
 upgrade.
 
+**Upgrade drain and claim state.** Before each upgrade, a hook pauses new worker
+claims and waits for accepted deliveries to finish. The chart stores an
+installation identity in its managed Secret and reuses it across upgrades. A
+reinstall mints a new identity, so a late hook from the removed installation
+cannot pause the fresh workers.
+
+`curie cluster status` and `curie doctor` report the current claim state. While
+claims are paused, `curie cluster message` reports `waiting for upgrade revision
+<revision> since <timestamp>`; if safe marker metadata is unavailable, it uses
+the platform-authored `waiting for upgrade; marker metadata unavailable` reason
+instead of echoing marker data. A post-upgrade release clears only its own
+revision. If a newer revision is already active, the older release leaves that
+marker in place, so a successful release Job means release processing completed;
+confirm the actual claim state with `curie cluster status`. The marker TTL is a
+last-resort expiry, not a promise of prompt convergence for a current pause.
+
 **Step 2 -- connect Slack + a real model.** When you have Slack tokens and a
 model credential, upgrade in place (the exact command is also printed in
 `NOTES.txt` after step 1):
@@ -522,7 +538,22 @@ postgres:
   port: 5432
   auth: { username: curie, database: curie }
   existingSecret: my-pg-secret   # must carry key: postgresPassword
+  sslMode: require               # RDS / Cloud SQL / Neon that enforce TLS
 ```
+
+A BYO Postgres that enforces TLS (RDS with `rds.force_ssl=1`, Cloud SQL, Neon)
+also needs `postgres.sslMode: require` alongside `postgres.deploy: false` and
+`postgres.host`. One helper (`curie.postgres.dsnParams`) renders the per-driver
+suffix onto every DSN: `?ssl=require` for the api and worker (SQLAlchemy +
+asyncpg) and `?sslmode=no-verify` for both Langfuse Deployments (Prisma). The
+api migrate init container lifts `ssl=` out of the DSN into the asyncpg connect
+kwarg, because asyncpg's DSN parser would otherwise forward `ssl` as a server
+setting and the API would never leave init. `postgres.sslMode: require` against
+the in-chart Postgres fails the render: that StatefulSet serves no TLS
+listener. Neither suffix verifies the server certificate, so Langfuse traffic
+is encrypted but not authenticated; a `verify-full` mode needs a mounted CA
+bundle and is a second step. Leave `sslMode` empty (the default) for the
+in-cluster store: the rendered DSNs stay suffix-free.
 
 Toggles (all default `true`): `langfuse.deploy`, `postgres.deploy`,
 `valkey.deploy`, `clickhouse.deploy`, `rustfs.deploy`, `otelCollector.deploy`.
