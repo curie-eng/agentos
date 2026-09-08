@@ -165,11 +165,20 @@ spec:
      must be in that store's allow-list or Claim 5 red-fails a correct rail.
      Claim 5 only asserts the data-tier boundary when the rail that creates it is
      enabled AND the store is in-chart-deployed; BYO stores are external and
-     excluded. Both a disabled rail and all-BYO stores yield an empty list =>
-     Claim 5 skips. */}}
+     excluded from $dt (there is no in-cluster ingress rail to prove). Both a
+     disabled rail and all-BYO stores yield an empty list => Claim 5 skips.
+     When postgres.deploy is false and postgres.host is set, $pgByo carries
+     host:port so Claim 5 can SKIP the in-cluster 5432 check by name rather
+     than dropping it silently (#2432). Do not put that host on $dt: Claim 5's
+     allowed=reachable / denied=blocked pair cannot hold on an external
+     endpoint, and helm test would fail a correct BYO/RDS install. */}}
 {{- $dt := list -}}
+{{- $pgByo := "" -}}
+{{- if and (not .Values.postgres.deploy) .Values.postgres.host -}}
+{{- $pgByo = printf "%s:%v" .Values.postgres.host .Values.postgres.port -}}
+{{- end -}}
 {{- if .Values.security.dataTierNetworkPolicy.enabled -}}
-{{- if .Values.postgres.deploy }}{{- $dt = append $dt (printf "%s:5432" (include "curie.postgres.host" .)) -}}{{- end }}
+{{- if .Values.postgres.deploy }}{{- $dt = append $dt (printf "%s:%v" (include "curie.postgres.host" .) .Values.postgres.port) -}}{{- end }}
 {{- if .Values.rustfs.deploy }}{{- $dt = append $dt (printf "%s:%v" (include "curie.rustfs.host" .) .Values.rustfs.port) -}}{{- end }}
 {{- if .Values.clickhouse.deploy }}{{- $dt = append $dt (printf "%s:8123" (include "curie.clickhouse.host" .)) -}}{{- end }}
 {{- if .Values.valkey.deploy }}{{- $dt = append $dt (printf "%s:6379" (include "curie.valkey.host" .)) -}}{{- end }}
@@ -239,6 +248,11 @@ spec:
             # only a probe label with NO app labels (rail SHOULD block it).
             - name: DATATIER_TARGETS
               value: {{ join " " $dt | quote }}
+            # BYO Postgres (#2432): empty on the in-chart path. When set, Claim 5
+            # skips in-cluster :5432 and names this host:port rather than nc'ing
+            # it (no in-cluster deny/allow pair exists for an external store).
+            - name: POSTGRES_BYO_TARGET
+              value: {{ $pgByo | quote }}
             - name: DT_ALLOWED_POD
               value: {{ include "curie.fullname" . }}-dt-probe-allowed
             - name: DT_DENIED_POD
@@ -457,6 +471,9 @@ spec:
               # with no app labels is blocked (the isolation the rail enforces).
               echo ""
               echo "== Claim 5: data-tier ingress isolation (default-deny + scoped-allow) =="
+              if [ -n "$POSTGRES_BYO_TARGET" ]; then
+                echo "SKIP: postgres.deploy is false; Claim 5 does not probe in-cluster Postgres. BYO ${POSTGRES_BYO_TARGET} is outside the cluster and has no data-tier ingress rail."
+              fi
               if [ -z "$DATATIER_TARGETS" ]; then
                 echo "SKIP: data-tier NetworkPolicy rail disabled or no in-chart store deployed"
               else
