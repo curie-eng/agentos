@@ -264,7 +264,7 @@ impl Fixture {
             "version_conflict": version_conflict, "discovery_calls": 0,
             "hook_delete_error": false,
             "apiservices_error": false,
-            "apiservices": {"apiVersion":"apiregistration.k8s.io/v1", "kind":"APIServiceList", "items":[]},
+            "apiservices": {"apiVersion":"v1", "kind":"List", "items":[]},
             "inventory_seen": [],
             "resources": ["serviceaccounts", "configmaps", "secrets", "events", "jobs.batch", "deployments.apps"],
             "defaults": Self::default_furniture()
@@ -486,8 +486,8 @@ fn empty_namespace_adoption_fails_closed_on_unavailable_remote_apiservices() {
     };
     let list = |items: Value| {
         json!({
-            "apiVersion":"apiregistration.k8s.io/v1",
-            "kind":"APIServiceList",
+            "apiVersion":"v1",
+            "kind":"List",
             "items":items
         })
     };
@@ -514,10 +514,7 @@ fn empty_namespace_adoption_fails_closed_on_unavailable_remote_apiservices() {
     );
 
     for blocked in [
-        fixture(
-            json!({"apiVersion":"apiregistration.k8s.io/v1", "kind":"APIServiceList"}),
-            false,
-        ),
+        fixture(json!({"apiVersion":"v1", "kind":"List"}), false),
         fixture(list(json!([])), true),
     ] {
         let output = blocked.up();

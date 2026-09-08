@@ -6190,8 +6190,8 @@ async fn verify_remote_apiservices_available(namespace: &str) -> Result<()> {
     if document
         .get("apiVersion")
         .and_then(serde_json::Value::as_str)
-        != Some("apiregistration.k8s.io/v1")
-        || document.get("kind").and_then(serde_json::Value::as_str) != Some("APIServiceList")
+        != Some("v1")
+        || document.get("kind").and_then(serde_json::Value::as_str) != Some("List")
     {
         bail!("APIService availability inventory has an unexpected object shape");
     }
