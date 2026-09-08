@@ -1516,6 +1516,11 @@ class StreamConsumer:
     async def _prompt_reclaim_once(self) -> int:
         """Observe capable peers and promptly recover only proven-dead owners."""
 
+        if await self._claims_paused():
+            # A prompt transfer is a new claim just as surely as XREADGROUP is.
+            # Return before liveness observation, pending selection, arbitration,
+            # or XCLAIM so a drain cannot charge or move a peer's delivery.
+            return 0
         return await self._reclaim_dead_consumers()
 
     async def _prompt_reclaim_loop(self) -> None:
@@ -1550,6 +1555,11 @@ class StreamConsumer:
         than on the faster prompt cadence so it inherits the upgrade-drain gate
         and can reuse the ``over_cap`` set this tick already produced.
         """
+        if await self._claims_paused():
+            # Runs already skips this entire maintenance tick at its outer loop.
+            # Keep the shared entrypoint guarded too so eval and direct callers
+            # return before cap scans, dead-letter writes, or any transfer.
+            return 0
         selected: list[StreamEntry] = []
         async with self._reclaim_lock:
             over_cap = await self._dead_letter_over_cap()

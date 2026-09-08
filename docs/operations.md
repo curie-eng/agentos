@@ -321,6 +321,14 @@ So this verb reads the history first, skips every revision whose status is not
 which revisions it passed over, so you can see exactly what a bare
 `helm rollback` would have landed on instead.
 
+Status is not the whole story. Every API pod still runs `alembic upgrade head`
+at startup, so an older image refuses a live database revision it does not
+know. After the status filter, `cluster rollback` reads the live revision from
+the running API pod and refuses a target whose declared schema range does not
+include it, before Helm mutates the release. The refusal names the
+compatibility boundary and the newest safe fail-forward application version.
+It does not print database contents or credentials. See issue #2296.
+
 If you know which revision you want, `--revision <n>` takes it. A revision that
 isn't in the history is refused, and so is one Helm never finished applying --
 unless you also pass `--allow-failed-revision` to say you accept that. If no

@@ -27,6 +27,14 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 helm template t "$CHART" > "$TMP/default.yaml"
+helm template t "$CHART" > "$TMP/fresh-second.yaml"
+helm template t "$CHART" --is-upgrade > "$TMP/client-upgrade.yaml"
+helm template t "$CHART" \
+  --set-string postgres.existingSecret=acme-postgres-credentials \
+  --set-string valkey.existingSecret=acme-valkey-credentials \
+  --set-string agentSandbox.runner.credentialsExistingSecret=acme-model-credentials \
+  --set-string worker.adapterCredentialsExistingSecret=acme-adapter-credentials \
+  > "$TMP/byo-credentials.yaml"
 helm template t "$CHART" --set worker.upgradeDrain.enabled=false > "$TMP/disabled.yaml"
 helm template t "$CHART" --set worker.deploy=false > "$TMP/no-worker.yaml"
 
@@ -193,8 +201,15 @@ if not failures:
         )
         check(
             container.get("command")
-            == ["python", "-m", "curie_worker.upgrade_drain", "--mode", mode],
-            f"{component} command is {container.get('command')!r}",
+            == [
+                "python",
+                "-m",
+                "curie_worker.upgrade_drain",
+                "--mode",
+                mode,
+                "--installation-id-observed=true",
+            ],
+            f"{component} command does not pass the observed installation identity",
         )
         env = {e["name"]: e for e in container.get("env", []) if isinstance(e, dict)}
         for required in ("VALKEY_HOST", "VALKEY_PORT", "VALKEY_PASSWORD"):
@@ -278,4 +293,192 @@ if failures:
     raise SystemExit(1)
 
 print("OK: upgrade drain gate render assertions passed")
+PY
+
+# The installation identity is one render-scoped value shared by the managed
+# Secret, the long-running worker and both lifecycle hooks. Keep these checks in
+# the real Helm consumer: independently calling a random helper from each
+# template would look plausible in source and still split the release across
+# three different Valkey keys.
+python3 - \
+  "$TMP/default.yaml" \
+  "$TMP/fresh-second.yaml" \
+  "$TMP/client-upgrade.yaml" \
+  "$TMP/byo-credentials.yaml" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+default_path, fresh_second_path, client_upgrade_path, byo_path = map(
+    pathlib.Path, sys.argv[1:5]
+)
+
+DRAIN = "upgrade-drain"
+RELEASE = "upgrade-drain-release"
+
+
+def load(path):
+    return [doc for doc in yaml.safe_load_all(path.read_text()) if doc]
+
+
+def one(docs, *, kind, component=None):
+    matches = []
+    for doc in docs:
+        if doc.get("kind") != kind:
+            continue
+        labels = (doc.get("metadata") or {}).get("labels") or {}
+        if component is not None and labels.get("app.kubernetes.io/component") != component:
+            continue
+        matches.append(doc)
+    assert len(matches) == 1, (
+        f"expected one {kind} for component {component!r}, found {len(matches)}"
+    )
+    return matches[0]
+
+
+def managed_secret(docs):
+    secrets = [
+        doc
+        for doc in docs
+        if doc.get("kind") == "Secret"
+        and ((doc.get("metadata") or {}).get("labels") or {}).get(
+            "app.kubernetes.io/instance"
+        )
+        == "t"
+    ]
+    assert len(secrets) == 1, f"expected one release-managed Secret, found {len(secrets)}"
+    secret = secrets[0]
+    installation_id = (secret.get("stringData") or {}).get("installationId")
+    assert isinstance(installation_id, str) and installation_id.strip(), (
+        "managed Secret has no nonblank stringData.installationId"
+    )
+    return secret, installation_id
+
+
+def container_env(doc):
+    containers = ((doc.get("spec") or {}).get("template") or {}).get("spec", {}).get(
+        "containers"
+    ) or []
+    assert len(containers) == 1, "expected exactly one container"
+    return containers[0], containers[0].get("env") or []
+
+
+def unique_env(env, name):
+    entries = [entry for entry in env if entry.get("name") == name]
+    assert len(entries) == 1, f"expected exactly one {name} entry, found {len(entries)}"
+    return entries[0]
+
+
+def assert_identity_render(docs, *, observed, legacy):
+    secret, installation_id = managed_secret(docs)
+    managed_name = secret["metadata"]["name"]
+
+    worker = one(docs, kind="Deployment", component="worker")
+    _, worker_env = container_env(worker)
+    worker_identity = unique_env(worker_env, "CURIE_INSTALLATION_ID")
+    ref = (worker_identity.get("valueFrom") or {}).get("secretKeyRef") or {}
+    assert ref.get("name") == managed_name, (
+        "worker installation identity does not reference the release-managed Secret"
+    )
+    assert ref.get("key") == "installationId", (
+        "worker installation identity does not reference the installationId key"
+    )
+    assert ref.get("optional", False) is False, (
+        "worker installation identity Secret reference is optional"
+    )
+    assert "value" not in worker_identity, "worker installation identity was inlined"
+
+    revisions = []
+    identities = []
+    legacy_values = []
+    for component, mode in ((DRAIN, "drain"), (RELEASE, "release")):
+        hook = one(docs, kind="Job", component=component)
+        container, env = container_env(hook)
+        assert container.get("command") == [
+            "python",
+            "-m",
+            "curie_worker.upgrade_drain",
+            "--mode",
+            mode,
+            f"--installation-id-observed={str(observed).lower()}",
+        ], f"{component} does not carry the expected observed-identity argument"
+
+        identity = unique_env(env, "CURIE_INSTALLATION_ID")
+        revision = unique_env(env, "CURIE_UPGRADE_REVISION")
+        legacy_entry = unique_env(env, "CURIE_UPGRADE_LEGACY_QUIESCE")
+        assert set(identity) == {"name", "value"}, (
+            f"{component} installation identity is not a render-time literal"
+        )
+        assert set(revision) == {"name", "value"}, (
+            f"{component} upgrade revision is not a render-time literal"
+        )
+        assert set(legacy_entry) == {"name", "value"}, (
+            f"{component} legacy compatibility bit is not a render-time literal"
+        )
+        assert isinstance(revision["value"], str) and revision["value"].isdecimal(), (
+            f"{component} upgrade revision is not a decimal integer string"
+        )
+        assert int(revision["value"]) > 0, f"{component} upgrade revision is not positive"
+        identities.append(identity["value"])
+        revisions.append(revision["value"])
+        legacy_values.append(legacy_entry["value"])
+
+    assert identities == [installation_id, installation_id], (
+        "managed Secret and hook installation identities do not match within one render"
+    )
+    assert len(set(revisions)) == 1, "drain and release hooks carry different revisions"
+    assert legacy_values == [legacy, legacy], (
+        "drain and release hooks disagree on legacy compatibility"
+    )
+    return installation_id, managed_name, worker_env
+
+
+default_docs = load(default_path)
+first_id, _, _ = assert_identity_render(default_docs, observed=True, legacy="false")
+second_id, _, _ = assert_identity_render(
+    load(fresh_second_path), observed=True, legacy="false"
+)
+assert first_id != second_id, "two fresh installs reused one installation identity"
+
+# `helm template --is-upgrade` has no live lookup result. It must remain a valid
+# client-side render while marking the hook as unobserved so an executing drain
+# can refuse before touching Valkey or allowing a rollout.
+assert_identity_render(load(client_upgrade_path), observed=False, legacy="true")
+
+# A store/model/adapter credential may come from an operator-owned Secret, but
+# the installation identity always belongs to this release's managed Secret.
+_, managed_name, byo_worker_env = assert_identity_render(
+    load(byo_path), observed=True, legacy="false"
+)
+expected_credential_refs = {
+    "POSTGRES_PASSWORD": "acme-postgres-credentials",
+    "VALKEY_PASSWORD": "acme-valkey-credentials",
+    "CURIE_CREDENTIALS": "acme-model-credentials",
+    "CURIE_ADAPTER_CREDENTIALS": "acme-adapter-credentials",
+    "CURIE_API_KEY": managed_name,
+}
+for env_name, expected_secret in expected_credential_refs.items():
+    entry = unique_env(byo_worker_env, env_name)
+    actual_secret = (
+        ((entry.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name")
+    )
+    assert actual_secret == expected_secret, (
+        f"{env_name} did not use its expected credential Secret"
+    )
+installation_ref = (
+    (
+        unique_env(byo_worker_env, "CURIE_INSTALLATION_ID").get("valueFrom") or {}
+    ).get("secretKeyRef")
+    or {}
+)
+assert installation_ref.get("name") == managed_name, (
+    "a BYO credential Secret substituted for the managed installation identity"
+)
+
+print(
+    "OK: one memoized installation identity reaches the managed Secret, worker and "
+    "both hooks; fresh installs rotate it; client-only upgrades are marked unobserved; "
+    "BYO credential Secrets cannot replace it"
+)
 PY

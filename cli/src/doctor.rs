@@ -650,8 +650,18 @@ fn webhook_recovery(f: &Facts, namespace: &str, release: &str) -> String {
     command
 }
 
-/// Judge the gathered facts. Pure.
+/// Judge caller-supplied facts without adding an observation the caller did
+/// not make. The real doctor path uses [`evaluate_with_worker_claims`] after
+/// its release-scoped observer completes.
 pub fn evaluate(f: &Facts) -> Vec<Check> {
+    evaluate_with_worker_claims(f, None)
+}
+
+/// Judge the gathered facts, including the optional claim observation. Pure.
+fn evaluate_with_worker_claims(
+    f: &Facts,
+    worker_claims: Option<&crate::worker_claims::ClaimsState>,
+) -> Vec<Check> {
     let mut out = Vec::new();
 
     out.push(match (&f.model_credential, &f.model_credential_source) {
@@ -876,6 +886,46 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             out.push(skipped(id, title, reason));
         }
         return out;
+    }
+
+    if let Some(worker_claims) = worker_claims {
+        out.push(match worker_claims {
+            crate::worker_claims::ClaimsState::ClaimsEnabled => {
+                ok("worker-claims", "Worker claims", "claims enabled")
+            }
+            crate::worker_claims::ClaimsState::Quiescing { revision, .. } => {
+                let detail = worker_claims
+                    .wait_reason()
+                    .expect("a quiescing claim state has a wait reason");
+                missing(
+                    "worker-claims",
+                    "Worker claims",
+                    detail,
+                    format!(
+                        "wait for upgrade revision {revision} to finish, then re-run `curie doctor \
+                         --namespace {namespace} --release {release}` and `{}`",
+                        targeted("status", namespace, release)
+                    ),
+                )
+            }
+            crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => missing(
+                "worker-claims",
+                "Worker claims",
+                worker_claims
+                    .wait_reason()
+                    .expect("a metadata-free quiescing state has a wait reason"),
+                format!(
+                    "wait for the current upgrade to finish, then re-run `curie doctor \
+                     --namespace {namespace} --release {release}` and `{}`",
+                    targeted("status", namespace, release)
+                ),
+            ),
+            crate::worker_claims::ClaimsState::Unknown => skipped(
+                "worker-claims",
+                "Worker claims",
+                "worker claim state unknown",
+            ),
+        });
     }
 
     if f.mail_channels.is_empty() {
@@ -4294,6 +4344,17 @@ fn is_plain_https(entry: &serde_json::Value) -> bool {
 /// Gather the facts. Every probe is read-only and failure-tolerant: a missing
 /// tool or an unreachable cluster is a fact to report, never an error to raise.
 pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -> Facts {
+    gather_with_worker_claims(namespace, release, api).await.0
+}
+
+/// Gather the existing public facts plus the release-scoped claim observation
+/// used only by the assembled doctor report. Keeping the observation beside
+/// the facts avoids widening `Facts`, which is a public fixture surface.
+async fn gather_with_worker_claims(
+    namespace: &str,
+    release: &str,
+    api: Option<(&str, &str)>,
+) -> (Facts, Option<crate::worker_claims::ClaimsState>) {
     // Four independent probes, issued as ONE stage: none reads another's
     // output, and every one of them is a subprocess plus a round trip that
     // doctor used to pay for in series. The RESULTS are consumed below in
@@ -4379,7 +4440,7 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
 
     let (ok, ctx, _) = context_probe;
     if !ok || ctx.trim().is_empty() {
-        return f;
+        return (f, None);
     }
     f.kube_context = Some(ctx.trim().to_string());
 
@@ -4401,7 +4462,7 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     let (listed, stdout, _) = release_listing;
     f.release = classify_release_probe(helm_present, listed, &stdout, release);
     if !matches!(f.release, ReleaseProbe::Installed { .. }) {
-        return f;
+        return (f, None);
     }
 
     let common = crate::ops::CommonOpts {
@@ -4409,7 +4470,8 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         release: release.to_string(),
         dry_run: false,
     };
-    // Two SEPARATE reads, deliberately, issued CONCURRENTLY.
+    // Two SEPARATE reads and the worker selection, deliberately issued
+    // CONCURRENTLY.
     //
     // Separate: `fetch_release_values` reports only what the operator supplied,
     // so an operator who never set a model has nothing to read there and the
@@ -4418,30 +4480,25 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     // slack_configured, api.ingress.* or clone_credential onto computed values
     // would silently change three unrelated checks.
     //
-    // Concurrent: neither consumes the other's output and both depend only on
-    // `common`, so awaiting them in turn made every cluster run pay two helm
-    // spawns and two API-server round trips back to back for nothing. Each
-    // result keeps its own failure-tolerant handling below.
-    let (computed, values) = tokio::join!(
+    // Concurrent: none consumes another's output and all depend only on the
+    // confirmed release, so awaiting them in turn would add avoidable cluster
+    // round trips. Each result keeps its own failure-tolerant handling below.
+    let (computed, values, worker_claim_probe) = tokio::join!(
         crate::ops::fetch_release_computed_values(&common),
         crate::ops::fetch_release_values(&common),
+        crate::worker_claims::select_cluster(namespace, release),
     );
 
     // Failed values reads must not claim that the mail adapter is disabled.
     f.mail_channels = vec![crate::mail_channel::unavailable(namespace, release)];
+    let mut mail_enabled = false;
     if let Ok(Some(computed)) = computed {
         f.mail_channels.clear();
-        if helm_truthy(
+        mail_enabled = helm_truthy(
             computed
                 .get("mailAdapter")
                 .and_then(|value| value.get("deploy")),
-        ) {
-            f.mail_channels = crate::mail_channel::observe(namespace, release).await;
-            if f.mail_channels.is_empty() {
-                f.mail_channels
-                    .push(crate::mail_channel::unavailable(namespace, release));
-            }
-        }
+        );
         // The key travels with the id: the chart reads one of two, and a fix
         // naming the other one is a command that changes nothing.
         if let Some((model, key)) = runner_model_from_values(&computed) {
@@ -4453,6 +4510,7 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         f.model_release_fake = release_fake_model(&computed);
     }
 
+    let mut api_values_needing_nodeport = None;
     if let Ok(Some(values)) = values {
         // Presence only, both of them: socket mode needs the pair, and reading
         // one while reporting both is what made a half-wired release read as Ok.
@@ -4465,15 +4523,47 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         // decision itself still lives in exactly one place; deciding it here
         // too, to skip the read, is how a helper stays right while the report
         // goes wrong.
-        f.api_exposure = match api_exposure_from_values(&values, None) {
-            Some(exposure) => Some(exposure),
-            None => api_exposure_from_values(&values, api_nodeport(namespace, release).await),
-        };
+        f.api_exposure = api_exposure_from_values(&values, None);
         f.clone_credential = clone_credential_from_values(&values);
         (f.sandbox_egress_cidrs, f.sandbox_egress_is_reproducible) =
             sandbox_egress_from_values(&values);
+        if f.api_exposure.is_none() {
+            api_values_needing_nodeport = Some(values);
+        }
     }
-    f
+
+    // These reads consume the preceding stage: mail observation needs the
+    // computed deploy gate, NodePort discovery needs the supplied ingress
+    // values, and worker exec needs the selected pod. Run them together so no
+    // independent subprocess waits behind another.
+    let needs_api_nodeport = api_values_needing_nodeport.is_some();
+    let (mail_channels, nodeport, worker_claims) = tokio::join!(
+        async {
+            if !mail_enabled {
+                return None;
+            }
+            let mut reports = crate::mail_channel::observe(namespace, release).await;
+            if reports.is_empty() {
+                reports.push(crate::mail_channel::unavailable(namespace, release));
+            }
+            Some(reports)
+        },
+        async {
+            if needs_api_nodeport {
+                api_nodeport(namespace, release).await
+            } else {
+                None
+            }
+        },
+        worker_claim_probe.observe(),
+    );
+    if let Some(reports) = mail_channels {
+        f.mail_channels = reports;
+    }
+    if let Some(values) = api_values_needing_nodeport.as_ref() {
+        f.api_exposure = api_exposure_from_values(values, nodeport);
+    }
+    (f, Some(worker_claims.state))
 }
 
 /// The kubectl read behind `api_nodeport`, extracted pure so the Service NAME
@@ -4635,7 +4725,8 @@ pub async fn doctor(
     let api = resolved
         .as_ref()
         .map(|(url, key)| (url.as_str(), key.as_str()));
-    let checks = evaluate(&gather(namespace, release, api).await);
+    let (facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    let checks = evaluate_with_worker_claims(&facts, worker_claims.as_ref());
     let summary = summary(&checks);
     DoctorOutput { checks, summary }
 }

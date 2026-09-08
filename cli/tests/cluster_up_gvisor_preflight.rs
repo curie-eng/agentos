@@ -48,6 +48,8 @@ struct Fixture {
     bin_dir: PathBuf,
     plan_file: PathBuf,
     upgrade_log: PathBuf,
+    uninstall_log: PathBuf,
+    helm_sequence: PathBuf,
     event_log: PathBuf,
     helm_pid: PathBuf,
     helm_termination_log: PathBuf,
@@ -59,6 +61,7 @@ struct Fixture {
     event_mode: String,
     singleton_mode: String,
     credential: String,
+    history_status: String,
 }
 
 impl Fixture {
@@ -73,6 +76,8 @@ impl Fixture {
         )
         .expect("write prepared apply plan");
         let upgrade_log = temp.path().join("upgrades.log");
+        let uninstall_log = temp.path().join("uninstalls.log");
+        let helm_sequence = temp.path().join("helm-sequence.log");
         let event_log = temp.path().join("event-queries.log");
         let helm_pid = temp.path().join("helm.pid");
         let helm_termination_log = temp.path().join("helm-termination.log");
@@ -180,6 +185,7 @@ fi
 
 if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
     printf '%s\n' "$*" >> "$CURIE_TEST_UPGRADE_LOG"
+    printf '%s\n' "$*" >> "$CURIE_TEST_HELM_SEQUENCE"
     printf '%s\n' "$$" > "$CURIE_TEST_HELM_PID"
     gvisor_mode="auto"
     fake_model="true"
@@ -222,6 +228,43 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
     fi
     sleep 1
     printf '%s\n' 'Release installed'
+    exit 0
+fi
+
+if [ "$1" = "history" ]; then
+    printf '%s\n' "$*" >> "$CURIE_TEST_HELM_SEQUENCE"
+    if [ "$2" != "target-release" ] || [ "$3" != "-n" ] || [ "$4" != "target-namespace" ]; then
+        printf 'unexpected helm history: %s\n' "$*" >&2
+        exit 64
+    fi
+    case "$CURIE_TEST_HISTORY_STATUS" in
+        absent)
+            printf '%s\n' 'Error: release: not found' >&2
+            exit 1
+            ;;
+        deployed)
+            printf '%s\n' '[{"revision":1,"status":"deployed","chart":"curie-0.0.0","description":"Install complete"}]'
+            exit 0
+            ;;
+        superseded)
+            printf '%s\n' '[{"revision":1,"status":"superseded","chart":"curie-0.0.0","description":"Upgrade complete"},{"revision":2,"status":"failed","chart":"curie-0.0.0","description":"Upgrade \"target-release\" failed: context canceled"}]'
+            exit 0
+            ;;
+        *)
+            printf '%s\n' '[{"revision":1,"status":"failed","chart":"curie-0.0.0","description":"Release \"target-release\" failed: context canceled"}]'
+            exit 0
+            ;;
+    esac
+fi
+
+if [ "$1" = "uninstall" ]; then
+    printf '%s\n' "$*" >> "$CURIE_TEST_UNINSTALL_LOG"
+    printf '%s\n' "$*" >> "$CURIE_TEST_HELM_SEQUENCE"
+    if [ "$2" != "target-release" ] || [ "$3" != "-n" ] || [ "$4" != "target-namespace" ]; then
+        printf 'unexpected helm uninstall: %s\n' "$*" >&2
+        exit 64
+    fi
+    printf '%s\n' 'release "target-release" uninstalled'
     exit 0
 fi
 
@@ -421,6 +464,8 @@ exit 64
             bin_dir,
             plan_file,
             upgrade_log,
+            uninstall_log,
+            helm_sequence,
             event_log,
             helm_pid,
             helm_termination_log,
@@ -432,7 +477,13 @@ exit 64
             event_mode: event_mode.to_string(),
             singleton_mode: singleton_mode.to_string(),
             credential: credential.to_string(),
+            history_status: "failed".to_string(),
         }
+    }
+
+    fn with_history_status(mut self, status: &str) -> Self {
+        self.history_status = status.to_string();
+        self
     }
 
     fn run(&self, extra: &[&str]) -> (Output, Duration) {
@@ -484,6 +535,9 @@ exit 64
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
             .env("CURIE_TEST_UPGRADE_LOG", &self.upgrade_log)
+            .env("CURIE_TEST_UNINSTALL_LOG", &self.uninstall_log)
+            .env("CURIE_TEST_HELM_SEQUENCE", &self.helm_sequence)
+            .env("CURIE_TEST_HISTORY_STATUS", &self.history_status)
             .env("CURIE_TEST_EVENT_LOG", &self.event_log)
             .env("CURIE_TEST_HELM_PID", &self.helm_pid)
             .env(
@@ -518,6 +572,78 @@ exit 64
             .unwrap_or_default()
             .lines()
             .count()
+    }
+
+    fn uninstall_count(&self) -> usize {
+        fs::read_to_string(&self.uninstall_log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    fn helm_mutations(&self) -> Vec<String> {
+        fs::read_to_string(&self.helm_sequence)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let verb = line.split_whitespace().next()?;
+                matches!(verb, "upgrade" | "uninstall").then(|| line.to_string())
+            })
+            .collect()
+    }
+
+    /// Issue #2347: aborting the first Helm attempt leaves a failed revision.
+    /// Recovery must uninstall that never-deployed release before the gVisor-off
+    /// retry so Helm treats the retry as a clean install, not a pre-upgrade.
+    fn assert_failed_revision_discarded_before_retry(&self) {
+        let uninstalls = fs::read_to_string(&self.uninstall_log).unwrap_or_default();
+        assert_eq!(
+            uninstalls.lines().count(),
+            1,
+            "automatic gVisor recovery must uninstall the failed first revision once:\n{uninstalls}"
+        );
+        assert_eq!(
+            uninstalls.trim(),
+            "uninstall target-release -n target-namespace",
+            "the discard must reuse cluster down's helm uninstall argv:\n{uninstalls}"
+        );
+        let mutations = self.helm_mutations();
+        assert_eq!(
+            mutations.len(),
+            3,
+            "recovery must run upgrade, uninstall, upgrade — not a second upgrade against the failed revision:\n{mutations:?}"
+        );
+        assert!(
+            mutations[0].starts_with("upgrade --install"),
+            "the interrupted first attempt must be helm upgrade --install:\n{mutations:?}"
+        );
+        assert_eq!(
+            mutations[1], "uninstall target-release -n target-namespace",
+            "the failed revision must be uninstalled before the retry:\n{mutations:?}"
+        );
+        assert!(
+            mutations[2].starts_with("upgrade --install")
+                && mutations[2].contains("security.gvisor.mode=off"),
+            "the retry must be a clean helm upgrade --install with gVisor off:\n{mutations:?}"
+        );
+        let sequence = fs::read_to_string(&self.helm_sequence).unwrap_or_default();
+        assert!(
+            sequence.lines().any(|line| line.starts_with("history ")
+                && line.contains("target-release")
+                && line.contains("-n target-namespace")
+                && line.contains("-o json")
+                && line.contains("--max")
+                && line.contains("256")),
+            "recovery must read helm history before deciding to discard:\n{sequence}"
+        );
+    }
+
+    fn assert_no_failed_revision_discard(&self) {
+        let uninstalls = fs::read_to_string(&self.uninstall_log).unwrap_or_default();
+        assert!(
+            uninstalls.is_empty(),
+            "this path must not helm uninstall the release:\n{uninstalls}"
+        );
     }
 
     fn assert_event_was_observed_for_rendered_job(&self) {
@@ -733,6 +859,7 @@ fn bare_cluster_up_infers_all_detected_facts_and_retries_once() {
         !shown.contains(OPENROUTER_CREDENTIAL),
         "credential leaked: {shown}"
     );
+    fixture.assert_failed_revision_discarded_before_retry();
     fixture.assert_event_was_observed_for_rendered_job();
     fixture.assert_graceful_helm_interruption();
     fixture.assert_children_stopped();
@@ -755,6 +882,7 @@ fn runtimeclass_document_before_job_still_observes_the_rendered_job() {
         stderr(&output)
     );
     assert_eq!(fixture.upgrade_count(), 1);
+    fixture.assert_no_failed_revision_discard();
     fixture.assert_event_was_observed_for_rendered_job();
     fixture.assert_children_stopped();
 }
@@ -810,6 +938,7 @@ fn fresh_namespace_rejection_is_observed_after_cli_creates_the_namespace() {
             .all(|line| line.contains("-n target-namespace") && !line.contains("--all-namespaces")),
         "fresh namespace retries must retain namespaced permissions:\n{invocations}"
     );
+    fixture.assert_failed_revision_discarded_before_retry();
     fixture.assert_graceful_helm_interruption();
     fixture.assert_children_stopped();
 }
@@ -834,6 +963,7 @@ fn nonmatching_failedcreate_does_not_abort_successful_install() {
         !shown.contains("--set security.gvisor.mode=off"),
         "an unrelated event must not produce the gVisor remediation:\n{shown}"
     );
+    fixture.assert_no_failed_revision_discard();
     fixture.assert_event_was_observed_for_rendered_job();
     fixture.assert_children_stopped();
 }
@@ -869,6 +999,7 @@ fn bare_cluster_up_json_keeps_inferences_on_stderr_and_one_success_on_stdout() {
     }
     assert_automatic_gvisor_recovery_narration(&shown);
     assert_eq!(fixture.upgrade_count(), 2);
+    fixture.assert_failed_revision_discarded_before_retry();
     fixture.assert_event_was_observed_for_rendered_job();
     fixture.assert_graceful_helm_interruption();
     fixture.assert_children_stopped();
@@ -910,6 +1041,7 @@ fn explicit_gvisor_mode_contradicting_admission_is_rejected_before_retry() {
             !retrying_install_line(&shown),
             "an explicit contradiction must not narrate a retry:\n{shown}"
         );
+        fixture.assert_no_failed_revision_discard();
         fixture.assert_graceful_helm_interruption();
         fixture.assert_children_stopped();
     }
@@ -932,6 +1064,7 @@ fn failed_helm_revision_does_not_replace_explicit_gvisor_usage_recovery() {
         .unwrap()
         .contains("remove the explicit"));
     assert_eq!(fixture.upgrade_count(), 1);
+    fixture.assert_no_failed_revision_discard();
     fixture.assert_children_stopped();
 }
 
@@ -966,6 +1099,7 @@ fn prepared_apply_keeps_the_exact_gvisor_rejection_fail_closed() {
         "prepared apply must not narrate automatic recovery:\n{shown}"
     );
     assert_eq!(fixture.upgrade_count(), 1, "prepared apply must not retry");
+    fixture.assert_no_failed_revision_discard();
     fixture.assert_graceful_helm_interruption();
     fixture.assert_children_stopped();
 }
@@ -982,6 +1116,7 @@ fn fake_model_auto_and_mode_off_skip_the_event_observer() {
             stderr(&output)
         );
         assert_eq!(fixture.upgrade_count(), 1);
+        fixture.assert_no_failed_revision_discard();
         fixture.assert_no_event_watch();
     }
 }
@@ -997,8 +1132,88 @@ fn unavailable_event_watch_preserves_the_helm_result() {
         stderr(&output)
     );
     assert_eq!(fixture.upgrade_count(), 1);
+    fixture.assert_no_failed_revision_discard();
     assert!(
         !fixture.watch_pid.exists(),
         "a failed Event snapshot must not spawn the watch process"
     );
+}
+
+/// Issue #2347: the gVisor observer aborts attempt 1, Helm records a failed
+/// revision, and a naive `helm upgrade --install` retry is an upgrade whose
+/// pre-upgrade drain hook waits on a Secret that revision never rendered.
+#[test]
+fn gvisor_retry_uninstalls_a_failed_first_revision_before_reinstall() {
+    let fixture = Fixture::new("matching", "foreign", OPENROUTER_CREDENTIAL);
+    let (output, elapsed) = fixture.run(&[]);
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "recovery must still converge after discarding the failed revision\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}\n{shown}");
+    assert_automatic_gvisor_recovery_narration(&shown);
+    assert_eq!(fixture.upgrade_count(), 2);
+    assert_eq!(fixture.uninstall_count(), 1);
+    fixture.assert_failed_revision_discarded_before_retry();
+    fixture.assert_graceful_helm_interruption();
+    fixture.assert_children_stopped();
+}
+
+/// Negative for #2347: a history that already has a known-good revision is an
+/// in-place upgrade. Discarding it would delete a working release.
+#[test]
+fn gvisor_retry_preserves_a_known_good_release() {
+    for status in ["deployed", "superseded"] {
+        let fixture =
+            Fixture::new("matching", "foreign", OPENROUTER_CREDENTIAL).with_history_status(status);
+        let (output, elapsed) = fixture.run(&[]);
+        let shown = stderr(&output);
+
+        assert!(
+            output.status.success(),
+            "{status} history must still recover with gVisor off\nstdout:\n{}\nstderr:\n{shown}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(elapsed < Duration::from_secs(3), "{status}: {elapsed:?}");
+        assert_automatic_gvisor_recovery_narration(&shown);
+        assert_eq!(fixture.upgrade_count(), 2, "{status}");
+        fixture.assert_no_failed_revision_discard();
+        let mutations = fixture.helm_mutations();
+        assert_eq!(
+            mutations.len(),
+            2,
+            "{status}: must retry as a second upgrade, not uninstall a known-good release:\n{mutations:?}"
+        );
+        assert!(
+            mutations
+                .iter()
+                .all(|line| line.starts_with("upgrade --install")),
+            "{status}: {mutations:?}"
+        );
+        fixture.assert_graceful_helm_interruption();
+        fixture.assert_children_stopped();
+    }
+}
+
+/// An interrupted attempt that never recorded a Helm release is already a
+/// clean install target; uninstall must tolerate "not found".
+#[test]
+fn gvisor_retry_tolerates_an_absent_release_history() {
+    let fixture =
+        Fixture::new("matching", "foreign", OPENROUTER_CREDENTIAL).with_history_status("absent");
+    let (output, elapsed) = fixture.run(&[]);
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "an absent history must still recover\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}\n{shown}");
+    assert_automatic_gvisor_recovery_narration(&shown);
+    fixture.assert_failed_revision_discarded_before_retry();
+    fixture.assert_children_stopped();
 }

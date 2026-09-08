@@ -5,6 +5,8 @@ disposable-DB conftest provisions and migrates a throwaway database per run).
 """
 
 import asyncio
+import json
+import os
 import threading
 import time
 import uuid
@@ -13,8 +15,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import asyncpg
+import pytest
 from curie_api.config import get_settings
-from curie_api.routers.state import _NAMESPACE_LOCK_CLASS, _namespace_lock_key
+from curie_api.routers.state import (
+    _NAMESPACE_LOCK_CLASS,
+    _json_size,
+    _namespace_lock_key,
+)
 from curie_api.sandbox_token import mint
 from sqlalchemy import make_url
 from sqlalchemy.exc import IntegrityError
@@ -407,6 +414,276 @@ def test_namespace_over_the_per_namespace_cap_is_rejected(
         assert b.status_code == 413, b.text
     finally:
         get_settings.cache_clear()
+
+
+def test_namespace_exactly_at_the_byte_cap_is_accepted(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # Cap check is strict greater-than, so a write that lands exactly on
+    # state_max_namespace_bytes must still succeed. Two 50-byte JSON strings
+    # fill a 100-byte namespace with no slack.
+    from curie_api.config import get_settings
+
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/exact-cap"
+    fifty = "x" * 48
+    assert _json_size(fifty) == 50
+    get_settings().state_max_namespace_bytes = 100
+    try:
+        a = client.put(f"{base}/a", json={"value": fifty}, headers=auth_headers)
+        assert a.status_code == 200, a.text
+        b = client.put(f"{base}/b", json={"value": fifty}, headers=auth_headers)
+        assert b.status_code == 200, b.text
+        assert b.json()["value"] == fifty
+    finally:
+        get_settings.cache_clear()
+
+
+def test_namespace_one_byte_over_the_byte_cap_is_rejected(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # One extra serialized byte past the same 100-byte cap must 413, and the
+    # message text is the load-bearing operator string (do not reword it).
+    from curie_api.config import get_settings
+
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/over-cap"
+    get_settings().state_max_namespace_bytes = 100
+    try:
+        a = client.put(f"{base}/a", json={"value": "x" * 48}, headers=auth_headers)
+        assert a.status_code == 200, a.text
+        b = client.put(f"{base}/b", json={"value": "x" * 49}, headers=auth_headers)
+        assert b.status_code == 413, b.text
+        assert "would be 101 bytes" in b.text
+        assert "100-byte per-namespace cap" in b.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_sql_text_bound_over_cap_falls_back_to_exact_size(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """JSONB ::text is an upper bound, not the cap unit.
+
+    Postgres renders object whitespace (`{"k": 1}`) that compact json.dumps
+    does not (`{"k":1}`). A namespace of those objects can have
+    sum(octet_length(value::text)) over the cap while the exact Python size
+    is still under it. That write must be accepted; using the SQL bound as
+    the verdict (removing the exact fallback) 413s it.
+    """
+    from curie_api.config import get_settings
+
+    aid = _agent(client, auth_headers)
+    namespace = "sql-bound-slack"
+    base = f"/agents/{aid}/state/{namespace}"
+    obj = {"k": 1}
+    exact_each = _json_size(obj)
+    cap = 50
+    incoming = obj
+    get_settings().state_max_namespace_bytes = cap
+    try:
+        for i in range(6):
+            r = client.put(f"{base}/s{i}", json={"value": obj}, headers=auth_headers)
+            assert r.status_code == 200, r.text
+
+        sibling_exact, sibling_sql = asyncio.run(
+            _namespace_sibling_sizes(namespace, exclude_key="s6")
+        )
+        incoming_size = _json_size(incoming)
+        assert sibling_exact + incoming_size <= cap, (
+            f"exact total {sibling_exact + incoming_size} must be at or under the cap"
+        )
+        assert sibling_sql + incoming_size > cap, (
+            f"SQL text bound {sibling_sql + incoming_size} must exceed the cap so "
+            "this test fails if the exact fallback is removed; each="
+            f"{exact_each} sql_siblings={sibling_sql}"
+        )
+
+        accepted = client.put(f"{base}/s6", json={"value": incoming}, headers=auth_headers)
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["value"] == incoming
+    finally:
+        get_settings.cache_clear()
+
+
+def test_multibyte_sibling_still_uses_exact_json_dumps_bytes(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Postgres jsonb::text is UTF-8; compact json.dumps is ensure_ascii.
+
+    A sibling of three 'é' characters is 8 bytes as jsonb::text but 20 bytes
+    as json.dumps. Treating the SQL sum as the verdict would accept a follow-on
+    write that is actually over the cap. Exact semantics must still 413.
+    """
+    from curie_api.config import get_settings
+
+    aid = _agent(client, auth_headers)
+    namespace = "unicode-bound"
+    base = f"/agents/{aid}/state/{namespace}"
+    sibling = "é" * 3
+    incoming = "a"
+    cap = 20
+    assert _json_size(sibling) == 20
+    assert _json_size(incoming) == 3
+    get_settings().state_max_namespace_bytes = cap
+    try:
+        first = client.put(f"{base}/u0", json={"value": sibling}, headers=auth_headers)
+        assert first.status_code == 200, first.text
+        sibling_exact, sibling_sql = asyncio.run(
+            _namespace_sibling_sizes(namespace, exclude_key="u1")
+        )
+        assert sibling_exact == 20, sibling_exact
+        assert sibling_sql < cap, sibling_sql
+        assert sibling_sql + _json_size(incoming) <= cap
+        assert sibling_exact + _json_size(incoming) > cap
+        refused = client.put(f"{base}/u1", json={"value": incoming}, headers=auth_headers)
+        assert refused.status_code == 413, refused.text
+        assert "100-byte per-namespace cap" not in refused.text
+        assert "20-byte per-namespace cap" in refused.text
+        assert "would be 23 bytes" in refused.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_under_namespace_cap_does_not_reserialize_sibling_values(
+    client: Any, auth_headers: dict[str, str], clean_db: None, monkeypatch: Any
+) -> None:
+    # Common-case O(1) wire: when the SQL upper bound of sibling jsonb::text
+    # plus the incoming value is under the namespace cap, _enforce_caps must
+    # not json.dumps the sibling values. Pre-change this is RED because every
+    # write fetches and re-serializes every other key.
+    import curie_api.routers.state as state_mod
+
+    aid = _agent(client, auth_headers)
+    base = f"/agents/{aid}/state/hot-path"
+    for i in range(4):
+        r = client.put(f"{base}/k{i}", json={"value": {"n": i}}, headers=auth_headers)
+        assert r.status_code == 200, r.text
+
+    calls: list[Any] = []
+    original = state_mod._json_size
+
+    def _spy(value: Any) -> int:
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(state_mod, "_json_size", _spy)
+    incoming = {"n": 4}
+    r = client.put(f"{base}/k4", json={"value": incoming}, headers=auth_headers)
+    assert r.status_code == 200, r.text
+    assert calls == [incoming], calls
+
+
+async def _namespace_sibling_sizes(namespace: str, exclude_key: str) -> tuple[int, int]:
+    """Exact compact-json bytes vs Postgres jsonb::text bytes for siblings."""
+    connection = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT value
+            FROM curie.workflow_state_entries
+            WHERE namespace = $1 AND key <> $2
+            """,
+            namespace,
+            exclude_key,
+        )
+        sql_bound = await connection.fetchval(
+            """
+            SELECT COALESCE(SUM(octet_length(value::text)), 0)
+            FROM curie.workflow_state_entries
+            WHERE namespace = $1 AND key <> $2
+            """,
+            namespace,
+            exclude_key,
+        )
+    finally:
+        await connection.close()
+    exact = 0
+    for row in rows:
+        raw = row["value"]
+        value = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+        exact += _json_size(value)
+    return exact, int(sql_bound)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("CURIE_STATE_CAP_BENCH"),
+    reason="opt-in namespace-cap microbenchmark; set CURIE_STATE_CAP_BENCH=1",
+)
+def test_namespace_cap_write_p50_and_payload_bytes(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Record p50 PUT latency and cap-check payload bytes at 16 x 64 KiB.
+
+    Not a CI gate: it prints one STATE_CAP_BENCH JSON line for the PR body.
+    `legacy_sibling_json_bytes` is what the old path transferred (every sibling
+    jsonb::text). `sql_bound_result_bytes` is what the SQL SUM path returns.
+    """
+    aid = _agent(client, auth_headers)
+    namespace = "bench-ns"
+    base = f"/agents/{aid}/state/{namespace}"
+    value_bytes = 64 * 1024
+    payload = "x" * (value_bytes - 2)
+    assert _json_size(payload) == value_bytes
+    n_keys = 16
+    for i in range(n_keys):
+        r = client.put(f"{base}/k{i:02d}", json={"value": payload}, headers=auth_headers)
+        assert r.status_code == 200, r.text
+
+    sibling_json_bytes, bound_result_bytes = asyncio.run(
+        _cap_check_payload_bytes(namespace, exclude_key="k00")
+    )
+    samples: list[float] = []
+    iterations = 30
+    for _ in range(iterations):
+        started = time.perf_counter()
+        r = client.put(f"{base}/k00", json={"value": payload}, headers=auth_headers)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        assert r.status_code == 200, r.text
+        samples.append(elapsed_ms)
+    samples.sort()
+    p50 = samples[len(samples) // 2]
+    report = {
+        "p50_ms": round(p50, 3),
+        "samples_ms": [round(s, 3) for s in samples],
+        "iterations": iterations,
+        "keys": n_keys,
+        "value_bytes": value_bytes,
+        "legacy_sibling_json_bytes": sibling_json_bytes,
+        "sql_bound_result_bytes": bound_result_bytes,
+    }
+    print(f"STATE_CAP_BENCH {json.dumps(report)}", flush=True)
+    assert sibling_json_bytes >= (n_keys - 1) * value_bytes
+    assert bound_result_bytes > 0
+    assert bound_result_bytes < sibling_json_bytes
+
+
+async def _cap_check_payload_bytes(namespace: str, exclude_key: str) -> tuple[int, int]:
+    connection = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        sibling_json_bytes = await connection.fetchval(
+            """
+            SELECT COALESCE(SUM(octet_length(value::text)), 0)::bigint
+            FROM curie.workflow_state_entries
+            WHERE namespace = $1 AND key <> $2
+            """,
+            namespace,
+            exclude_key,
+        )
+        bound_result_bytes = await connection.fetchval(
+            """
+            SELECT pg_column_size(
+                COALESCE(SUM(octet_length(value::text)), 0)
+            )
+            FROM curie.workflow_state_entries
+            WHERE namespace = $1 AND key <> $2
+            """,
+            namespace,
+            exclude_key,
+        )
+    finally:
+        await connection.close()
+    return int(sibling_json_bytes), int(bound_result_bytes)
 
 
 def test_namespace_count_over_the_per_agent_cap_is_rejected(
