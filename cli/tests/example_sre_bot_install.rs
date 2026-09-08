@@ -174,6 +174,14 @@ case " $* " in
         exit 0
         ;;
     *" get namespace "*)
+        case " $* " in
+            *" get namespace curie "*)
+                printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"curie","labels":{"curietech.ai/created-by":"curie","curietech.ai/created-in":"curie"},"uid":"uid-curie","resourceVersion":"17"}}'
+                ;;
+            *" get namespace soak "*)
+                printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"soak","labels":{"curietech.ai/created-by":"soak-rel","curietech.ai/created-in":"soak"},"uid":"uid-soak","resourceVersion":"17"}}'
+                ;;
+        esac
         exit 0
         ;;
     *" get priorityclass "*|*" get priorityclasses "*)

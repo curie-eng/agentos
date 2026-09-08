@@ -126,6 +126,9 @@ exit 64
 printf '%s\n' "$*" >> "$CURIE_TEST_KUBECTL_LOG"
 
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
+    if [ "$3" = "target-namespace" ]; then
+        printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"target-namespace","labels":{"curietech.ai/created-by":"target-release","curietech.ai/created-in":"target-namespace"},"uid":"uid-target-namespace","resourceVersion":"17"}}'
+    fi
     exit 0
 fi
 

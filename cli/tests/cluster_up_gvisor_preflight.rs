@@ -279,10 +279,33 @@ exit 64
             r#"#!/bin/sh
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     if [ "$3" = "target-namespace" ] && [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ] && [ ! -e "$CURIE_TEST_NAMESPACE_READY" ]; then
-        printf '%s\n' 'Error from server (NotFound): namespaces "target-namespace" not found' >&2
-        exit 1
+        # `--ignore-not-found -o json`: absence is exit 0 plus empty stdout.
+        exit 0
+    fi
+    if [ "$3" = "target-namespace" ]; then
+        printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"target-namespace","labels":{"curietech.ai/created-by":"target-release","curietech.ai/created-in":"target-namespace"},"uid":"uid-target-namespace","resourceVersion":"17"}}'
     fi
     exit 0
+fi
+
+if [ "$1" = "create" ] && [ "$2" = "-f" ] && [ "$3" = "-" ]; then
+    manifest=$(cat)
+    if MANIFEST="$manifest" python3 -c 'import json, os, sys
+document = json.loads(os.environ["MANIFEST"])
+metadata = document.get("metadata", {})
+labels = metadata.get("labels", {})
+sys.exit(0 if document.get("kind") == "Namespace"
+         and metadata.get("name") == "target-namespace"
+         and labels.get("curietech.ai/created-by") == "target-release"
+         and labels.get("curietech.ai/created-in") == "target-namespace"
+         else 1)'
+    then
+        : > "$CURIE_TEST_NAMESPACE_READY"
+        printf '%s\n' 'namespace/target-namespace created'
+        exit 0
+    fi
+    printf 'namespace was not atomically created with its ownership pair: %s\n' "$manifest" >&2
+    exit 64
 fi
 
 if [ "$1" = "get" ] && [ "$2" = "statefulset" ]; then
@@ -379,13 +402,20 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
     fi
     printf '%s\n' "$$" > "$CURIE_TEST_WATCH_PID"
     trap 'exit 0' HUP INT TERM
-    if [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ] && [ -e "$CURIE_TEST_FRESH_EVENT" ]; then
+    if [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ]; then
+        attempts=0
+        while [ ! -e "$CURIE_TEST_FRESH_EVENT" ] && [ "$attempts" -lt 100 ]; do
+            sleep 0.01
+            attempts=$((attempts + 1))
+        done
+        if [ ! -e "$CURIE_TEST_FRESH_EVENT" ]; then
+            printf '%s\n' 'Helm did not emit the fresh namespace event' >&2
+            exit 64
+        fi
         : > "$CURIE_TEST_EVENT_EMITTED"
         printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
             'ADDED' 'fresh-event-uid' 'Job' 'target-namespace' 'acme-runtime-preflight-gvisor' 'FailedCreate' \
             'Error creating: pods "acme-runtime-preflight-gvisor-example" is forbidden: pod rejected: RuntimeClass "gvisor" not found'
-    fi
-    if [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ]; then
         sleep 30
         exit 0
     fi
@@ -858,7 +888,7 @@ fn runtimeclass_document_before_job_still_observes_the_rendered_job() {
 }
 
 #[test]
-fn fresh_namespace_rejection_is_observed_after_helm_creates_the_namespace() {
+fn fresh_namespace_rejection_is_observed_after_cli_creates_the_namespace() {
     let fixture = Fixture::new("fresh-namespace", "absent", OPENROUTER_CREDENTIAL);
     let (output, elapsed) = fixture.run(&[]);
     let shown = stderr(&output);
@@ -870,7 +900,7 @@ fn fresh_namespace_rejection_is_observed_after_helm_creates_the_namespace() {
     );
     assert!(
         elapsed < Duration::from_secs(3),
-        "the post Helm namespace retry must still beat the fake deadline, elapsed {elapsed:?}\nstderr:\n{shown}"
+        "the pre-Helm Event watch must still beat the fake deadline, elapsed {elapsed:?}\nstderr:\n{shown}"
     );
     assert_inference_once(&shown, "--set security.gvisor.mode=off");
     assert_automatic_gvisor_recovery_narration(&shown);
@@ -881,13 +911,19 @@ fn fresh_namespace_rejection_is_observed_after_helm_creates_the_namespace() {
     assert_eq!(fixture.upgrade_count(), 2);
     assert!(
         fixture.namespace_ready.is_file() && fixture.event_emitted.is_file(),
-        "Helm must create the namespace and event before the retry observes them"
+        "the CLI must create the namespace before Helm emits the event observed by the retry"
     );
     let invocations = fs::read_to_string(&fixture.event_log).unwrap_or_default();
     assert_eq!(
         invocations.lines().count(),
-        1,
-        "fresh namespace recovery must use one list and watch request after Helm starts:\n{invocations}"
+        2,
+        "fresh namespace recovery must snapshot once and use one list-and-watch stream:\n{invocations}"
+    );
+    assert!(
+        invocations
+            .lines()
+            .any(|line| !line.contains("--watch") && line.contains("{range .items[*]}{.metadata.uid}")),
+        "the atomically created namespace must establish a stale Event UID boundary:\n{invocations}"
     );
     assert!(
         invocations.contains("{.object.metadata.uid}")

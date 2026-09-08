@@ -147,8 +147,26 @@ if program == "kubectl":
                 "status": {"images": images},
             }
         )
-    if "namespace" in args or "namespaces" in args:
-        emit({"kind": "Namespace", "metadata": {"name": args[-1]}})
+    if len(args) >= 3 and args[:2] in (["get", "namespace"], ["get", "namespaces"]):
+        namespace = args[2]
+        labels = {}
+        if namespace == "convergence-test":
+            labels = {
+                "curietech.ai/created-by": "acme-bot",
+                "curietech.ai/created-in": "convergence-test",
+            }
+        emit(
+            {
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": namespace,
+                    "labels": labels,
+                    "uid": "uid-" + namespace,
+                    "resourceVersion": "17",
+                },
+            }
+        )
     if "config" in args:
         print("https://127.0.0.1:6443")
         sys.exit(0)

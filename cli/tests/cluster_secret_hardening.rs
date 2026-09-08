@@ -142,6 +142,9 @@ exit 64
             "kubectl",
             r#"#!/bin/sh
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
+    if [ "$3" = "acme-namespace" ]; then
+        printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"acme-namespace","labels":{"curietech.ai/created-by":"acme-release","curietech.ai/created-in":"acme-namespace"},"uid":"uid-acme-namespace","resourceVersion":"17"}}'
+    fi
     exit 0
 fi
 
