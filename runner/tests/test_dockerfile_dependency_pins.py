@@ -642,8 +642,7 @@ def test_runner_image_installs_the_shared_telemetry_workspace_dependency() -> No
 
     assert "COPY packages/telemetry ./packages/telemetry" in instructions
     assert any(
-        instruction.startswith("RUN python3 -m venv ")
-        and "pip install --no-cache-dir --no-deps" in instruction
+        "pip install --no-cache-dir --no-deps" in instruction
         and "./packages/telemetry" in instruction
         for instruction in instructions
     )

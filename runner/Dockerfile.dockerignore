@@ -1,0 +1,27 @@
+# Per-Dockerfile ignore (BuildKit honors <dockerfile>.dockerignore over the
+# context-root .dockerignore). The runner image builds from the REPO ROOT to
+# reach the uv workspace, so this trims the root context to what the runner
+# COPY set needs -- uv.lock, the four packages, and runner/ stay; the heavy
+# non-Python trees plus developer checkout debris (.worktrees, .projects,
+# cli/target) are dropped.
+.git
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
+**/node_modules
+apps/ui/dist
+apps/ui/test-results
+apps/ui/playwright-report
+cli/target
+docs
+prototypes
+.github
+charts
+*.md
+**/*.md
+**/.env
+.worktrees
+.projects

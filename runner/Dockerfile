@@ -48,32 +48,35 @@ RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
 
 WORKDIR /app
 
-# The five source trees the runner needs: the two frozen workspace packages, the
-# shared telemetry implementation and schema, and the runner itself. Copied by path so the image is
-# reproducible from the lockfile above them (root pyproject/uv.lock are the
-# workspace source of truth).
+# Registry dependency layer: the lockfile plus the pin exporter, and nothing
+# else, so this ~322 MB install (claude_agent_sdk dominates) is invalidated
+# only by a lock or exporter change -- never by a runner/src edit.
+# export_dependency_pins.py remains the pin source (#1436 is pin correctness,
+# not layer placement). --no-deps keeps the closure on those exact pins;
+# local workspace projects are installed by path after the source copy so
+# they resolve to the copied trees, not same-named PyPI distributions.
 COPY uv.lock ./uv.lock
+COPY runner/export_dependency_pins.py ./runner/export_dependency_pins.py
+RUN python3 -m venv /app/.venv \
+    && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
+    && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
+    && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt
+
+# The five source trees the runner needs: the two frozen workspace packages,
+# the shared telemetry implementation and schema, and the runner itself.
+# Copied by path so the image is reproducible from the lockfile above them
+# (root pyproject/uv.lock are the workspace source of truth).
 COPY packages/aci-protocol ./packages/aci-protocol
 COPY packages/plugin-format ./packages/plugin-format
 COPY packages/telemetry ./packages/telemetry
 COPY packages/telemetry-schema ./packages/telemetry-schema
 COPY runner ./runner
-
-# One venv. Install every local project without dependencies, then install the
-# full registry dependency closure exported from the tested workspace uv.lock.
-# The local packages are installed by path first so the
-# workspace requirements resolve to the copied trees, not same-named PyPI
-# distributions.
-RUN python3 -m venv /app/.venv \
-    && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps \
+RUN /app/.venv/bin/pip install --no-cache-dir --no-deps \
         ./packages/aci-protocol \
         ./packages/plugin-format \
         ./packages/telemetry \
         ./packages/telemetry-schema \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
-    && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt
+    && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner
 
 # Run as a non-root user. The claude-agent-sdk spawns
 # `claude --dangerously-skip-permissions` (permission_mode=bypassPermissions),
