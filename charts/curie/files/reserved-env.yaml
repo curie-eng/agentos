@@ -66,7 +66,7 @@ worker:
   CURIE_WORKSPACE_SCRATCH_ROOT: worker.workspace.mountPath
   CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS: worker.workspace.totalTimeoutSeconds
   CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS: worker.workspace.uploadTimeoutSeconds
-  DATABASE_URL: postgres.host / postgres.port / postgres.auth
+  DATABASE_URL: postgres.host / postgres.port / postgres.auth / postgres.sslMode
   DB_SCHEMA: the chart-managed database schema (remove this override)
   LANGFUSE_HOST: langfuse.host / langfuse.web.service.port
   LANGFUSE_PUBLIC_KEY: langfuse.init.projectPublicKey
@@ -90,7 +90,7 @@ api:
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
-  DATABASE_URL: postgres.host / postgres.port / postgres.auth
+  DATABASE_URL: postgres.host / postgres.port / postgres.auth / postgres.sslMode
   DB_SCHEMA: the chart-managed database schema (remove this override)
   ENVIRONMENT: api.environment
   GITHUB_API_URL: api.githubApiUrl

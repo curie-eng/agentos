@@ -183,6 +183,18 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/valkey-tls-assertions.sh
 
+      # Prove every Postgres DSN carries a TLS parameter when asked, and that
+      # the signal reaches both driver families rather than one of them (#2431).
+      # SQLAlchemy/asyncpg needs ?ssl=require; Prisma needs ?sslmode=no-verify;
+      # the api migrate probe must lift ssl= into the connect kwarg or asyncpg
+      # forwards it as a server setting and the API never leaves init. Also
+      # proves the guard refuses require against the in-chart store, which
+      # serves no TLS listener, and that false/0/prefer are refused by name.
+      - name: helm render assertions (postgres TLS mode)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/postgres-ssl-mode-assertions.sh
+
       # Prove the tenant capacity ceiling actually binds the pods it is meant to.
       # The quota is PriorityClass-scoped, so if its scope is not the name the
       # sandbox pods carry it matches nothing and enforces nothing -- silently,
