@@ -12238,6 +12238,32 @@ mod tests {
         assert!(resolve_comms_values(Some(&disconnected), &[]).is_empty());
     }
 
+    /// The values Helm records after `opts` runs.
+    ///
+    /// `cluster up` is a FULL upgrade rather than `--reuse-values`, so the
+    /// release afterwards holds exactly what this run supplied: the planned
+    /// values plus the secret entries. Tests that assert on a LATER run must
+    /// start from this, not from the fixture the earlier run began with --
+    /// otherwise a plan that dropped a value on the way out still reads as
+    /// having preserved it.
+    fn recorded_by_helm(opts: &UpOpts) -> serde_json::Value {
+        let mut values = serde_json::json!({});
+        let planned = up_value_plan(opts).effective_values();
+        let supplied = planned
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .chain(opts.secrets.iter().cloned());
+        for (key, value) in supplied {
+            let parts: Vec<_> = key.split('.').collect();
+            let mut current = &mut values;
+            for part in &parts[..parts.len() - 1] {
+                current = &mut current[*part];
+            }
+            current[*parts.last().unwrap()] = value.into();
+        }
+        values
+    }
+
     fn secret_for<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
         opts.secrets
             .iter()
@@ -15033,10 +15059,18 @@ mod tests {
             "--fake-model must not pin fakeModel=false off the value it preserved"
         );
 
-        // And the recovery the defect broke: a following plain `up` reads the
-        // still-recorded reference and selects the real model again, with no
-        // operator re-supply.
-        let recovered = completed_dev_up(Some(&existing), vec![]);
+        // And the recovery the defect broke, driven through what the FAKE RUN
+        // would actually leave behind rather than through the original fixture.
+        // `cluster up` is a full upgrade, so the release ends up holding exactly
+        // what this run supplied -- reading the fixture again instead would pass
+        // even if the plan had dropped the preserved reference on the way out.
+        let recorded = recorded_by_helm(&opts);
+        assert_eq!(
+            recorded["agentSandbox"]["runner"]["credentialsExistingSecret"],
+            serde_json::json!("acme-credentials"),
+            "the reference must reach Helm, not merely survive in opts"
+        );
+        let recovered = completed_dev_up(Some(&recorded), vec![]);
         assert_eq!(
             secret_for(&recovered, "agentSandbox.runner.credentialsExistingSecret"),
             Some("acme-credentials")
