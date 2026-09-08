@@ -446,6 +446,62 @@ jobs:
           path: cli/target/aarch64-unknown-linux-gnu/release/curie
           if-no-files-found: error
 
+  cli-darwin:
+    name: CLI builds for macOS (the fourth release target)
+    runs-on: macos-latest
+    # `aarch64-apple-darwin` ships in the release matrix (release.yaml) and was
+    # compiled for the FIRST TIME when a tag was pushed. Anything that breaks it
+    # -- a dependency that does not build on macOS, a `cfg(unix)` assumption that
+    # is really a Linux assumption, a crate needing a Linux-only system library
+    # -- surfaced inside the release run, with `fail-fast: false` leaving a
+    # partial asset set behind an already-pushed tag (#2458).
+    #
+    # This is the same hole `cli-portability` closes for the two Linux targets,
+    # and it stays a SEPARATE job: that one must remain on `ubuntu-latest`
+    # because its whole point is running the artifact on an old-glibc Linux
+    # image. macOS runner minutes bill at a multiple of Linux, so this job does
+    # the build and nothing else.
+    #
+    # `macos-latest` is arm64, so this is a NATIVE build: no zig, no
+    # cargo-zigbuild, no glibc floor, no cross toolchain. It is the same path a
+    # tag takes for this target (release.yaml's non-`glibc` branch).
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: Add target
+        run: rustup target add aarch64-apple-darwin
+      - name: Build (same path as the release)
+        env:
+          CURIE_BUILD_CHANNEL: release
+        run: cargo build --release --target aarch64-apple-darwin
+      # The release strips this target with the external tool rather than at
+      # link time, because only the cross targets carry `-C strip=symbols`.
+      # `|| true` matches release.yaml: an unstrippable binary is still
+      # shippable, and the release must not fail over symbol size.
+      - name: Strip
+        run: strip target/aarch64-apple-darwin/release/curie || true
+      # Named like the per-commit Linux binaries above and like the release
+      # assets, so an unreleased macOS fix can be installed without a local
+      # Rust toolchain:
+      #
+      #   gh run download <run-id> -R curie-eng/curie \
+      #     -n curie-aarch64-apple-darwin-<sha>
+      #   chmod +x curie && sudo install -m 0755 curie /usr/local/bin/curie
+      - name: Publish the per-commit macOS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: curie-aarch64-apple-darwin-${{ github.sha }}
+          path: cli/target/aarch64-apple-darwin/release/curie
+          if-no-files-found: error
+
   contracts-ts:
     name: Contracts (generated TypeScript compiles)
     runs-on: ubuntu-latest
