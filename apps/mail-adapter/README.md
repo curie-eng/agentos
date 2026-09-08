@@ -266,3 +266,19 @@ AgentMail's API and the platform's channel ingress. Everything inside
 `curie_mail_adapter` runs for real, the egress server included, and the boot
 gates are driven through the real `python -m curie_mail_adapter` entry point in a
 subprocess.
+
+### Deleted provider threads
+
+A thread lookup returning HTTP 404 after admission is terminal for that reply.
+The adapter durably records deletion, logs one warning with a hashed correlation,
+and returns HTTP 410 on the first and any duplicate completion, including after
+restart. The response body carries `{"detail":"thread deleted at provider"}`;
+HTTP 410 without that explicit classification remains retryable for other adapters.
+It never records the reply as delivered. The worker dead-letters the
+completion on the first definitive refusal (N = 1) with reason `thread deleted
+at provider`, atomically removing its owed completion from the pending index.
+The existing configured dead-letter stream and size cap apply. Earlier transient
+failures do not spend this terminal budget: provider 5xx and transport failures
+still return 502 and remain retryable. A missing local admission record also
+remains retryable. HTTP 410 applies only to completion delivery; other reply
+events and other error statuses keep their existing retry behavior.

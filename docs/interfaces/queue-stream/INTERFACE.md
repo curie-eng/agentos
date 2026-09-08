@@ -68,7 +68,17 @@ A second broker must honor the stream key, the payload encoding, and the Stream 
   (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._dead_letter`), then acked off
   the group. The target stream is `WorkerConfig.dead_letter_stream`
   (`apps/worker/src/curie_worker/config.py::WorkerConfig`), defaulting to
-  `"<stream>:dead"`.
+  `"<stream>:dead"`. This writer produces rows with the original stream fields
+  and `dl_original_id`, `dl_delivery_count`, `dl_reason`, and
+  `dl_dead_lettered_at`. The second writer,
+  `Markers.dead_letter_completion`
+  (`apps/worker/src/curie_worker/markers.py::Markers.dead_letter_completion`),
+  writes terminal completion-outbox rows to the same stream with `event_id`,
+  serialized `completion`, `dl_reason`, `dl_delivery_count`, `dl_source`, and
+  `dl_dead_lettered_at`; these rows have no `dl_original_id` and are not
+  replayable as inbound stream entries. Both writers use the bounded,
+  best-effort graveyard; collision escaping applies to the stream-consumer
+  row family.
 - **Consumer liveness and prompt reclaim** (#1532) — `XINFO CONSUMERS` idle is
   only a cheap candidate filter: it rises while a worker drains a turn or waits
   at its local concurrency limit. Before either lane reads, the narrow
@@ -196,13 +206,17 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   `apps/api/src/curie_api/resumequeue.py::ResumeQueue.read_dead_letter` (`xrevrange`),
   whose rows the #532 backstop
   (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler.reopen_dead_lettered_resumes`)
-  consumes. Both readers also depend on the worker's `dl_*` metadata field schema
-  (`dl_original_id`, `dl_delivery_count`, `dl_reason`, `dl_dead_lettered_at`, written by
-  `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._dead_letter`), and
-  the API re-derives the graveyard name as `<stream>:dead` rather than reading the
-  worker's config. So a second broker must account for a third producer (the API) and for
-  two API-side graveyard readers, none of which go through a port today, plus an
-  undeclared cross-service field schema on the dead-letter stream.
+  consumes. `GraveyardWatcher` and `ResumeQueue.read_dead_letter` may each see
+  both graveyard row families. The watcher alerts on every row but always
+  projects the stream-consumer metadata fields `dl_original_id`,
+  `dl_delivery_count`, `dl_reason`, and `dl_dead_lettered_at`, using `?` when a
+  field is absent; it does not report completion `event_id` or `dl_source`.
+  The resume reconciler only acts on stream-consumer rows with a `payload` and
+  the expected resume metadata, so it skips completion-outbox rows. The API
+  re-derives the graveyard name as `<stream>:dead` rather than reading the
+  worker's config. The PEL writer already uses `StreamBroker.xadd`; a second
+  broker must additionally account for the off-port completion-outbox writer
+  and these two API-side readers.
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its

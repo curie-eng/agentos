@@ -30,7 +30,9 @@ the enforceable-rule summary.
   provider-visible event witness before deciding whether to send. An unreadable
   witness or a completion with no admitted reply row is 502/no send; an active
   lease owned by this process is 503. Never turn either case into 200 or a
-  permanent 503.
+  permanent 503. A confirmed provider thread 404 for an admitted reply is the
+  exception: persist a deleted receipt and return 410, including on duplicates
+  and restart, so the worker dead-letters it without claiming delivery.
 - **The inbound gate is two checks, in order: the provider's verdict labels, then
   the allow-list.** They are not equivalent and the ordering is not incidental.
   The provider's filtering is the real control; the label check is defense in

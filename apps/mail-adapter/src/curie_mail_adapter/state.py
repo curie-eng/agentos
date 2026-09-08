@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LEASE_SECONDS = 300.0
 BODY_FAILURE_BACKOFF_SECONDS = 60.0
 TERMINAL_RECEIPT_MAX = 4096
@@ -37,7 +37,7 @@ _ADMISSION_BACKPRESSURE_CODES = frozenset(
 )
 
 DeliveryAdmission = Literal["admitted", "known", "full"]
-EventClaim = Literal["claimed", "busy", "done"]
+EventClaim = Literal["claimed", "busy", "done", "deleted"]
 
 
 class MailState:
@@ -139,6 +139,16 @@ class MailState:
                     updated_at REAL NOT NULL
                 );
                 PRAGMA user_version=1;
+                COMMIT;
+                """
+            )
+
+        if version < 2:
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                ALTER TABLE completion_events ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+                PRAGMA user_version=2;
                 COMMIT;
                 """
             )
@@ -442,10 +452,12 @@ class MailState:
         now = time.time()
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT delivered, lease_owner, lease_until FROM completion_events "
+                "SELECT delivered, lease_owner, lease_until, deleted FROM completion_events "
                 "WHERE event_id=?",
                 (event_id,),
             ).fetchone()
+            if row and int(row[3]) == 1:
+                return "deleted"
             if row and int(row[0]) == 1:
                 return "done"
             if row and row[1] and float(row[2] or 0) > now:
@@ -469,6 +481,20 @@ class MailState:
                 "UPDATE completion_events SET lease_owner=NULL, lease_until=NULL, updated_at=? "
                 "WHERE event_id=? AND lease_owner=? AND delivered=0",
                 (time.time(), event_id, owner),
+            )
+
+    def delete_event(self, event_id: str, conversation_id: str, reply_ref: str) -> None:
+        """Keep a durable refusal without claiming the provider accepted a send."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE completion_events SET deleted=1, lease_owner=NULL, lease_until=NULL, "
+                "updated_at=? WHERE event_id=?",
+                (time.time(), event_id),
+            )
+            connection.execute(
+                "UPDATE reply_state SET text=NULL, active=0, updated_at=? "
+                "WHERE conversation_id=? AND reply_ref=?",
+                (time.time(), conversation_id, reply_ref),
             )
 
     def finish_event(self, event_id: str) -> None:

@@ -98,7 +98,7 @@ from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
 from .receipt import render_receipt
-from .reply_sink import ObservedReplySink, ReplySink, TargetRoute
+from .reply_sink import DeletedReplyTargetError, ObservedReplySink, ReplySink, TargetRoute
 from .runner_client import (
     RunnerClient,
     RunnerError,
@@ -2098,6 +2098,12 @@ class Kernel:
         """
         try:
             await self._sink.emit(record.event, route=record.route)
+        except DeletedReplyTargetError as exc:
+            if await self._markers.dead_letter_completion(
+                record, generation=generation, reason=exc.reason
+            ):
+                logger.warning("turn.completed dead-lettered: %s", exc.reason)
+            return False
         except Exception as exc:  # noqa: BLE001 - the turn is already durably done
             logger.warning(
                 "turn.completed delivery failed for %s (%s); the outbox record stands",

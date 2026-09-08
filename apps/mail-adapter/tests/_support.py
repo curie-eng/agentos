@@ -79,6 +79,7 @@ class MailState:
         self.messages: list[dict[str, Any]] = []  # newest last, as seeded
         self.bodies: dict[str, dict[str, Any]] = {}
         self.threads: dict[str, list[dict[str, Any]]] = {}
+        self.deleted_threads: set[str] = set()
         self.replies: list[tuple[str, str]] = []  # (in_reply_to_message_id, text)
         self.list_calls = 0
         # time.monotonic() per list call, so the retry CADENCE is observable at
@@ -332,6 +333,8 @@ class MailHandler(_JsonHandler):
             failure, state.fail_next_thread = state.fail_next_thread, None
             if self._injected(failure):
                 return
+            if parts[4] in state.deleted_threads:
+                return self._send(404, {"detail": "no such thread"})
             return self._send(200, {"messages": state.threads.get(parts[4], [])})
         self._send(404, {"detail": "not found"})
 
