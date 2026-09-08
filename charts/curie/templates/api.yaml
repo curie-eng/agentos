@@ -258,7 +258,7 @@ spec:
               containerPort: 8000
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 8000
             {{- toYaml .Values.api.readinessProbe | nindent 12 }}
           livenessProbe:

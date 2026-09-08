@@ -1033,9 +1033,9 @@ api:
   # approval evidence. A sealed install generates and persists this value
   # independently; values-dev.yaml keeps the published deterministic default.
   approvalChatAttesterSecret: curie-dev-approval-chat-attester
-  # Probe cadences. Liveness must outlast readiness so a cold API still warming
-  # up before /health answers is kept out of the Service rather than restarted
-  # back into the same warm-up. Cutoffs: readiness 120s, liveness 195s.
+  # Probe cadences. Database aware /ready keeps the API out of the Service until
+  # Postgres responds, while process local /health keeps the process alive.
+  # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
   # Formula/rationale: ci/probe-window-assertions.sh header.
   readinessProbe:
     initialDelaySeconds: 5

@@ -110,7 +110,8 @@ component and rail detail in `charts/curie/README.md`.
   detection of that rides on the **readiness** probe instead, which does
   exercise the event loop and the stores, and flips `Deployment.Available`.
   The chart's other first-party liveness probes are likewise process-local
-  rather than store-probing: `api.yaml`'s `/health` does no store I/O,
+  rather than store-probing: `api.yaml` uses database aware `/ready` for
+  readiness while its liveness `/health` does no store I/O,
   `mail-adapter.yaml` documents `/healthz` as a static liveness signal while
   `/readyz` alone waits on SQLite, `inference.yaml` uses `tcpSocket`, and
   `worker.yaml`/`dispatcher.yaml` use the heartbeat-file check

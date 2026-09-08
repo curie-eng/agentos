@@ -946,6 +946,7 @@
           "/git-flow/routing-check",
           "/github/webhook",
           "/health",
+          "/ready",
           "/hooks/{agent_id}/{hook}",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
@@ -988,7 +989,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2800
+      "cardinality_bound": 2840
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1050,6 +1051,7 @@
           "/git-flow/routing-check",
           "/github/webhook",
           "/health",
+          "/ready",
           "/hooks/{agent_id}/{hook}",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
@@ -1092,7 +1094,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2800
+      "cardinality_bound": 2840
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1154,6 +1156,7 @@
           "/git-flow/routing-check",
           "/github/webhook",
           "/health",
+          "/ready",
           "/hooks/{agent_id}/{hook}",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
@@ -1189,7 +1192,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 560
+      "cardinality_bound": 568
     },
     "curie.background.loop": {
       "type": "counter",

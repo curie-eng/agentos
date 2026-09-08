@@ -22,8 +22,9 @@ from curie_telemetry import (
     operation_span,
     record_metric,
 )
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
+from sqlalchemy import text
 from starlette.routing import Match
 
 from . import __version__
@@ -322,6 +323,23 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get(
+        "/ready",
+        tags=["health"],
+        responses={503: {"description": "Database is unavailable"}},
+    )
+    async def ready(request: Request) -> dict[str, str]:
+        try:
+            async with asyncio.timeout(2):
+                async with request.app.state.sessionmaker() as session:
+                    await session.execute(text("SELECT 1"))
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail="Database is unavailable",
+            ) from None
         return {"status": "ok"}
 
     app.include_router(config.router)
