@@ -5186,6 +5186,7 @@ pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
 pub fn status_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
     let mut commands = vec![
         helm_status_cmd(o),
+        helm_get_all_values_cmd(o),
         pods_cmd(o),
         svc_cmd(o, fullname, "ui"),
         svc_cmd(o, fullname, "langfuse-web"),
@@ -6869,6 +6870,10 @@ pub struct ClusterStatus {
     pub ready: usize,
     pub total: usize,
     pub unhealthy: Vec<String>,
+    /// Diagnoses that could not be MADE, kept apart from `unhealthy` so they
+    /// never reach the exit code. See the mail-channel classification in
+    /// [`status`].
+    pub warnings: Vec<String>,
     pub pods_listed: bool,
     pub urls: Vec<ServiceUrl>,
 }
@@ -6890,6 +6895,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                         "unhealthy": s.unhealthy,
                         "rows": s.pods.iter().map(PodRow::to_json).collect::<Vec<_>>(),
                     },
+                    "warnings": s.warnings,
                     "urls": s.urls.iter().map(ServiceUrl::to_json).collect::<Vec<_>>(),
                     "healthy": healthy,
                 })
@@ -6912,6 +6918,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 if !s.pods_listed {
                     ui.warn(&format!("could not list pods in namespace {}", s.namespace));
                 }
+                for warning in &s.warnings {
+                    ui.warn(warning);
+                }
                 for url in &s.urls {
                     url.render(ui);
                 }
@@ -6929,6 +6938,55 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
             }
         }
     }
+}
+
+/// Where one mail-channel report belongs in the `cluster status` verdict.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MailVerdict {
+    /// A token was read and it is usable.
+    Fine,
+    /// The adapter did not answer, so there is no token to judge.
+    Unknown,
+    /// A token was read and it is not usable.
+    Unhealthy,
+}
+
+/// Split "we could not tell" from "we looked and it is broken".
+///
+/// `Report::healthy` is false for both, and `cluster status` used to send both
+/// to the `unhealthy` list, which fails the command with `target release has
+/// not converged`. An unreachable pod proxy, an adapter older than `/statusz`,
+/// a restarting pod or an unparseable body is not a defect of the release.
+pub(crate) fn mail_verdict(report: &crate::mail_channel::Report) -> MailVerdict {
+    if !report.known() {
+        MailVerdict::Unknown
+    } else if !report.healthy() {
+        MailVerdict::Unhealthy
+    } else {
+        MailVerdict::Fine
+    }
+}
+
+/// How long `cluster status` waits for the values read that feeds the
+/// mail-adapter gate. It is an optional input to one diagnosis, not part of the
+/// report, so it must never be the reason the command produces nothing.
+const VALUES_READ_FOR_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Whether the operator has the mail adapter turned OFF, so status must not
+/// probe for it at all -- the gate `doctor` already applies.
+///
+/// `None` means the computed values could not be read, which is NOT a falsy
+/// `mailAdapter.deploy`: an unreadable values file must not silently suppress a
+/// real expired-token diagnosis. It is safe to probe on it because an
+/// unreadable answer is now a warning rather than a convergence failure.
+pub(crate) fn mail_probe_is_gated_off(computed: Option<&serde_json::Value>) -> bool {
+    computed.is_some_and(|values| {
+        !crate::doctor::helm_truthy(
+            values
+                .get("mailAdapter")
+                .and_then(|value| value.get("deploy")),
+        )
+    })
 }
 
 pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
@@ -6965,13 +7023,27 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     // these ran in sequence.
     let helm_status = helm_status_cmd(&opts);
     let pods = pods_cmd(&opts);
-    let (helm, pods_read, observed, fullname, host) = tokio::join!(
+    let (helm, pods_read, observed, fullname, host, computed) = tokio::join!(
         run_capture(&helm_status),
         run_capture(&pods),
         convergence::observe(&opts),
         release_fullname(&opts.namespace, &opts.release),
         discover_host(),
+        // The mail-adapter gate below, and NOTHING else. Two guards, both
+        // required: `?` is deliberately never applied to it, so a values read
+        // that FAILS cannot turn a reachable cluster's status into an error;
+        // and it is bounded, because `run_capture` waits on its subprocess
+        // without a deadline, so a helm that never returns would otherwise hold
+        // the whole `join!` and produce no status output at all. A timeout is
+        // treated exactly like a failed read.
+        tokio::time::timeout(
+            VALUES_READ_FOR_GATE_TIMEOUT,
+            fetch_release_computed_values(&opts),
+        ),
     );
+    let computed = computed.unwrap_or_else(|_| {
+        Err(crate::exit::CliError::failure("timed out reading computed Helm values").into())
+    });
 
     // (a) Helm release state -> a bright header line.
     let (helm_ok, helm_out, helm_err) = helm?;
@@ -6998,6 +7070,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
 
     // (b) Pod health.
     let (ok, out, _) = pods_read?;
+    let mut warnings: Vec<String> = Vec::new();
     let (mut pods, ready, total, mut unhealthy) = if ok {
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&out)
             .ok()
@@ -7008,17 +7081,44 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         (Vec::new(), 0, 0, Vec::new())
     };
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&out) {
-        if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
-            for report in
-                crate::mail_channel::observe_pods(&opts.namespace, &opts.release, items).await
-            {
-                if !report.healthy() {
-                    unhealthy.push(format!("{}: {}", report.pod, report.detail));
-                }
-                if let Some(row) = pods.iter_mut().find(|row| row.name == report.pod) {
-                    row.status = format!("{}; {}", row.status, report.detail);
-                    row.mail_channel = Some(report);
+    // (b2) Mail channel token, off the pod listing already read above.
+    //
+    // Gated on the operator's own `mailAdapter.deploy`, the same gate `doctor`
+    // applies (`doctor::checks`). Without it, a pod that still carries the
+    // mail-adapter labels on a release where mail is turned OFF -- a scale-down
+    // that has not finished, an orphan from a prior revision -- is probed, and
+    // its answer is reported against a release that does not run a mail adapter
+    // at all. A read that FAILED is not a falsy value and does not suppress the
+    // probe: the classification below can no longer turn an unreadable answer
+    // into a convergence failure, so probing on a read we could not make costs
+    // at most a warning, while suppressing it would lose a real expired token.
+    if !mail_probe_is_gated_off(computed.as_ref().ok().and_then(Option::as_ref)) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&out) {
+            if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
+                for report in
+                    crate::mail_channel::observe_pods(&opts.namespace, &opts.release, items).await
+                {
+                    // An answer we could not READ is unknown, and unknown is a
+                    // warning. It used to land in `unhealthy`, which fails the
+                    // whole command with `target release has not converged` --
+                    // so an unreachable pod proxy, an adapter older than
+                    // `/statusz`, a restarting pod or an unparseable body made
+                    // `cluster status` declare a healthy release broken. A
+                    // token we DID read and found bad is still unhealthy and
+                    // still fails: that is the #2377 behavior and it stands.
+                    match mail_verdict(&report) {
+                        MailVerdict::Unknown => {
+                            warnings.push(format!("{}: {}", report.pod, report.detail));
+                        }
+                        MailVerdict::Unhealthy => {
+                            unhealthy.push(format!("{}: {}", report.pod, report.detail));
+                        }
+                        MailVerdict::Fine => {}
+                    }
+                    if let Some(row) = pods.iter_mut().find(|row| row.name == report.pod) {
+                        row.status = format!("{}; {}", row.status, report.detail);
+                        row.mail_channel = Some(report);
+                    }
                 }
             }
         }
@@ -7058,6 +7158,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         ready,
         total,
         unhealthy,
+        warnings,
         pods_listed: ok,
         urls,
     }));
@@ -11694,16 +11795,19 @@ mod tests {
         let cmds = status_commands(&common(), &fullname());
         let lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
         assert_eq!(lines[0], "helm status curie -n curie");
-        assert_eq!(lines[1], "kubectl get pods -n curie -o json");
-        assert_eq!(lines[2], "kubectl get svc curie-ui -n curie -o json");
+        // The computed values, for the `mailAdapter.deploy` gate (#2457). A dry
+        // run that omitted it would under-report the reads the live path makes.
+        assert_eq!(lines[1], "helm get values curie -n curie --all -o json");
+        assert_eq!(lines[2], "kubectl get pods -n curie -o json");
+        assert_eq!(lines[3], "kubectl get svc curie-ui -n curie -o json");
         assert_eq!(
-            lines[3],
+            lines[4],
             "kubectl get svc curie-langfuse-web -n curie -o json"
         );
         assert!(
-            lines[4].starts_with("kubectl config view --minify -o "),
+            lines[5].starts_with("kubectl config view --minify -o "),
             "{}",
-            lines[4]
+            lines[5]
         );
     }
 
@@ -14971,6 +15075,134 @@ mod tests {
             )
             .is_err(),
             "the conflict guard matches the key trimmed on both ends"
+        );
+    }
+
+    /// #2457: `cluster status` failed the whole command on a diagnosis it could
+    /// not make. An unreadable `/statusz` is `unavailable` -- no token at all --
+    /// and `Report::healthy` is false for it, exactly as it is for a token that
+    /// was read and found expired. Sending both to `unhealthy` made a running
+    /// release report `target release has not converged` because a pod proxy was
+    /// unreachable, an adapter predated `/statusz`, or a pod was restarting.
+    #[test]
+    fn an_unreadable_mail_status_is_unknown_and_a_bad_token_is_still_unhealthy() {
+        use crate::mail_channel::{Report, Token, TokenState};
+
+        assert_eq!(
+            mail_verdict(&crate::mail_channel::unavailable("curie", "curie")),
+            MailVerdict::Unknown,
+            "an adapter that did not answer is not a verdict about the release"
+        );
+
+        let with = |state: TokenState| Report {
+            pod: "acme-mail-0".to_string(),
+            channel_token: Some(Token {
+                present: true,
+                exp: None,
+                state,
+            }),
+            last_ingress_status: None,
+            detail: String::new(),
+            fix: None,
+        };
+        for state in [TokenState::Ok, TokenState::Expiring, TokenState::Disabled] {
+            assert_eq!(mail_verdict(&with(state)), MailVerdict::Fine, "{state:?}");
+        }
+        // The #2377 behavior, unchanged: a token we DID read and found unusable
+        // still fails the command.
+        for state in [
+            TokenState::Expired,
+            TokenState::Rejected,
+            TokenState::Missing,
+            TokenState::Invalid,
+        ] {
+            assert_eq!(
+                mail_verdict(&with(state)),
+                MailVerdict::Unhealthy,
+                "{state:?}"
+            );
+        }
+    }
+
+    /// #2457: the gate `doctor` has and `status` did not. Without it a pod that
+    /// still carries the mail-adapter labels on a release where mail is OFF is
+    /// probed, and its answer is reported against a release that runs no mail
+    /// adapter at all.
+    #[test]
+    fn the_mail_probe_follows_helm_truthiness_and_probes_when_values_are_unreadable() {
+        let deploy =
+            |value: serde_json::Value| serde_json::json!({"mailAdapter": {"deploy": value}});
+
+        for off in [
+            serde_json::json!(false),
+            serde_json::json!(""),
+            serde_json::json!(0),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                mail_probe_is_gated_off(Some(&deploy(off.clone()))),
+                "{off} must read as disabled, the same way helm does"
+            );
+        }
+        // Helm computes this key as the JSON STRING "true", which is the shape
+        // the gate meets in practice. Go calls every non-empty string truthy, so
+        // a quoted "false" is ON here -- surprising, but it is what the chart
+        // itself does with the value, and `doctor` reads it through the same
+        // `helm_truthy`. The two surfaces agreeing is the point of this gate;
+        // diverging from Go here would make status and the rendered release
+        // disagree about whether mail is deployed.
+        for on in [
+            serde_json::json!(true),
+            serde_json::json!("true"),
+            serde_json::json!("false"),
+            serde_json::json!(1),
+        ] {
+            assert!(!mail_probe_is_gated_off(Some(&deploy(on.clone()))), "{on}");
+        }
+        // A release that never named the key at all.
+        assert!(mail_probe_is_gated_off(Some(&serde_json::json!({}))));
+        // A values read that FAILED is not a falsy value: suppressing the probe
+        // on it would lose a real expired token, and the unreadable answer it
+        // may now produce costs only a warning.
+        assert!(!mail_probe_is_gated_off(None));
+    }
+
+    /// The whole point of the split: a warning must not reach the exit code.
+    #[test]
+    fn warnings_do_not_make_a_status_unhealthy() {
+        use crate::ui::CliOutput;
+        let status = |warnings: Vec<String>, unhealthy: Vec<String>| {
+            ClusterStatusOutput::Status(Box::new(ClusterStatus {
+                namespace: "curie".to_string(),
+                revision: "3".to_string(),
+                release_state: "deployed".to_string(),
+                release_found: true,
+                release_missing_note: None,
+                pods: Vec::new(),
+                ready: 1,
+                total: 1,
+                unhealthy,
+                warnings,
+                pods_listed: true,
+                urls: Vec::new(),
+            }))
+            .to_json()
+        };
+
+        let warned = status(
+            vec!["acme-mail-0: mail channel token: unknown".to_string()],
+            Vec::new(),
+        );
+        assert_eq!(warned["healthy"], true);
+        assert_eq!(
+            warned["warnings"][0],
+            "acme-mail-0: mail channel token: unknown"
+        );
+        assert!(warned["pods"]["unhealthy"].as_array().unwrap().is_empty());
+
+        assert_eq!(
+            status(Vec::new(), vec!["acme-mail-0: expired".to_string()])["healthy"],
+            false
         );
     }
 }

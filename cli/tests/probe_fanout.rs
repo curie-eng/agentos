@@ -313,7 +313,7 @@ fn probe_stages(log: &str) -> (usize, usize, Vec<String>, Vec<String>) {
 }
 
 /// `expected_calls` pins the documented probe set from the module doc (12 for
-/// `doctor`, 7 for `cluster status`) exactly, so a probe silently added or
+/// `doctor`, 8 for `cluster status`) exactly, so a probe silently added or
 /// dropped fails here rather than only showing up as a stage-count wobble.
 fn assert_fanout(
     label: &str,
@@ -397,9 +397,10 @@ fn doctor_fans_out_independent_probes() {
 }
 
 /// `curie cluster status` must issue helm status, the pod list, convergence,
-/// the fullname and the host as one stage, then the two Service reads (which
-/// consume the fullname) as a second. The sequential implementation took 6.
-/// Exit 1 is part of the contract (see `cluster_status_output_is_golden`).
+/// the computed values (the `mailAdapter.deploy` gate, #2457), the fullname and
+/// the host as one stage, then the two Service reads (which consume the
+/// fullname) as a second. The sequential implementation took 6. Exit 1 is part
+/// of the contract (see `cluster_status_output_is_golden`).
 #[test]
 fn cluster_status_fans_out_independent_probes() {
     let fixture = fixture();
@@ -411,7 +412,7 @@ fn cluster_status_fans_out_independent_probes() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    assert_fanout("status", &fixture, 2, 7, wall_ms);
+    assert_fanout("status", &fixture, 2, 8, wall_ms);
 }
 
 /// Joining probes must not move a byte of what either surface prints, so both

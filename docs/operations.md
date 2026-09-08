@@ -223,6 +223,15 @@ rollout reasons. `--json` retains the same report object with `healthy: false`.
 The check compares the installed Helm target with live workload generations,
 replica counts and serving pod images; an `Available` condition alone is insufficient.
 
+A diagnosis the command could not MAKE is a warning, not a failure. When the
+mail adapter is deployed but its `/statusz` cannot be read -- the pod proxy is
+unreachable, the pod is restarting, the adapter predates that endpoint -- the
+mail channel token reads as unknown, which prints a warning and appears under
+`warnings` in `--json`, leaving the exit code and `healthy` alone. A token that
+was read and found expired, rejected, missing or invalid is still a failure. The
+probe follows `mailAdapter.deploy`, so a release with the adapter off is not
+probed at all.
+
 Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
 their deployed versions, and their run history. That console URL includes a
