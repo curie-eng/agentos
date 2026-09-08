@@ -1,13 +1,32 @@
+import { lazy } from "react";
 import { SectionTitle, Tabs } from "../primitives";
 import { useStore } from "../state/store";
 import type { ObsTab } from "../state/types";
-import { RealTracesList, RealTraceDetail } from "./obs/RealTraces";
-import { RealMetrics } from "./obs/RealMetrics";
-import { RealLogs } from "./obs/RealLogs";
-import { RealCost } from "./obs/RealCost";
-import { RealMemory } from "./obs/RealMemory";
-import { RealApprovals } from "./obs/RealApprovals";
-import { WiredUsage } from "./wired/WiredStubs";
+
+const RealTracesList = lazy(() =>
+  import("./obs/RealTraces").then((m) => ({ default: m.RealTracesList })),
+);
+const RealTraceDetail = lazy(() =>
+  import("./obs/RealTraces").then((m) => ({ default: m.RealTraceDetail })),
+);
+const RealMetrics = lazy(() =>
+  import("./obs/RealMetrics").then((m) => ({ default: m.RealMetrics })),
+);
+const RealLogs = lazy(() =>
+  import("./obs/RealLogs").then((m) => ({ default: m.RealLogs })),
+);
+const RealCost = lazy(() =>
+  import("./obs/RealCost").then((m) => ({ default: m.RealCost })),
+);
+const RealMemory = lazy(() =>
+  import("./obs/RealMemory").then((m) => ({ default: m.RealMemory })),
+);
+const RealApprovals = lazy(() =>
+  import("./obs/RealApprovals").then((m) => ({ default: m.RealApprovals })),
+);
+const WiredUsage = lazy(() =>
+  import("./wired/WiredStubs").then((m) => ({ default: m.WiredUsage })),
+);
 
 const TABS: [ObsTab, string][] = [
   ["traces", "Traces"],
