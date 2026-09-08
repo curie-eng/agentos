@@ -479,7 +479,9 @@ fact about the release artifacts, not about what this chart resolves to.
   which pulls the runner image `Always` and keeps that same `appVersion` ref
   pinned on every node; a Release-revision annotation rolls those pods on every
   `helm upgrade` so an upgraded chart's new `appVersion` is pulled before the
-  next claim.
+  next claim. When `agentSandbox.runner.bundleFetch.enabled` is true the same
+  DaemonSet also pins `fetchImage` and `extractImage` (default `amazon/aws-cli`
+  and busybox) so the bundle-fetch init pair is not a first-claim cold pull.
 - **Override `tag` (or set `digest`)** to pin an explicit version. Empty `tag`
   is the default and resolves to `.Chart.AppVersion`; `digest` wins over `tag`
   when set.
@@ -1241,7 +1243,8 @@ to install only the control plane + backing stores without the runner substrate.
 - **Runner image**: the pool runs `curie-runner`, defaulting to
   `ghcr.io/curie-eng/curie-runner:<appVersion>` with `imagePullPolicy: IfNotPresent`
   (per-thread cold boots must not contain a pull; the `runner-prewarm` DaemonSet
-  keeps the image on every node -- see "Publishing and pulling images").
+  keeps the runner image and, when bundle-fetch is enabled, the bundle-fetch
+  init images on every node -- see "Publishing and pulling images").
   For offline
   dev/e2e, `-f values-dev.yaml` overrides it to a locally-built, cluster-imported
   tag with `imagePullPolicy: Never` (`docker build -f runner/Dockerfile -t
