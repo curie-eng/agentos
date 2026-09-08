@@ -2049,7 +2049,20 @@ fn resolve_preserved_runner_identity_values(
 
     let mut references =
         resolve_credential_values(existing, operator_sets, MODEL_CREDENTIAL_REFERENCE_KEYS);
-    if opts.fake_model || opts.local_model.is_some() || opts.credentials.is_some() {
+    // `--local-model` and `--credentials` each SUPPLY a replacement for the
+    // credential family, so clearing the recorded reference is the documented
+    // rule above: an explicit input replaces its recorded family.
+    //
+    // `--fake-model` supplies nothing. It suppresses the model for this run, and
+    // clearing on it destroyed the operator's BYO Secret wiring as a side effect
+    // of a temporary, offline, diagnostic switch. `cluster up` is a FULL upgrade
+    // rather than `--reuse-values`, so the blank was recorded and the next plain
+    // `up` preserved the blank: the ordinary sequence `up --fake-model` (take the
+    // model out of the picture) then `up` (put it back) silently did not put it
+    // back, and nothing said so (#2459). Preserving costs a mounted, unused
+    // credential on the warm pod; destroying costs a reference nobody can
+    // recover. Ambiguity keeps the recorded value.
+    if opts.local_model.is_some() || opts.credentials.is_some() {
         for (_, value) in &mut references {
             value.clear();
         }
@@ -4372,10 +4385,21 @@ fn model_credential_source_is_set(opts: &UpOpts) -> bool {
     opts.credentials.is_some()
         || final_operator_value(opts, MODEL_CREDENTIAL_REFERENCE_KEYS[0])
             .is_some_and(|value| !value.is_empty())
-        || opts
-            .secrets
-            .iter()
-            .any(|(key, value)| key == MODEL_CREDENTIAL_REFERENCE_KEYS[0] && !value.is_empty())
+        // The `opts.secrets` entry may be a reference this run PRESERVED rather
+        // than one anybody supplied for it (#2459). Counting a preserved value
+        // as a credential source would make the caller pin `fakeModel=false`
+        // off the very value it just carried forward, so `--fake-model` would
+        // silently install the real model.
+        //
+        // Only this lane is suppressed. An operator `--set` (the lane above)
+        // and an explicit credential still win over `--fake-model` exactly as
+        // they did before: an operator naming a credential secret and asking
+        // for a fake model in one command is a contradiction, and which side
+        // wins there is not this fix's decision to change.
+        || (!opts.fake_model
+            && opts.secrets.iter().any(|(key, value)| {
+                key == MODEL_CREDENTIAL_REFERENCE_KEYS[0] && !value.is_empty()
+            }))
 }
 
 /// The ordered chart values supplied by one `cluster up`. Both the Helm command
@@ -12321,6 +12345,32 @@ mod tests {
         assert!(resolve_comms_values(Some(&disconnected), &[]).is_empty());
     }
 
+    /// The values Helm records after `opts` runs.
+    ///
+    /// `cluster up` is a FULL upgrade rather than `--reuse-values`, so the
+    /// release afterwards holds exactly what this run supplied: the planned
+    /// values plus the secret entries. Tests that assert on a LATER run must
+    /// start from this, not from the fixture the earlier run began with --
+    /// otherwise a plan that dropped a value on the way out still reads as
+    /// having preserved it.
+    fn recorded_by_helm(opts: &UpOpts) -> serde_json::Value {
+        let mut values = serde_json::json!({});
+        let planned = up_value_plan(opts).effective_values();
+        let supplied = planned
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .chain(opts.secrets.iter().cloned());
+        for (key, value) in supplied {
+            let parts: Vec<_> = key.split('.').collect();
+            let mut current = &mut values;
+            for part in &parts[..parts.len() - 1] {
+                current = &mut current[*part];
+            }
+            current[*parts.last().unwrap()] = value.into();
+        }
+        values
+    }
+
     fn secret_for<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
         opts.secrets
             .iter()
@@ -12502,10 +12552,12 @@ mod tests {
     #[test]
     fn existing_secret_preservation_respects_runner_modes_and_last_inline_value() {
         let existing = byo_preservation_fixture();
-        for mode in ["fake", "local", "inline"] {
+        // Both of these SUPPLY a replacement credential, so the recorded
+        // reference is obsolete and must go. `--fake-model` supplies nothing and
+        // is covered separately below (#2459).
+        for mode in ["local", "inline"] {
             let mut input = completed_dev_up(None, vec![]);
             match mode {
-                "fake" => input.fake_model = true,
                 "local" => input.local_model = Some("acme-model".into()),
                 _ => input.credentials = Some("replacement".into()),
             }
@@ -15075,6 +15127,112 @@ mod tests {
             )
             .is_err(),
             "the conflict guard matches the key trimmed on both ends"
+        );
+    }
+
+    /// #2459: `--fake-model` must IGNORE a recorded BYO credential reference,
+    /// not destroy it.
+    ///
+    /// `cluster up` is a full upgrade, so a blank re-passed here is what Helm
+    /// records, and the next plain `up` preserves the blank. The ordinary
+    /// sequence -- `up --fake-model` to take the model out of the picture, then
+    /// `up` to put it back -- silently stopped putting it back, with no warning
+    /// and no way to notice until someone looked for the credential.
+    #[test]
+    fn fake_model_preserves_a_recorded_byo_credential_reference() {
+        let existing = byo_preservation_fixture();
+        let mut input = completed_dev_up(None, vec![]);
+        input.fake_model = true;
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            Some("acme-credentials"),
+            "--fake-model supplies no replacement, so it must not clear the reference"
+        );
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecretKey"),
+            Some("credentials-custom"),
+            "the key travels with the reference; half of a reference is not one"
+        );
+
+        // Preserving it must not turn the fake model back into the real one:
+        // `up_value_plan` pins `fakeModel=false` off any credential source, and
+        // the preserved reference is exactly such a source.
+        assert_eq!(
+            up_value_plan(&opts).effective_values().get(FAKE_MODEL_KEY),
+            None,
+            "--fake-model must not pin fakeModel=false off the value it preserved"
+        );
+
+        // And the recovery the defect broke, driven through what the FAKE RUN
+        // would actually leave behind rather than through the original fixture.
+        // `cluster up` is a full upgrade, so the release ends up holding exactly
+        // what this run supplied -- reading the fixture again instead would pass
+        // even if the plan had dropped the preserved reference on the way out.
+        let recorded = recorded_by_helm(&opts);
+        assert_eq!(
+            recorded["agentSandbox"]["runner"]["credentialsExistingSecret"],
+            serde_json::json!("acme-credentials"),
+            "the reference must reach Helm, not merely survive in opts"
+        );
+        let recovered = completed_dev_up(Some(&recorded), vec![]);
+        assert_eq!(
+            secret_for(&recovered, "agentSandbox.runner.credentialsExistingSecret"),
+            Some("acme-credentials")
+        );
+        assert_eq!(
+            up_value_plan(&recovered)
+                .effective_values()
+                .get(FAKE_MODEL_KEY)
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    /// #2459: an explicit operator `--set` still owns the key outright, and
+    /// `--fake-model` does not resurrect a reference the operator cleared.
+    #[test]
+    fn fake_model_leaves_an_operator_set_credential_reference_alone() {
+        let existing = byo_preservation_fixture();
+        let mut input = completed_dev_up(
+            None,
+            vec!["agentSandbox.runner.credentialsExistingSecret=".into()],
+        );
+        input.fake_model = true;
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            None,
+            "the operator set the key, so the CLI supplies nothing for it"
+        );
+    }
+
+    /// #2459: `--fake-model` beats a PRESERVED reference and nothing else.
+    ///
+    /// An operator naming a credential secret and asking for a fake model in
+    /// one command is a contradiction; the operator's `--set` has always won it
+    /// and still does. Suppressing that lane too would have been a second,
+    /// undeclared precedence change riding on this fix.
+    #[test]
+    fn fake_model_does_not_beat_an_operator_supplied_credential_reference() {
+        let mut input = completed_dev_up(
+            None,
+            vec!["agentSandbox.runner.credentialsExistingSecret=acme-operator".into()],
+        );
+        input.fake_model = true;
+        let opts = complete_up_opts_without_runner_egress(input, None, None, false).unwrap();
+
+        assert_eq!(
+            up_value_plan(&opts)
+                .effective_values()
+                .get(FAKE_MODEL_KEY)
+                .map(String::as_str),
+            Some("false"),
+            "an explicitly set credential reference still selects the real model"
         );
     }
 
