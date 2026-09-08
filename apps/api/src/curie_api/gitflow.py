@@ -575,7 +575,9 @@ async def process_push(
                 repo_full_name=trusted_repo_full_name,
                 ref=ref,
             )
-            extension, content_type = deploy.validate_archive(archive, settings)
+            extension, content_type = await run_in_threadpool(
+                deploy.validate_archive, archive, settings
+            )
             targets = await run_in_threadpool(_read_targets, archive, settings)
     except InvalidRepoFullName as exc:
         return WebhookResult(

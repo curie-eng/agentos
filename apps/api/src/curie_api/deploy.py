@@ -213,7 +213,8 @@ async def revalidate_stored_bundle(
     settings = settings or get_settings()
     data = await store.get(version.bundle_ref)
     try:
-        plugin_format.check_archive_bounds(
+        await run_in_threadpool(
+            plugin_format.check_archive_bounds,
             data,
             max_uncompressed_bytes=settings.bundle_max_uncompressed_bytes,
             max_compression_ratio=settings.bundle_max_compression_ratio,
