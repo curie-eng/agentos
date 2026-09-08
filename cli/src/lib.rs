@@ -42,6 +42,7 @@ pub mod retired;
 pub mod runner;
 pub mod scaffold;
 pub mod schema;
+pub mod schema_window;
 pub mod schemas;
 pub mod seal;
 pub mod sealing;
