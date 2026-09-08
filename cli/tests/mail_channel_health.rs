@@ -61,6 +61,7 @@ impl Fixture {
 case "${0##*/}:$*" in
   kubectl:*--raw*) printf '%s\n' "$*" >> "${0%/*}/proxy-calls"; cat "${0%/*}/status.json"; exit 0 ;;
   kubectl:"get pods"*) cat "${0%/*}/pods.json"; exit 0 ;;
+  kubectl:"get deployments,statefulsets -n "*) printf '%s\n' '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}'; exit 0 ;;
   kubectl:"config current-context") printf '%s\n' 'owned-test'; exit 0 ;;
   kubectl:*"component=api"*) printf '%s\n' 'acme-api'; exit 0 ;;
   kubectl:*"config view"*) printf '%s\n' 'https://127.0.0.1:6443'; exit 0 ;;

@@ -52,6 +52,7 @@ case "$*" in
     printf '%s\n' '{{"spec":{{"type":"NodePort","ports":[{{"port":8000,"nodePort":{node_port}}}]}}}}'
     ;;
   *nodePort*) printf '%s\n' '{node_port}' ;;
+  *"get deployments,statefulsets -n "*) printf '%s\n' '{{"items":[{{"kind":"Deployment","status":{{"readyReplicas":1}}}}]}}' ;;
   *) printf 'unexpected kubectl invocation: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#,
@@ -82,6 +83,7 @@ fn install_cluster_without_api(tools: &Path) {
         r#"#!/bin/sh
 case "$*" in
   "config current-context") printf '%s\n' 'doctor-stub-context' ;;
+  *"get deployments,statefulsets -n "*) printf '%s\n' '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}' ;;
   *) printf 'unexpected kubectl invocation: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#,

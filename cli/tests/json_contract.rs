@@ -1878,6 +1878,8 @@ fn doctor_output_validates() {
         release: curie::doctor::ReleaseProbe::Installed {
             chart: "curie-0.6.0".to_string(),
         },
+        release_status: None,
+        ready_workloads: None,
         sandbox_egress_cidrs: vec!["160.79.104.0/23".to_string()],
         sandbox_egress_is_reproducible: true,
         slack_app_token: true,
@@ -1949,6 +1951,8 @@ fn doctor_ready_tracks_the_checks() {
         release: curie::doctor::ReleaseProbe::Installed {
             chart: "curie-0.6.0".to_string(),
         },
+        release_status: Some("deployed".to_string()),
+        ready_workloads: Some(4),
         sandbox_egress_cidrs: vec![],
         sandbox_egress_is_reproducible: true,
         slack_app_token: true,

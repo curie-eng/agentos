@@ -44,7 +44,8 @@
 //!    curie --all` (issued only because the Secret listing came back empty);
 //! 3. the four `gather` probes -- docker, the kube context, the helm version
 //!    and `helm list -n curie -o json`;
-//! 4. the two `helm get values` reads, computed and operator-supplied;
+//! 4. the two `helm get values` reads, computed and operator-supplied, plus
+//!    the deploy/sts ready-replica listing;
 //! 5. the api Service NodePort read, which needs the fullname (a cache hit, so
 //!    no second discovery) and only happens because the values carry no
 //!    ingress.
@@ -55,7 +56,7 @@
 //! "its chart Secret API key could not be read". That is what makes the API
 //! leg observable here without an HTTP round trip. Baseline was 13 calls in 12
 //! stages, including the duplicated label-selector read; the joined
-//! implementation is 12 calls in 5.
+//! implementation is 13 calls in 5.
 //!
 //! # Why the scenario makes no HTTP call
 //!
@@ -134,6 +135,9 @@ RULES = {
                  "app.kubernetes.io/instance=curie", "-o", NAMES)): "",
     # -- cluster status pod health ----------------------------------------
     ("kubectl", ("get", "pods", "-n", "curie", "-o", "json")): '{"items":[]}\n',
+    # -- doctor release serving set (#2349) -------------------------------
+    ("kubectl", ("get", "deployments,statefulsets", "-n", "curie", "-o", "json")):
+        '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}\n',
     # -- resolve_node_host fallback (defensive; must not fire) -------------
     ("kubectl", ("get", "nodes", "-o", "json")): '{"items":[]}\n',
 
@@ -142,7 +146,7 @@ RULES = {
     ("helm", ("list", "-n", "curie", "--all", "-o", "json")):
         '[{"name":"curie","namespace":"curie","status":"deployed","chart":"curie-0.8.2"}]\n',
     ("helm", ("list", "-n", "curie", "-o", "json")):
-        '[{"name":"curie","chart":"curie-0.8.2"}]\n',
+        '[{"name":"curie","chart":"curie-0.8.2","status":"deployed"}]\n',
     # convergence::observe reads this one; no `version` field means it bails
     # after exactly one call with "Helm release has no verifiable revision".
     ("helm", ("status", "curie", "-n", "curie", "-o", "json")): "{}\n",
@@ -393,7 +397,7 @@ fn doctor_fans_out_independent_probes() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    assert_fanout("doctor", &fixture, 5, 12, wall_ms);
+    assert_fanout("doctor", &fixture, 5, 13, wall_ms);
 }
 
 /// `curie cluster status` must issue helm status, the pod list, convergence,
