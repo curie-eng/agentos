@@ -180,6 +180,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         ready: 0,
         total: 0,
         unhealthy: Vec::new(),
+        warnings: Vec::new(),
         pods_listed: true,
         urls: Vec::new(),
     })

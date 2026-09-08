@@ -44,6 +44,18 @@ pub struct Report {
 }
 
 impl Report {
+    /// Whether the adapter actually answered with a token state.
+    ///
+    /// `unavailable` is a report about the READ, not about the release: the
+    /// proxy was unreachable, the adapter predates `/statusz`, the pod is
+    /// restarting, the body did not parse. Callers that turn a report into a
+    /// verdict must separate that from a token we read and found bad --
+    /// otherwise an admitted "we could not tell" becomes a failure claim about
+    /// a release that is running fine.
+    pub fn known(&self) -> bool {
+        self.channel_token.is_some()
+    }
+
     pub fn healthy(&self) -> bool {
         self.channel_token.as_ref().is_some_and(|token| {
             matches!(

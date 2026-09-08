@@ -2397,6 +2397,7 @@ fn cluster_status_output_validates_both_variants() {
         ready: 1,
         total: 1,
         unhealthy: vec![],
+        warnings: vec![],
         pods_listed: true,
         urls: vec![],
     };

@@ -524,7 +524,7 @@ fn release_fake_model(values: &serde_json::Value) -> bool {
 /// `classify_existing_secret_field` in `cli/src/github_app.rs`, which mirrors
 /// the same Go rule for `api.githubAppExistingSecret`. They must agree, so a
 /// change to one belongs in both.
-fn helm_truthy(value: Option<&serde_json::Value>) -> bool {
+pub(crate) fn helm_truthy(value: Option<&serde_json::Value>) -> bool {
     match value {
         None | Some(serde_json::Value::Null) => false,
         Some(serde_json::Value::Bool(b)) => *b,
