@@ -8,6 +8,7 @@ bytes so a runner can pull a bundle by version.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 
 from .. import bundles, crud, deploy
 from ..auth import require_api_key
@@ -111,7 +112,7 @@ async def upload_bundle(
         )
 
     try:
-        extension, content_type = deploy.validate_archive(data)
+        extension, content_type = await run_in_threadpool(deploy.validate_archive, data)
     except bundles.UnsupportedArchive as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except deploy.BundleInvalid as exc:
