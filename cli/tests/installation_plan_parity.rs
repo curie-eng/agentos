@@ -423,7 +423,13 @@ case "$verb $object" in
     :
     ;;
 'get namespace')
-    exit 1
+    case "$all" in
+        *'get namespace parity '*)
+            printf '%s\n' '{{"apiVersion":"v1","kind":"Namespace","metadata":{{"name":"parity","labels":{{"curietech.ai/created-by":"parity","curietech.ai/created-in":"parity"}},"uid":"uid-parity","resourceVersion":"17"}}}}'
+            ;;
+        *'get namespace agent-sandbox-system '*) : ;;
+        *) unexpected ;;
+    esac
     ;;
 'get statefulset')
     if [ "${{CURIE_TEST_KUBECTL_FAIL:-}}" = 1 ]; then

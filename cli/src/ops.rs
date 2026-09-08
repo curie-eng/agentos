@@ -16,7 +16,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
 mod convergence;
@@ -5292,9 +5292,12 @@ pub(crate) fn nodes_cmd() -> OpsCommand {
 }
 
 /// `helm uninstall` then a namespace sweep of only the namespaces THIS release
-/// created (runtime sandboxes, PVCs and job pods Helm does not own). #707: the
-/// sweep is scoped by the ownership labels `up` stamped rather than a hardcoded
-/// namespace pair, so a pre-existing (unlabeled) namespace is never deleted.
+/// owns (runtime sandboxes, PVCs and job pods Helm does not own). #707: the
+/// sweep is scoped by the ownership labels `up` established rather than a
+/// hardcoded namespace pair. A fresh primary namespace is born with those
+/// labels and an empty primary namespace may be safely adopted; foreign-content,
+/// legacy unlabeled, foreign-owned, and shared controller namespaces are never
+/// swept.
 /// `--ignore-not-found` keeps a partial teardown re-runnable and the label
 /// selector tolerates zero matches. CRDs are never targeted (retention is
 /// by-construction).
@@ -5342,6 +5345,145 @@ pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
     ]
 }
 
+fn hook_jobs_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("jobs"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-l"),
+            plain(format!(
+                "app.kubernetes.io/instance={},app.kubernetes.io/managed-by=Helm",
+                o.release
+            )),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn hook_jobs_delete_cmd(o: &CommonOpts, names: &[String]) -> OpsCommand {
+    let mut args = vec![plain("delete"), plain("job")];
+    args.extend(names.iter().cloned().map(plain));
+    args.extend([
+        plain("-n"),
+        plain(&o.namespace),
+        plain("--ignore-not-found"),
+    ]);
+    OpsCommand::new("kubectl", args)
+}
+
+fn parse_hook_job_names(output: &str, o: &CommonOpts) -> Result<Vec<String>> {
+    let document: serde_json::Value =
+        serde_json::from_str(output).context("parsing the Helm hook Job inventory")?;
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("the Helm hook Job inventory has no items array")?;
+    let mut names = BTreeSet::new();
+    for item in items {
+        let metadata = item
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .context("a selected Job has no metadata object")?;
+        let labels = metadata
+            .get("labels")
+            .and_then(serde_json::Value::as_object)
+            .context("a selected Job has no labels object")?;
+        if labels
+            .get("app.kubernetes.io/instance")
+            .and_then(serde_json::Value::as_str)
+            != Some(o.release.as_str())
+            || labels
+                .get("app.kubernetes.io/managed-by")
+                .and_then(serde_json::Value::as_str)
+                != Some("Helm")
+        {
+            bail!("the Job inventory returned an object outside the exact release/Helm selector");
+        }
+        let annotations = metadata
+            .get("annotations")
+            .and_then(serde_json::Value::as_object);
+        let is_hook = annotations
+            .and_then(|annotations| annotations.get("helm.sh/hook"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|hook| !hook.is_empty());
+        if !is_hook {
+            continue;
+        }
+        let annotation_matches = |key: &str, expected: &str| -> Result<bool> {
+            let Some(value) = annotations.and_then(|annotations| annotations.get(key)) else {
+                return Ok(true);
+            };
+            let value = value
+                .as_str()
+                .with_context(|| format!("a selected Helm hook Job has malformed `{key}`"))?;
+            Ok(value == expected)
+        };
+        if !annotation_matches("meta.helm.sh/release-name", &o.release)?
+            || !annotation_matches("meta.helm.sh/release-namespace", &o.namespace)?
+        {
+            continue;
+        }
+        if metadata
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            != Some(o.namespace.as_str())
+        {
+            bail!("a selected Helm hook Job reported a different or missing namespace");
+        }
+        let name = metadata
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("a selected Helm hook Job has no name")?;
+        names.insert(name.to_string());
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// Copy-pasteable equivalent of the dynamic hook cleanup. The selector first
+/// narrows to this release's Helm-managed Jobs; the go-template then emits only
+/// objects carrying Helm's hook annotation. Kubernetes object names cannot
+/// contain shell whitespace, so the bounded `for` loop preserves each name.
+fn hook_cleanup_resume_command(o: &CommonOpts) -> String {
+    let selector = format!(
+        "app.kubernetes.io/instance={},app.kubernetes.io/managed-by=Helm",
+        o.release
+    );
+    let release = serde_json::to_string(&o.release)
+        .expect("a release name always serializes as a Go-template string");
+    let namespace = serde_json::to_string(&o.namespace)
+        .expect("a namespace always serializes as a Go-template string");
+    let mut template = String::from(
+        r#"go-template={{range .items}}{{$hook := ""}}{{$releaseNamePresent := false}}{{$releaseName := ""}}{{$releaseNamespacePresent := false}}{{$releaseNamespace := ""}}{{range $key, $value := .metadata.annotations}}{{if eq $key "helm.sh/hook"}}{{$hook = $value}}{{end}}{{if eq $key "meta.helm.sh/release-name"}}{{$releaseNamePresent = true}}{{$releaseName = $value}}{{end}}{{if eq $key "meta.helm.sh/release-namespace"}}{{$releaseNamespacePresent = true}}{{$releaseNamespace = $value}}{{end}}{{end}}{{if and $hook (or (not $releaseNamePresent) (eq $releaseName "#,
+    );
+    template.push_str(&release);
+    template.push_str(r#")) (or (not $releaseNamespacePresent) (eq $releaseNamespace "#);
+    template.push_str(&namespace);
+    template.push_str(r#"))}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}"#);
+    let get = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("jobs"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-l"),
+            plain(selector),
+            plain("-o"),
+            plain(template),
+        ],
+    )
+    .display();
+    format!(
+        "hooks=$({get}); hook_status=$?; if [ \"$hook_status\" -eq 0 ]; then for job in $hooks; do kubectl delete job \"$job\" -n {} --ignore-not-found || hook_status=$?; done; fi; [ \"$hook_status\" -eq 0 ]",
+        shell_quote(&o.namespace)
+    )
+}
+
 /// Outcome of the `helm uninstall` teardown step. `Absent` is the existing
 /// already-absent ("not found") case, which counts as done, never outstanding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5353,10 +5495,10 @@ enum HelmOutcome {
 
 /// Outcome of the label-scoped namespace sweep step. `NoMatch` (#768) is the
 /// zero-match case: the selector's `kubectl delete` exits 0 (success) but
-/// deleted nothing, because it printed nothing to stdout. This happens by
-/// design when Curie was installed into a PRE-EXISTING namespace (#707
-/// deliberately leaves that namespace unlabeled, so it is never a sweep
-/// target). `NoMatch` counts as a completed step, same as `Removed`
+/// deleted nothing, because it printed nothing to stdout. This happens when no
+/// namespace carries the complete ownership pair, including legacy installs in
+/// pre-existing namespaces that predate safe empty-namespace adoption. `NoMatch`
+/// counts as a completed step, same as `Removed`
 /// (`outstanding_steps` never re-queues it), but it is NOT the same as
 /// `Removed` for messaging: a `NoMatch` sweep stopped no compute, so
 /// `teardown_result` must not describe it as "swept".
@@ -5367,10 +5509,18 @@ enum SweepOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOutcome {
+    Removed,
+    NoMatch,
+    Failed,
+}
+
 /// A teardown step that can remain outstanding after a fail-forward `down`.
 #[derive(Debug, PartialEq, Eq)]
 enum TeardownStep {
     HelmUninstall,
+    HookCleanup,
     NamespaceSweep,
 }
 
@@ -5378,10 +5528,17 @@ enum TeardownStep {
 /// `Absent` helm is done; a `Failed` helm leaves `HelmUninstall` outstanding. A
 /// `Removed` sweep is done; a `Failed` sweep leaves `NamespaceSweep`
 /// outstanding. Order matches `down_commands` (helm before sweep).
-fn outstanding_steps(helm: HelmOutcome, sweep: SweepOutcome) -> Vec<TeardownStep> {
+fn outstanding_steps(
+    helm: HelmOutcome,
+    hooks: HookOutcome,
+    sweep: SweepOutcome,
+) -> Vec<TeardownStep> {
     let mut out = Vec::new();
     if matches!(helm, HelmOutcome::Failed) {
         out.push(TeardownStep::HelmUninstall);
+    }
+    if matches!(hooks, HookOutcome::Failed) {
+        out.push(TeardownStep::HookCleanup);
     }
     if matches!(sweep, SweepOutcome::Failed) {
         out.push(TeardownStep::NamespaceSweep);
@@ -5423,16 +5580,15 @@ fn resume_command(remaining: &[TeardownStep], o: &CommonOpts) -> String {
     // Helm before sweep, matching `down_commands` execution order.
     steps.sort_by_key(|step| match step {
         TeardownStep::HelmUninstall => 0,
-        TeardownStep::NamespaceSweep => 1,
+        TeardownStep::HookCleanup => 1,
+        TeardownStep::NamespaceSweep => 2,
     });
     let lines: Vec<String> = steps
         .iter()
-        .map(|step| {
-            let idx = match step {
-                TeardownStep::HelmUninstall => 0,
-                TeardownStep::NamespaceSweep => 1,
-            };
-            cmds[idx].display()
+        .map(|step| match step {
+            TeardownStep::HelmUninstall => cmds[0].display(),
+            TeardownStep::HookCleanup => hook_cleanup_resume_command(o),
+            TeardownStep::NamespaceSweep => cmds[1].display(),
         })
         .collect();
     match lines.as_slice() {
@@ -5441,9 +5597,25 @@ fn resume_command(remaining: &[TeardownStep], o: &CommonOpts) -> String {
         [first, second] => {
             format!("{first}; s1=$?; {second}; s2=$?; [ \"$s1\" -eq 0 ] && [ \"$s2\" -eq 0 ]")
         }
-        // `remaining` only ever holds HelmUninstall and/or NamespaceSweep, so a
-        // third element is unreachable; stay defensive rather than panic.
-        _ => lines.join("; "),
+        _ => {
+            let mut command = String::new();
+            for (index, line) in lines.iter().enumerate() {
+                let number = index + 1;
+                if !command.is_empty() {
+                    command.push_str("; ");
+                }
+                command.push_str(line);
+                command.push_str(&format!("; s{number}=$?"));
+            }
+            command.push_str("; ");
+            command.push_str(
+                &(1..=lines.len())
+                    .map(|number| format!("[ \"$s{number}\" -eq 0 ]"))
+                    .collect::<Vec<_>>()
+                    .join(" && "),
+            );
+            command
+        }
     }
 }
 
@@ -5561,7 +5733,7 @@ fn failure_reason(stderr: &str) -> &str {
         .unwrap_or("command failed")
 }
 
-/// Pure decision (#767, #768): turn the two teardown-step outcomes plus their
+/// Pure decision (#767, #768): turn all three teardown-step outcomes plus their
 /// stderr into the `cluster down` result. An empty remainder is success.
 /// Otherwise it is a fail-forward error carrying the exact resume command in
 /// BOTH the human Display message (P1: `main` renders Display and drops the
@@ -5574,12 +5746,14 @@ fn failure_reason(stderr: &str) -> &str {
 /// nothing was actually deleted.
 fn teardown_result(
     helm: HelmOutcome,
+    hooks: HookOutcome,
     sweep: SweepOutcome,
     helm_err: &str,
+    hook_err: &str,
     sweep_err: &str,
     o: &CommonOpts,
 ) -> anyhow::Result<ClusterDownOutput> {
-    let remaining = outstanding_steps(helm, sweep);
+    let remaining = outstanding_steps(helm, hooks, sweep);
     if remaining.is_empty() {
         return Ok(ClusterDownOutput::Down {
             release_was_absent: matches!(helm, HelmOutcome::Absent),
@@ -5591,9 +5765,10 @@ fn teardown_result(
     // a non-failed step never blocks retryability, a permanent failed step always
     // does.
     let helm_retryable = !matches!(helm, HelmOutcome::Failed) || is_connectivity_failure(helm_err);
+    let hook_retryable = !matches!(hooks, HookOutcome::Failed) || is_connectivity_failure(hook_err);
     let sweep_retryable =
         !matches!(sweep, SweepOutcome::Failed) || is_connectivity_failure(sweep_err);
-    let transient = helm_retryable && sweep_retryable;
+    let transient = helm_retryable && hook_retryable && sweep_retryable;
 
     // The one-line reason drawn from the failed step that DETERMINES the class,
     // composed into the message so the human Display (P1) names WHY teardown
@@ -5604,21 +5779,31 @@ fn teardown_result(
     let reason = if transient {
         if matches!(helm, HelmOutcome::Failed) {
             failure_reason(helm_err)
+        } else if matches!(hooks, HookOutcome::Failed) {
+            failure_reason(hook_err)
         } else {
             failure_reason(sweep_err)
         }
     } else if !helm_retryable {
         failure_reason(helm_err)
+    } else if !hook_retryable {
+        failure_reason(hook_err)
     } else {
         failure_reason(sweep_err)
     };
 
-    let message = if matches!(sweep, SweepOutcome::Removed) {
+    let message = if matches!(helm, HelmOutcome::Failed)
+        && !matches!(hooks, HookOutcome::Failed)
+        && matches!(sweep, SweepOutcome::Removed)
+    {
         // Sweep succeeded (compute stopped); only the stale helm record remains.
         format!(
             "helm uninstall failed ({reason}) but the run-created namespaces were swept; the release record remains. Resume with: {cmd}"
         )
-    } else if matches!(sweep, SweepOutcome::NoMatch) {
+    } else if matches!(helm, HelmOutcome::Failed)
+        && !matches!(hooks, HookOutcome::Failed)
+        && matches!(sweep, SweepOutcome::NoMatch)
+    {
         // #768: the sweep's label selector matched nothing -- this release never
         // created (or was installed into a pre-existing) namespace, so nothing
         // was actually removed. This is NOT the swept case above: do not claim
@@ -5644,13 +5829,14 @@ fn teardown_result(
     Err(err.into())
 }
 
-/// #707 ownership stamp. Returns the single `kubectl label namespace` step that
-/// records THIS release as the creator of the target namespace `o.namespace`
+/// #707 create-only controller ownership stamp. Returns the single `kubectl
+/// label namespace` step that records THIS release as the creator of the target
+/// namespace `o.namespace`
 /// (callers retarget `o` with `ns_common`, so this is the namespace being
 /// labelled, NOT the release's install namespace), but ONLY when `up` actually
 /// created it (`namespace_existed == false`); an empty vec when the namespace
-/// pre-existed, so a namespace `up` merely adopted is never stamped and
-/// therefore never swept by a later `down`. A release-scoped label (not a
+/// pre-existed. The primary namespace no longer uses this helper: it is created
+/// atomically with labels or safely adopted before Helm. A release-scoped label (not a
 /// per-invocation run-id) is what lets a separate `down` invocation match what
 /// `up` created. `--overwrite` keeps a re-run idempotent, so an `up` interrupted
 /// after create but before stamp fails safe toward retention.
@@ -5710,21 +5896,508 @@ fn ns_common(opts: &CommonOpts, ns: &str, dry_run: bool) -> CommonOpts {
     }
 }
 
-/// `kubectl get namespace <ns>`: the pre-existence probe `up` runs before the
-/// install so it stamps ownership only on namespaces it creates.
+const CREATED_BY_LABEL: &str = "curietech.ai/created-by";
+const CREATED_IN_LABEL: &str = "curietech.ai/created-in";
+
+/// `kubectl get namespace <ns>` using the API's machine-readable absence
+/// contract. `--ignore-not-found` returns exit 0 plus empty stdout for an absent
+/// namespace; every nonzero result is therefore a real read failure and must
+/// block mutation rather than being mistaken for absence.
 fn namespace_get_cmd(namespace: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
-        vec![plain("get"), plain("namespace"), plain(namespace)],
+        vec![
+            plain("get"),
+            plain("namespace"),
+            plain(namespace),
+            plain("--ignore-not-found"),
+            plain("-o"),
+            plain("json"),
+        ],
     )
 }
 
-/// Whether `namespace` already exists on the cluster. A nonzero `kubectl get`
-/// (typically NotFound) reads as absent, so `up` treats it as fresh and stamps
-/// it; any other transport error surfaces later on the install itself.
+#[derive(Debug, Clone)]
+struct NamespaceRecord {
+    labels: BTreeMap<String, String>,
+    uid: String,
+    resource_version: String,
+}
+
+enum NamespaceProbe {
+    Absent,
+    Present(NamespaceRecord),
+}
+
+fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe> {
+    if output.trim().is_empty() {
+        return Ok(NamespaceProbe::Absent);
+    }
+    let document: serde_json::Value = serde_json::from_str(output)
+        .with_context(|| format!("parsing Namespace `{namespace}` returned by kubectl"))?;
+    if document.get("kind").and_then(serde_json::Value::as_str) != Some("Namespace") {
+        bail!("kubectl returned a non-Namespace object while inspecting namespace `{namespace}`");
+    }
+    let metadata = document
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .with_context(|| format!("Namespace `{namespace}` has no metadata object"))?;
+    if metadata.get("name").and_then(serde_json::Value::as_str) != Some(namespace) {
+        bail!("kubectl returned metadata for a different namespace while inspecting `{namespace}`");
+    }
+    if metadata
+        .get("deletionTimestamp")
+        .is_some_and(|value| !value.is_null())
+    {
+        bail!("namespace `{namespace}` is terminating and cannot be used for an install");
+    }
+    let labels = match metadata.get("labels") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .with_context(|| format!("Namespace `{namespace}` has malformed labels"))?,
+    };
+    let uid = metadata
+        .get("uid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("Namespace `{namespace}` metadata has no UID"))?
+        .to_string();
+    let resource_version = metadata
+        .get("resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("Namespace `{namespace}` metadata has no resourceVersion"))?
+        .to_string();
+    Ok(NamespaceProbe::Present(NamespaceRecord {
+        labels,
+        uid,
+        resource_version,
+    }))
+}
+
+async fn namespace_probe(namespace: &str) -> Result<NamespaceProbe> {
+    let (ok, out, err) = run_capture(&namespace_get_cmd(namespace)).await?;
+    if !ok {
+        bail!(
+            "could not inspect namespace `{namespace}`: {}",
+            failure_reason(&err)
+        );
+    }
+    parse_namespace_probe(namespace, &out)
+}
+
 async fn namespace_exists(namespace: &str) -> Result<bool> {
-    let (ok, _out, _err) = run_capture(&namespace_get_cmd(namespace)).await?;
-    Ok(ok)
+    Ok(matches!(
+        namespace_probe(namespace).await?,
+        NamespaceProbe::Present(_)
+    ))
+}
+
+fn ownership_labels(release: &str, install_namespace: &str) -> serde_json::Value {
+    let mut labels = serde_json::Map::new();
+    labels.insert(
+        CREATED_BY_LABEL.to_string(),
+        serde_json::Value::String(release.to_string()),
+    );
+    labels.insert(
+        CREATED_IN_LABEL.to_string(),
+        serde_json::Value::String(install_namespace.to_string()),
+    );
+    serde_json::Value::Object(labels)
+}
+
+fn namespace_create_cmd() -> OpsCommand {
+    OpsCommand::new("kubectl", vec![plain("create"), plain("-f"), plain("-")])
+}
+
+fn namespace_manifest(namespace: &str, release: &str) -> Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": namespace,
+            "labels": ownership_labels(release, namespace),
+        },
+    }))
+    .context("serializing the owned Namespace manifest")
+}
+
+fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain(resource),
+            plain("-n"),
+            plain(namespace),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn namespaced_resources_cmd() -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("api-resources"),
+            plain("--namespaced=true"),
+            plain("--verbs=list"),
+            plain("-o"),
+            plain("name"),
+        ],
+    )
+}
+
+fn empty_json_value(value: &serde_json::Value) -> bool {
+    value.is_null()
+        || value.as_array().is_some_and(|items| items.is_empty())
+        || value.as_object().is_some_and(|object| object.is_empty())
+}
+
+fn default_object_metadata(
+    value: &serde_json::Value,
+    namespace: &str,
+    name: &str,
+    allowed_annotations: &[&str],
+) -> bool {
+    let Some(metadata) = value.as_object() else {
+        return false;
+    };
+    if metadata.get("name").and_then(serde_json::Value::as_str) != Some(name)
+        || metadata
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            != Some(namespace)
+    {
+        return false;
+    }
+    if metadata
+        .get("labels")
+        .is_some_and(|labels| !empty_json_value(labels))
+        || metadata
+            .get("ownerReferences")
+            .is_some_and(|owners| !empty_json_value(owners))
+        || metadata
+            .get("finalizers")
+            .is_some_and(|finalizers| !empty_json_value(finalizers))
+    {
+        return false;
+    }
+    if let Some(annotations) = metadata.get("annotations") {
+        let Some(annotations) = annotations.as_object() else {
+            return false;
+        };
+        if annotations
+            .keys()
+            .any(|key| !allowed_annotations.iter().any(|allowed| key == *allowed))
+        {
+            return false;
+        }
+    }
+    const SERVER_METADATA: &[&str] = &[
+        "name",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "managedFields",
+        "selfLink",
+        "generateName",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ];
+    metadata
+        .keys()
+        .all(|key| SERVER_METADATA.contains(&key.as_str()))
+}
+
+fn is_default_service_account(item: &serde_json::Value, namespace: &str) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    if item.get("apiVersion").and_then(serde_json::Value::as_str) != Some("v1")
+        || item.get("kind").and_then(serde_json::Value::as_str) != Some("ServiceAccount")
+        || !item
+            .get("metadata")
+            .is_some_and(|metadata| default_object_metadata(metadata, namespace, "default", &[]))
+    {
+        return false;
+    }
+    object.iter().all(|(key, value)| {
+        matches!(key.as_str(), "apiVersion" | "kind" | "metadata") || empty_json_value(value)
+    })
+}
+
+fn is_root_ca_config_map(item: &serde_json::Value, namespace: &str) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    if item.get("apiVersion").and_then(serde_json::Value::as_str) != Some("v1")
+        || item.get("kind").and_then(serde_json::Value::as_str) != Some("ConfigMap")
+        || !item.get("metadata").is_some_and(|metadata| {
+            default_object_metadata(
+                metadata,
+                namespace,
+                "kube-root-ca.crt",
+                &["kubernetes.io/description"],
+            )
+        })
+    {
+        return false;
+    }
+    let Some(data) = item.get("data").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if data.len() != 1
+        || data
+            .get("ca.crt")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    object.iter().all(|(key, value)| {
+        matches!(key.as_str(), "apiVersion" | "kind" | "metadata" | "data")
+            || empty_json_value(value)
+    })
+}
+
+async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
+    let (ok, discovered, err) = run_capture(&namespaced_resources_cmd()).await?;
+    if !ok {
+        bail!(
+            "could not discover the namespaced API inventory before adopting `{namespace}`: {}",
+            failure_reason(&err)
+        );
+    }
+    let resources: BTreeSet<&str> = discovered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if resources.is_empty() {
+        bail!("namespaced API discovery returned no resources; refusing to adopt `{namespace}`");
+    }
+
+    let mut foreign: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for resource in resources {
+        let (ok, output, err) = run_capture(&namespace_inventory_cmd(namespace, resource)).await?;
+        if !ok {
+            bail!(
+                "could not inventory `{resource}` in namespace `{namespace}`: {}",
+                failure_reason(&err)
+            );
+        }
+        let document: serde_json::Value = serde_json::from_str(&output).with_context(|| {
+            format!("parsing the `{resource}` inventory in namespace `{namespace}`")
+        })?;
+        let items = document
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| {
+                format!("the `{resource}` inventory in namespace `{namespace}` has no items array")
+            })?;
+        for item in items {
+            if is_default_service_account(item, namespace) || is_root_ca_config_map(item, namespace)
+            {
+                continue;
+            }
+            let kind = item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(resource)
+                .to_string();
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>")
+                .to_string();
+            foreign.entry(kind).or_default().push(name);
+        }
+    }
+    if !foreign.is_empty() {
+        let detail = foreign
+            .into_iter()
+            .map(|(kind, mut names)| {
+                names.sort();
+                format!("{kind} ({}): {}", names.len(), names.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "namespace `{namespace}` contains non-default objects and cannot be adopted: {detail}"
+        );
+    }
+    Ok(())
+}
+
+fn namespace_adoption_cmd(
+    namespace: &str,
+    release: &str,
+    record: &NamespaceRecord,
+) -> Result<OpsCommand> {
+    let mut labels = record.labels.clone();
+    labels.insert(CREATED_BY_LABEL.to_string(), release.to_string());
+    labels.insert(CREATED_IN_LABEL.to_string(), namespace.to_string());
+    let patch = serde_json::to_string(&serde_json::json!([
+        {"op": "test", "path": "/metadata/uid", "value": record.uid.clone()},
+        {"op": "test", "path": "/metadata/resourceVersion", "value": record.resource_version.clone()},
+        {"op": "add", "path": "/metadata/labels", "value": labels},
+    ]))
+    .context("serializing the guarded Namespace ownership patch")?;
+    Ok(OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("patch"),
+            plain("namespace"),
+            plain(namespace),
+            plain("--type=json"),
+            plain("-p"),
+            plain(patch),
+        ],
+    ))
+}
+
+fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &str) -> bool {
+    labels.is_empty()
+        || (labels.len() == 1
+            && labels
+                .get("kubernetes.io/metadata.name")
+                .map(String::as_str)
+                == Some(namespace))
+}
+
+async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
+    match namespace_probe(&o.namespace).await? {
+        NamespaceProbe::Absent => {
+            let manifest = namespace_manifest(&o.namespace, &o.release)?;
+            let command = namespace_create_cmd();
+            let (ok, _out, err) = run_capture_with_stdin(&command, &manifest).await?;
+            if !ok {
+                bail!(
+                    "could not atomically create owned namespace `{}`: {}; inspect the namespace and retry",
+                    o.namespace,
+                    failure_reason(&err)
+                );
+            }
+        }
+        NamespaceProbe::Present(record) => {
+            let created_by = record.labels.get(CREATED_BY_LABEL);
+            let created_in = record.labels.get(CREATED_IN_LABEL);
+            if created_by.map(String::as_str) == Some(o.release.as_str())
+                && created_in.map(String::as_str) == Some(o.namespace.as_str())
+            {
+                return Ok(());
+            }
+            if created_by.is_some() || created_in.is_some() {
+                let by = created_by.map(String::as_str).unwrap_or("<missing>");
+                let install = created_in.map(String::as_str).unwrap_or("<missing>");
+                bail!(
+                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it",
+                    o.namespace
+                );
+            }
+            if o.namespace == CONTROLLER_DEPLOYMENT_NAMESPACE {
+                bail!(
+                    "pre-existing shared controller namespace `{}` is never eligible for adoption",
+                    o.namespace
+                );
+            }
+            if !labels_allow_empty_adoption(&record.labels, &o.namespace) {
+                let keys = record.labels.keys().cloned().collect::<Vec<_>>().join(", ");
+                bail!(
+                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted",
+                    o.namespace
+                );
+            }
+            verify_namespace_is_empty(&o.namespace).await?;
+            let command = namespace_adoption_cmd(&o.namespace, &o.release, &record)?;
+            let (ok, _out, err) = run_capture(&command).await?;
+            if !ok {
+                bail!(
+                    "could not adopt namespace `{}` with its UID/resourceVersion guard: {}; the object may have been modified, inspect it and retry",
+                    o.namespace,
+                    failure_reason(&err)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Preserve the existing create-only rule for the shared controller namespace.
+/// It is never adopted: only an object absent before Helm and present afterward
+/// is stamped, exactly as #707 required before the primary namespace moved to
+/// atomic pre-Helm creation.
+async fn stamp_created_controller_namespace(o: &CommonOpts, existed_before: bool) -> Result<()> {
+    if existed_before || o.namespace == CONTROLLER_DEPLOYMENT_NAMESPACE {
+        return Ok(());
+    }
+    let exists_after = namespace_exists(CONTROLLER_DEPLOYMENT_NAMESPACE).await?;
+    if !should_stamp_ownership(false, exists_after) {
+        return Ok(());
+    }
+    let common = ns_common(o, CONTROLLER_DEPLOYMENT_NAMESPACE, false);
+    let command = ownership_label_commands(&common, &o.namespace, false)
+        .into_iter()
+        .next()
+        .expect("a newly created controller namespace has one ownership command");
+    crate::ui::ui().plumbing(&format!("+ {}", command.display()));
+    let (ok, _out, err) = run_capture(&command).await?;
+    if !ok {
+        bail!(
+            "could not record create-only ownership for namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}`: {}",
+            failure_reason(&err)
+        );
+    }
+    Ok(())
+}
+
+fn combine_install_and_bookkeeping_errors(
+    install_error: anyhow::Error,
+    bookkeeping: Result<()>,
+    o: &CommonOpts,
+) -> anyhow::Error {
+    let Err(bookkeeping_error) = bookkeeping else {
+        return install_error;
+    };
+    let common = ns_common(o, CONTROLLER_DEPLOYMENT_NAMESPACE, false);
+    let stamp = ownership_label_commands(&common, &o.namespace, false)
+        .into_iter()
+        .next()
+        .expect("the create-only controller stamp has one command")
+        .display();
+    let fix = format!(
+        "inspect namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}`; if this release created it, run `{stamp}`, then correct the Helm failure and retry `curie cluster up`"
+    );
+    crate::exit::CliError::failure(format!(
+        "{install_error}; namespace ownership bookkeeping is also incomplete ({bookkeeping_error}); {fix}"
+    ))
+    .with_fix(fix)
+    .into()
+}
+
+async fn installation_failure_with_bookkeeping(
+    o: &CommonOpts,
+    original: anyhow::Error,
+    controller_existed_before: bool,
+) -> anyhow::Error {
+    let bookkeeping = stamp_created_controller_namespace(o, controller_existed_before).await;
+    let install_error = convergence::installation_failure(o, original).await;
+    combine_install_and_bookkeeping_errors(install_error, bookkeeping, o)
+}
+
+async fn failure_with_bookkeeping(
+    o: &CommonOpts,
+    original: anyhow::Error,
+    controller_existed_before: bool,
+) -> anyhow::Error {
+    let bookkeeping = stamp_created_controller_namespace(o, controller_existed_before).await;
+    combine_install_and_bookkeeping_errors(original, bookkeeping, o)
 }
 
 /// Parse the hostname out of a kubeconfig `cluster.server` URL
@@ -5771,6 +6444,42 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
         .output()
         .await
         .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+/// Run the one lifecycle command whose atomic API object is supplied on stdin.
+/// Kept separate from [`run_capture`] so adding namespace creation cannot change
+/// stdin behavior for the many existing helm/kubectl call sites. The child is
+/// kill-on-drop, and a failed write is killed and reaped before the error is
+/// returned.
+async fn run_capture_with_stdin(cmd: &OpsCommand, input: &[u8]) -> Result<(bool, String, String)> {
+    let (cmd, _secret_files) = cmd.materialize_secret_files()?;
+    let mut child = Command::new(&cmd.program)
+        .args(cmd.argv())
+        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(input).await,
+        None => Err(std::io::Error::other("child stdin pipe was unavailable")),
+    };
+    if let Err(error) = write_result {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error).with_context(|| format!("writing input to `{}`", cmd.program));
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .with_context(|| format!("waiting for `{}`", cmd.program))?;
     Ok((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -6665,48 +7374,38 @@ async fn run_prepared_up(
 
     let mut cmds = up_commands_with_plan(&opts, &value_plan);
 
-    // #707 record ownership only on namespaces THIS run creates, so a later
-    // `down` sweeps exactly what `up` made and leaves pre-existing state alone.
-    // `up` may create the release namespace (via `helm --create-namespace`) and
-    // the chart-created `agent-sandbox-system` -- but the latter is
-    // chart-conditional (created only when `agentSandbox.controller.deploy` is
-    // true), so a `--set agentSandbox.controller.deploy=false` release never
-    // creates it. Probe each candidate BEFORE the install so a namespace that
-    // already existed is adopted, not stamped (`existed_before`, recorded in
-    // `ownership_candidates`); the actual stamp attempt is gated a SECOND time
-    // AFTER the install (see `should_stamp_ownership` below, run once `cmds` has
-    // executed) against whether the namespace exists now, so a namespace the
-    // chart never created is simply not stamped instead of failing `kubectl
-    // label namespace <missing>`. Mirror the resolve_generated_secrets
-    // existing/fresh split: both runtime probes live here in the executor, the
-    // argv stays in the pure `ownership_label_commands` builder. `--dry-run`
-    // stays offline and previews the fresh-install stamp for every candidate
-    // (existed == false), never touching the cluster and never running the
-    // post-install probe.
-    let mut owned_namespaces = vec![opts.common.namespace.clone()];
-    if opts.common.namespace != "agent-sandbox-system" {
-        owned_namespaces.push("agent-sandbox-system".to_string());
-    }
-    if !opts.common.dry_run {
-        require_on_path("kubectl")?;
-    }
-    let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
-    for ns in owned_namespaces {
-        let existed_before = if opts.common.dry_run {
-            false
+    // #2375 closes the create-then-label crash window for the PRIMARY install
+    // namespace. A fresh namespace is created atomically with both #1654 labels;
+    // an ownership-unlabelled namespace is adopted only after full namespaced
+    // API discovery proves it contains no objects beyond Kubernetes' default
+    // ServiceAccount and root CA ConfigMap. Existing ownership is accepted only
+    // when the complete (release, install namespace) pair matches.
+    //
+    // The shared, conditional controller namespace keeps #707's old create-only
+    // behavior. It is probed before Helm and stamped afterward only if Helm made
+    // it; it is never eligible for empty-namespace adoption.
+    let controller_existed_before =
+        if opts.common.dry_run || opts.common.namespace == CONTROLLER_DEPLOYMENT_NAMESPACE {
+            true
         } else {
-            namespace_exists(&ns).await?
+            require_on_path("kubectl")?;
+            namespace_exists(CONTROLLER_DEPLOYMENT_NAMESPACE).await?
         };
-        if opts.common.dry_run {
-            // existed_before is provably false on this branch (set above).
-            let common = ns_common(&opts.common, &ns, true);
-            cmds.extend(ownership_label_commands(
+    if opts.common.dry_run {
+        let mut preview = vec![namespace_create_cmd()];
+        preview.append(&mut cmds);
+        if opts.common.namespace != CONTROLLER_DEPLOYMENT_NAMESPACE {
+            let common = ns_common(&opts.common, CONTROLLER_DEPLOYMENT_NAMESPACE, true);
+            preview.extend(ownership_label_commands(
                 &common,
                 &opts.common.namespace,
                 false,
             ));
         }
-        ownership_candidates.push((ns, existed_before));
+        cmds = preview;
+    } else {
+        require_on_path("kubectl")?;
+        establish_primary_namespace_ownership(&opts.common).await?;
     }
 
     // Count named provider intent on both live and dry runs, plus egress
@@ -6745,7 +7444,11 @@ async fn run_prepared_up(
     }
     if opts.common.dry_run {
         let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
-        lines.push("# After Helm and ownership stamping, verify convergence for at most 300 seconds; repeat observations every 2 seconds while rollout is pending.".to_owned());
+        lines.insert(1, format!(
+            "# The Namespace manifest supplied on stdin carries {CREATED_BY_LABEL}={} and {CREATED_IN_LABEL}={}; a live run instead safely adopts an existing empty primary namespace.",
+            opts.common.release, opts.common.namespace
+        ));
+        lines.push("# After Helm and create-only controller namespace stamping, verify convergence for at most 300 seconds; repeat observations every 2 seconds while rollout is pending.".to_owned());
         lines.push(convergence::DRY_RUN_NOTE.to_owned());
         lines.extend(
             convergence::dry_run_commands(&opts.common)
@@ -6754,10 +7457,10 @@ async fn run_prepared_up(
         );
         return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
-    let release_namespace_existed_before_install = ownership_candidates
-        .iter()
-        .find_map(|(namespace, existed)| (namespace == &opts.common.namespace).then_some(*existed))
-        .unwrap_or(false);
+    // The primary namespace is now guaranteed to exist before Helm starts,
+    // whether it was created, already owned, or safely adopted above. Start the
+    // gVisor event watch before install rather than waiting for Helm to create it.
+    let release_namespace_existed_before_install = true;
     require_on_path("helm")?;
     if detect_facts {
         for inference in reconcile_priority_class_ownership(&opts, &mut value_plan).await? {
@@ -6789,7 +7492,12 @@ async fn run_prepared_up(
             {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    return Err(convergence::installation_failure(&opts.common, error).await)
+                    return Err(installation_failure_with_bookkeeping(
+                        &opts.common,
+                        error,
+                        controller_existed_before,
+                    )
+                    .await)
                 }
             };
             match outcome {
@@ -6803,11 +7511,17 @@ async fn run_prepared_up(
                         let fix = format!(
                             "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
                         );
-                        return Err(crate::exit::CliError::usage(format!(
+                        let error: anyhow::Error = crate::exit::CliError::usage(format!(
                             "explicit `{assignment}` contradicts the detected admission result `{rejection}`; {fix}"
                         ))
                         .with_fix(fix)
-                        .into());
+                        .into();
+                        return Err(failure_with_bookkeeping(
+                            &opts.common,
+                            error,
+                            controller_existed_before,
+                        )
+                        .await);
                     }
                     step.warn("retrying");
                     value_plan.set(GVISOR_MODE_KEY, "off");
@@ -6817,48 +7531,43 @@ async fn run_prepared_up(
                         .next()
                         .expect("cluster up always has one Helm command");
                     if let Err(error) = run_step(&cl, &label, "installed", &retry).await {
-                        return Err(convergence::installation_failure(&opts.common, error).await);
+                        return Err(installation_failure_with_bookkeeping(
+                            &opts.common,
+                            error,
+                            controller_existed_before,
+                        )
+                        .await);
                     }
                 }
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
                     step.fail("failed");
                     let fix = "curie cluster up --set security.gvisor.mode=off";
-                    return Err(crate::exit::CliError::failure(format!(
+                    let error: anyhow::Error = crate::exit::CliError::failure(format!(
                         "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, run `{fix}`."
                     ))
                     .with_fix(fix)
-                    .into());
+                    .into();
+                    return Err(failure_with_bookkeeping(
+                        &opts.common,
+                        error,
+                        controller_existed_before,
+                    )
+                    .await);
                 }
             }
         } else {
             if let Err(error) = run_step(&cl, &label, "installed", cmd).await {
-                return Err(convergence::installation_failure(&opts.common, error).await);
+                return Err(installation_failure_with_bookkeeping(
+                    &opts.common,
+                    error,
+                    controller_existed_before,
+                )
+                .await);
             }
         }
     }
 
-    // #707 stamp ownership only on namespaces this run actually created. A
-    // candidate that did not exist before the install may still not exist
-    // after it -- `agent-sandbox-system` under
-    // `--set agentSandbox.controller.deploy=false` is the concrete case, since
-    // the chart only creates that namespace when the sandbox controller
-    // subchart is deployed -- so re-probe existence here, post-helm, and skip
-    // the label attempt for anything still absent rather than let `kubectl
-    // label namespace <missing>` fail the whole `up`. A namespace that
-    // pre-existed is never re-probed or stamped at all.
-    for (ns, existed_before) in &ownership_candidates {
-        if *existed_before {
-            continue;
-        }
-        let exists_after = namespace_exists(ns).await?;
-        if !should_stamp_ownership(false, exists_after) {
-            continue;
-        }
-        let common = ns_common(&opts.common, ns, false);
-        for cmd in ownership_label_commands(&common, &opts.common.namespace, false) {
-            run_step(&cl, &label, "installed", &cmd).await?;
-        }
-    }
+    stamp_created_controller_namespace(&opts.common, controller_existed_before).await?;
 
     let step = cl.step("waiting for exact target workload convergence");
     if let Err(error) = convergence::wait(&opts.common).await {
@@ -7240,16 +7949,20 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     let cmds = down_commands(&opts.common);
     if opts.common.dry_run {
         return Ok(ClusterDownOutput::DryRun(crate::ui::DryRunPlan {
-            lines: cmds.iter().map(|cmd| cmd.display()).collect(),
+            lines: vec![
+                cmds[0].display(),
+                hook_cleanup_resume_command(&opts.common),
+                cmds[1].display(),
+            ],
         }));
     }
     ui.warn(&format!(
-        "this uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach), leaving any pre-existing namespaces untouched",
+        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, and shared controller namespaces are retained",
         opts.common.release, opts.common.namespace
     ));
     if !opts.yes
         && !confirm(&format!(
-            "This uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach). Continue? [y/N] ",
+            "This uninstalls release '{0}' in namespace '{1}', removes its Helm hook Jobs, and deletes only namespaces owned by the exact release/install-namespace pair; unowned or shared namespaces are retained. Continue? [y/N] ",
             opts.common.release, opts.common.namespace
         ))?
     {
@@ -7267,7 +7980,10 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     let uninstall = &cmds[0];
     ui.plumbing(&format!("+ {}", uninstall.display()));
     let step = cl.step("uninstalling release");
-    let (ok, out, helm_err) = run_capture(uninstall).await?;
+    let (ok, out, helm_err) = match run_capture(uninstall).await {
+        Ok(captured) => captured,
+        Err(error) => (false, String::new(), format!("{error:#}")),
+    };
     let helm_outcome = if ok {
         step.done("removed");
         HelmOutcome::Removed
@@ -7282,6 +7998,82 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         ui.plumbing(line);
     }
 
+    // Failed Helm hooks may be retained even after uninstall. Remove only Jobs
+    // selected by this release's exact Helm labels and carrying `helm.sh/hook`.
+    // This object-scoped step is independent of namespace ownership and runs
+    // even when the namespace sweep below correctly retains the namespace.
+    let step = cl.step("removing Helm hook Jobs");
+    let mut hook_err = String::new();
+    let hook_outcome = match namespace_probe(&opts.common.namespace).await {
+        Ok(NamespaceProbe::Absent) => {
+            step.done("namespace absent");
+            HookOutcome::NoMatch
+        }
+        Err(error) => {
+            hook_err = format!("{error:#}");
+            step.fail("failed");
+            HookOutcome::Failed
+        }
+        Ok(NamespaceProbe::Present(_)) => {
+            let list = hook_jobs_cmd(&opts.common);
+            ui.plumbing(&format!("+ {}", list.display()));
+            match run_capture(&list).await {
+                Err(error) => {
+                    hook_err = format!("{error:#}");
+                    step.fail("failed");
+                    HookOutcome::Failed
+                }
+                Ok((false, _out, err)) => {
+                    hook_err = err;
+                    step.fail("failed");
+                    HookOutcome::Failed
+                }
+                Ok((true, out, _err)) => match parse_hook_job_names(&out, &opts.common) {
+                    Err(error) => {
+                        hook_err = format!("{error:#}");
+                        step.fail("failed");
+                        HookOutcome::Failed
+                    }
+                    Ok(names) if names.is_empty() => {
+                        step.done("no matching hooks");
+                        HookOutcome::NoMatch
+                    }
+                    Ok(names) => {
+                        let delete = hook_jobs_delete_cmd(&opts.common, &names);
+                        ui.plumbing(&format!("+ {}", delete.display()));
+                        match run_capture(&delete).await {
+                            Err(error) => {
+                                hook_err = format!("{error:#}");
+                                step.fail("failed");
+                                HookOutcome::Failed
+                            }
+                            Ok((false, out, err)) => {
+                                for line in out.lines().chain(err.lines()) {
+                                    ui.plumbing(line);
+                                }
+                                hook_err = err;
+                                step.fail("failed");
+                                HookOutcome::Failed
+                            }
+                            Ok((true, out, err)) => {
+                                for line in out.lines().chain(err.lines()) {
+                                    ui.plumbing(line);
+                                }
+                                if out.trim().is_empty() {
+                                    step.done("already absent");
+                                    HookOutcome::NoMatch
+                                } else {
+                                    step.done("removed");
+                                    HookOutcome::Removed
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    };
+
     // Namespace sweep (runtime artifacts Helm does not own). Runs
     // UNCONDITIONALLY: it is Helm-independent by design (#707) and is what
     // actually stops compute, so a failed helm uninstall must not skip it. Not
@@ -7289,7 +8081,10 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     let sweep = &cmds[1];
     ui.plumbing(&format!("+ {}", sweep.display()));
     let step = cl.step("sweeping namespaces");
-    let (ok, out, sweep_err) = run_capture(sweep).await?;
+    let (ok, out, sweep_err) = match run_capture(sweep).await {
+        Ok(captured) => captured,
+        Err(error) => (false, String::new(), format!("{error:#}")),
+    };
     // #768: `--ignore-not-found` makes a zero-match selector exit 0 with EMPTY
     // stdout (no "namespace ... deleted" line), the same exit code an actual
     // removal gets. That is exactly the pre-existing-namespace case (#707
@@ -7312,13 +8107,20 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     for line in out.lines().chain(sweep_err.lines()) {
         ui.plumbing(line);
     }
+    if matches!(sweep_outcome, SweepOutcome::NoMatch) {
+        ui.warn(
+            "no namespace matched the exact Curie ownership pair, so no namespace was removed; any legacy unlabeled, foreign-owned, foreign-content, or shared namespace is retained",
+        );
+    }
 
     // Pure decision (#767): success on a complete teardown, else a fail-forward
     // error whose exit class and message follow from the outcomes plus stderr.
     teardown_result(
         helm_outcome,
+        hook_outcome,
         sweep_outcome,
         &helm_err,
+        &hook_err,
         &sweep_err,
         &opts.common,
     )
@@ -11126,15 +11928,16 @@ mod tests {
     }
 
     // #767 fail-forward teardown (aggregation hardened by #768). PRODUCTION
-    // SYMBOLS: two pure functions plus three small enums so `cluster down` runs
-    // both teardown steps to completion and then decides the exit from the
+    // SYMBOLS: two pure functions plus four small enums so `cluster down` runs
+    // all teardown steps to completion and then decides the exit from the
     // combined result, instead of bailing the instant `helm uninstall` returns a
     // non-"not found" nonzero exit:
     //
     //   enum HelmOutcome { Removed, Absent, Failed }
+    //   enum HookOutcome { Removed, NoMatch, Failed }
     //   enum SweepOutcome { Removed, NoMatch, Failed }
-    //   enum TeardownStep { HelmUninstall, NamespaceSweep }  // derive Debug, PartialEq, Eq
-    //   fn outstanding_steps(helm: HelmOutcome, sweep: SweepOutcome) -> Vec<TeardownStep>
+    //   enum TeardownStep { HelmUninstall, HookCleanup, NamespaceSweep }  // derive Debug, PartialEq, Eq
+    //   fn outstanding_steps(helm: HelmOutcome, hooks: HookOutcome, sweep: SweepOutcome) -> Vec<TeardownStep>
     //   fn resume_command(remaining: &[TeardownStep], o: &CommonOpts) -> String
     //
     // `outstanding_steps` is the pure decision function: Removed/Absent helm is
@@ -11265,35 +12068,59 @@ mod tests {
 
         // Happy path: helm removed, sweep clean -> nothing outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed,
+            ),
             Vec::<TeardownStep>::new()
         );
         // Already-absent release, sweep clean -> still nothing outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Absent, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Absent,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed,
+            ),
             Vec::<TeardownStep>::new()
         );
         // Fail-forward win: helm failed but the sweep removed the namespaces
         // (compute stopped); only the stale helm release record remains.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed,
+            ),
             vec![HelmUninstall]
         );
         // Nothing could be removed; the API server is still unreachable.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::Failed),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Failed,
+            ),
             vec![HelmUninstall, NamespaceSweep]
         );
         // Helm removed but the sweep failed -> only the sweep is outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::Failed),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Failed,
+            ),
             vec![NamespaceSweep]
         );
         // #768: a zero-match sweep (pre-existing namespace, never labeled by
         // #707) is a completed step, same as an actual removal -- there is
         // nothing left for THIS step to do, so it must not be outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::NoMatch),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::NoMatch,
+            ),
             Vec::<TeardownStep>::new()
         );
         // #768: helm failed and the sweep matched nothing -> only the helm
@@ -11301,21 +12128,27 @@ mod tests {
         // but critically it did NOT stop any compute, unlike the Removed case
         // above.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::NoMatch),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::NoMatch,
+            ),
             vec![HelmUninstall]
         );
     }
 
     // #767 fail-forward HARDENING. PRODUCTION SYMBOLS: a connectivity
     // classifier and the pure teardown-result decision that `down()` calls
-    // AFTER running both teardown steps and capturing their outcomes plus
+    // AFTER running all three teardown steps and capturing their outcomes plus
     // stderr:
     //
     //   fn is_connectivity_failure(stderr: &str) -> bool
     //   fn teardown_result(
     //       helm: HelmOutcome,
+    //       hooks: HookOutcome,
     //       sweep: SweepOutcome,
     //       helm_err: &str,
+    //       hook_err: &str,
     //       sweep_err: &str,
     //       o: &CommonOpts,
     //   ) -> anyhow::Result<ClusterDownOutput>
@@ -11483,8 +12316,16 @@ mod tests {
     #[test]
     fn teardown_result_all_removed_is_success() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Removed, SweepOutcome::Removed, "", "", &o)
-            .expect("a complete teardown is Ok");
+        let res = teardown_result(
+            HelmOutcome::Removed,
+            HookOutcome::NoMatch,
+            SweepOutcome::Removed,
+            "",
+            "",
+            "",
+            &o,
+        )
+        .expect("a complete teardown is Ok");
         assert!(matches!(
             res,
             ClusterDownOutput::Down {
@@ -11497,8 +12338,16 @@ mod tests {
     #[test]
     fn teardown_result_absent_release_is_success_absent() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Absent, SweepOutcome::Removed, "", "", &o)
-            .expect("an already-absent release still completes");
+        let res = teardown_result(
+            HelmOutcome::Absent,
+            HookOutcome::NoMatch,
+            SweepOutcome::Removed,
+            "",
+            "",
+            "",
+            &o,
+        )
+        .expect("an already-absent release still completes");
         assert!(matches!(
             res,
             ClusterDownOutput::Down {
@@ -11519,8 +12368,10 @@ mod tests {
         let sweep_err = "Kubernetes cluster unreachable: connection refused";
         let err = teardown_result(
             HelmOutcome::Failed,
+            HookOutcome::NoMatch,
             SweepOutcome::Failed,
             helm_err,
+            "",
             sweep_err,
             &o,
         )
@@ -11553,8 +12404,16 @@ mod tests {
     fn teardown_result_connectivity_helm_only_failed_surfaces_swept_and_helm_resume() {
         let o = common_distinct_release();
         let helm_err = "Kubernetes cluster unreachable: net/http: TLS handshake timeout";
-        let err = teardown_result(HelmOutcome::Failed, SweepOutcome::Removed, helm_err, "", &o)
-            .expect_err("a stale helm record is still an incomplete teardown");
+        let err = teardown_result(
+            HelmOutcome::Failed,
+            HookOutcome::NoMatch,
+            SweepOutcome::Removed,
+            helm_err,
+            "",
+            "",
+            &o,
+        )
+        .expect_err("a stale helm record is still an incomplete teardown");
 
         let (class, fix) = crate::exit::classify(&err);
         assert_eq!(class, crate::exit::ExitClass::Transient);
@@ -11592,8 +12451,16 @@ mod tests {
     fn teardown_result_zero_match_sweep_never_claims_compute_was_removed() {
         let o = common_distinct_release();
         let helm_err = "Kubernetes cluster unreachable: net/http: TLS handshake timeout";
-        let err = teardown_result(HelmOutcome::Failed, SweepOutcome::NoMatch, helm_err, "", &o)
-            .expect_err("a stale helm record is still an incomplete teardown");
+        let err = teardown_result(
+            HelmOutcome::Failed,
+            HookOutcome::NoMatch,
+            SweepOutcome::NoMatch,
+            helm_err,
+            "",
+            "",
+            &o,
+        )
+        .expect_err("a stale helm record is still an incomplete teardown");
 
         let shown = err.to_string();
         // The core anti-regression: must NOT claim the run-created namespaces
@@ -11632,8 +12499,16 @@ mod tests {
     #[test]
     fn teardown_result_zero_match_sweep_with_helm_removed_is_still_success() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Removed, SweepOutcome::NoMatch, "", "", &o)
-            .expect("a zero-match sweep alongside a clean helm uninstall is a complete teardown");
+        let res = teardown_result(
+            HelmOutcome::Removed,
+            HookOutcome::NoMatch,
+            SweepOutcome::NoMatch,
+            "",
+            "",
+            "",
+            &o,
+        )
+        .expect("a zero-match sweep alongside a clean helm uninstall is a complete teardown");
         assert!(matches!(
             res,
             ClusterDownOutput::Down {
@@ -11653,8 +12528,10 @@ mod tests {
             "Error: query: failed to query with labels: namespaces is forbidden: User cannot list resource \"namespaces\"";
         let err = teardown_result(
             HelmOutcome::Failed,
+            HookOutcome::NoMatch,
             SweepOutcome::Failed,
             forbidden,
+            "",
             forbidden,
             &o,
         )
@@ -11705,8 +12582,10 @@ mod tests {
             "Error: namespaces is forbidden: User \"sa\" cannot delete resource \"namespaces\" in API group";
         let err = teardown_result(
             HelmOutcome::Failed,
+            HookOutcome::NoMatch,
             SweepOutcome::Failed,
             helm_err,
+            "",
             sweep_err,
             &o,
         )
@@ -11801,8 +12680,10 @@ mod tests {
         let helm_err = String::from_utf8_lossy(b"abcde\xe9fghij\n").into_owned();
         let err = teardown_result(
             HelmOutcome::Failed,
+            HookOutcome::NoMatch,
             SweepOutcome::Removed,
             &helm_err,
+            "",
             "",
             &o,
         )

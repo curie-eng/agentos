@@ -87,7 +87,9 @@ async fn cluster_down_fails_forward_through_real_down() {
     write_exec(
         dir1.path(),
         "kubectl",
-        &format!("#!/bin/sh\ntouch \"$SWEEP_MARKER\"\necho '{unreachable}' >&2\nexit 1\n"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{{\"name\":\"agent-ns\",\"labels\":{{}},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\necho '{unreachable}' >&2\nexit 1\n"
+        ),
     );
     prepend_path(dir1.path());
 
@@ -134,7 +136,7 @@ async fn cluster_down_fails_forward_through_real_down() {
     write_exec(
         dir2.path(),
         "kubectl",
-        "#!/bin/sh\ntouch \"$SWEEP_MARKER\"\necho 'namespace \"prod-release-agent-sandbox\" deleted'\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"agent-ns\",\"labels\":{},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\necho 'namespace \"prod-release-agent-sandbox\" deleted'\nexit 0\n",
     );
     // Drop scenario 1's fakes: reset to the original PATH, then prepend dir2.
     restore_path(&original_path);
@@ -187,7 +189,7 @@ async fn cluster_down_fails_forward_through_real_down() {
     write_exec(
         dir3.path(),
         "kubectl",
-        "#!/bin/sh\ntouch \"$SWEEP_MARKER\"\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"agent-ns\",\"labels\":{},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}'\n  exit 0\nfi\ntouch \"$SWEEP_MARKER\"\nexit 0\n",
     );
     restore_path(&original_path);
     prepend_path(dir3.path());
@@ -243,7 +245,7 @@ async fn cluster_down_fails_forward_through_real_down() {
         dir4.path(),
         "kubectl",
         &format!(
-            "#!/bin/sh\necho x >> '{log}'\nif [ -f '{switched}' ]; then\n  echo 'namespace \"x\" deleted'\n  exit 0\nelse\n  touch '{switched}'\n  echo 'Kubernetes cluster unreachable: connection refused' >&2\n  exit 1\nfi\n",
+            "#!/bin/sh\nif [ \"$1\" = get ] && [ \"$2\" = namespace ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{{\"name\":\"agent-ns\",\"labels\":{{}},\"uid\":\"uid-agent-ns\",\"resourceVersion\":\"17\"}}}}'\n  exit 0\nfi\nif [ \"$1\" = get ] && [ \"$2\" = jobs ]; then\n  echo '{{\"apiVersion\":\"v1\",\"kind\":\"List\",\"items\":[]}}'\n  exit 0\nfi\necho x >> '{log}'\nif [ -f '{switched}' ]; then\n  echo 'namespace \"x\" deleted'\n  exit 0\nelse\n  touch '{switched}'\n  echo 'Kubernetes cluster unreachable: connection refused' >&2\n  exit 1\nfi\n",
             log = kubectl_log.display(),
             switched = kubectl_switched.display(),
         ),

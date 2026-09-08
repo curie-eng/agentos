@@ -37,6 +37,9 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
 const FAKE_CLUSTER: &str = r###"#!/usr/bin/env python3
 import json, os, pathlib, sys
 
+NS = "agent-ns"
+RELEASE = "prod-release"
+
 state_path = pathlib.Path(os.environ["CURIE_TEST_CLUSTER_STATE"])
 log_path = pathlib.Path(os.environ["CURIE_TEST_CLUSTER_LOG"])
 state = json.loads(state_path.read_text())
@@ -155,12 +158,24 @@ if args and args[0] == "get" and len(args) >= 2:
     if record is None:
         fail(f'Error from server (NotFound): namespaces "{namespace}" not found')
     selector = option("-l", "--selector")
+    if not selector and resource in state["resources"]:
+        state["inventory_seen"].append(resource)
     if resource in ("jobs", "job", "jobs.batch"):
         items = [item for item in state["jobs"].get(namespace, [])
                  if matches(item.get("metadata", {}).get("labels", {}), selector)]
     else:
         items = record.get("objects", {}).get(resource, [])
-        state["inventory_seen"].append(resource)
+    output = option("-o", "--output")
+    if resource in ("jobs", "job", "jobs.batch") and output and output.startswith("go-template="):
+        names = []
+        for item in items:
+            metadata = item.get("metadata", {})
+            annotations = metadata.get("annotations", {})
+            if (annotations.get("helm.sh/hook")
+                    and annotations.get("meta.helm.sh/release-name", RELEASE) == RELEASE
+                    and annotations.get("meta.helm.sh/release-namespace", NS) == NS):
+                names.append(metadata["name"])
+        save(); print("\n".join(names)); raise SystemExit(0)
     save(); print(json.dumps({"apiVersion":"v1", "kind":"List", "items":items}))
     raise SystemExit(0)
 
@@ -205,6 +220,8 @@ if args[:2] == ["delete", "namespace"]:
 if args and args[0] == "delete" and len(args) > 2 and args[1] in ("job", "jobs", "jobs.batch"):
     namespace = option("-n", "--namespace") or NS
     names = [arg for arg in args[2:] if not arg.startswith("-") and arg != namespace]
+    if state.get("hook_delete_error"):
+        fail("Error from server (Forbidden): jobs is forbidden")
     kept = []
     for job in state["jobs"].get(namespace, []):
         if job["metadata"]["name"] in names:
@@ -237,6 +254,7 @@ impl Fixture {
             "helm_upgrades": 0, "labels_at_upgrade": {}, "created_atomically": false,
             "adoption_guarded": false, "inventory_error": inventory_error,
             "version_conflict": version_conflict, "discovery_calls": 0,
+            "hook_delete_error": false,
             "inventory_seen": [],
             "resources": ["serviceaccounts", "configmaps", "secrets", "events", "jobs.batch", "deployments.apps"],
             "defaults": Self::default_furniture()
@@ -328,6 +346,45 @@ impl Fixture {
             .expect("run cluster down")
     }
 
+    fn down_json(&self) -> Output {
+        self.command()
+            .args([
+                "--json",
+                "--color",
+                "never",
+                "cluster",
+                "down",
+                "--namespace",
+                NS,
+                "--release",
+                RELEASE,
+                "--yes",
+            ])
+            .output()
+            .expect("run cluster down with structured output")
+    }
+
+    fn set_hook_delete_error(&self, enabled: bool) {
+        let mut state = self.state();
+        state["hook_delete_error"] = json!(enabled);
+        fs::write(&self.state, serde_json::to_vec(&state).unwrap()).expect("update fake state");
+    }
+
+    fn run_resume(&self, command: &str) -> Output {
+        let mut paths = vec![self.bin_dir.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        Command::new("sh")
+            .args(["-c", command])
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("CURIE_TEST_CLUSTER_STATE", &self.state)
+            .env("CURIE_TEST_CLUSTER_LOG", &self.log)
+            .output()
+            .expect("execute emitted cleanup command")
+    }
+
     fn state(&self) -> Value {
         serde_json::from_slice(&fs::read(&self.state).expect("read state")).expect("parse state")
     }
@@ -371,6 +428,12 @@ fn job(name: &str, labels: Value, hook: bool) -> Value {
     json!({"apiVersion":"batch/v1", "kind":"Job", "metadata":metadata})
 }
 
+fn annotated_job(name: &str, labels: Value, annotations: Value) -> Value {
+    json!({"apiVersion":"batch/v1", "kind":"Job", "metadata":{
+        "name":name, "namespace":NS, "labels":labels, "annotations":annotations
+    }})
+}
+
 #[test]
 fn failed_install_cleanup_and_empty_namespace_adoption() {
     let empty = Fixture::default_furniture();
@@ -382,8 +445,10 @@ fn failed_install_cleanup_and_empty_namespace_adoption() {
     assert!(!failed.status.success(), "the fake Helm hook must fail");
     let state = fresh.state();
     assert_eq!(
-        state["created_atomically"], true,
-        "namespace was not created atomically"
+        state["created_atomically"],
+        true,
+        "namespace was not created atomically: {}",
+        String::from_utf8_lossy(&failed.stderr)
     );
     assert_eq!(
         state["labels_at_upgrade"],
@@ -441,7 +506,7 @@ fn failed_install_cleanup_and_empty_namespace_adoption() {
     let target =
         json!({"app.kubernetes.io/instance":RELEASE, "app.kubernetes.io/managed-by":"Helm"});
     let shared_jobs = json!({NS: [
-        job("owned-hook", target.clone(), true), job("owned-non-hook", target, false),
+        job("owned-hook", target.clone(), true), job("owned-non-hook", target.clone(), false),
         job("spoofed-hook", json!({"app.kubernetes.io/instance":RELEASE}), true),
         job("foreign-hook", json!({"app.kubernetes.io/instance":"other-release",
             "app.kubernetes.io/managed-by":"Helm"}), true)
@@ -473,6 +538,109 @@ fn failed_install_cleanup_and_empty_namespace_adoption() {
         .map(|item| item["metadata"]["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["owned-non-hook", "spoofed-hook", "foreign-hook"]);
+
+    // A failed exact hook deletion is fail-forward: the ownership-scoped
+    // namespace sweep still runs, and structured recovery is executable once
+    // the permanent API error clears. Empty hook annotations and conflicting
+    // optional Helm owner annotations are intentionally outside that recovery.
+    let retry_jobs = json!({NS: [
+        job("retry-hook", target.clone(), true),
+        job("ordinary-job", target.clone(), false),
+        annotated_job("empty-hook", target.clone(), json!({"helm.sh/hook":""})),
+        annotated_job("foreign-owner-name", target.clone(), json!({
+            "helm.sh/hook":"pre-install", "meta.helm.sh/release-name":"other-release"
+        })),
+        annotated_job("foreign-owner-namespace", target, json!({
+            "helm.sh/hook":"pre-install", "meta.helm.sh/release-namespace":"other-ns"
+        }))
+    ]});
+    let retry = Fixture::new(
+        json!({NS: Fixture::namespace(json!({}), json!({
+            "serviceaccounts":[], "configmaps":[], "secrets":[{"kind":"Secret","metadata":{"name":"foreign"}}],
+            "events":[], "jobs.batch":[], "deployments.apps":[]
+        }))}),
+        retry_jobs,
+        false,
+        false,
+    );
+    retry.set_hook_delete_error(true);
+    let failed_down = retry.down_json();
+    assert_eq!(
+        failed_down.status.code(),
+        Some(1),
+        "a permanent hook-delete error must fail with exit 1: {}",
+        shown(&failed_down)
+    );
+    let error: Value = serde_json::from_slice(&failed_down.stdout).unwrap_or_else(|parse| {
+        panic!(
+            "down error was not one JSON object ({parse}): {}",
+            shown(&failed_down)
+        )
+    });
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Resume with:")
+            && error["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("forbidden"),
+        "down omitted the permanent reason or recovery command: {error}"
+    );
+    let resume = error["fix"]
+        .as_str()
+        .expect("hook-delete failure must carry structured recovery");
+    assert!(
+        resume
+            .contains("app.kubernetes.io/instance=prod-release,app.kubernetes.io/managed-by=Helm")
+            && resume.contains("kubectl delete job"),
+        "recovery must retain the exact Helm hook selector and delete surface: {resume}"
+    );
+    let commands = fs::read_to_string(&retry.log).expect("read hook failure command log");
+    let hook_delete = commands
+        .find("kubectl delete job retry-hook")
+        .expect("down must attempt the exact hook deletion");
+    let sweep = commands
+        .find("kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns")
+        .expect("down must continue to the ownership-scoped namespace sweep");
+    assert!(
+        hook_delete < sweep,
+        "namespace sweep did not run after hook failure: {commands}"
+    );
+    assert!(
+        retry.state()["namespaces"].get(NS).is_some(),
+        "the foreign-content namespace must remain retained"
+    );
+
+    retry.set_hook_delete_error(false);
+    let resumed = retry.run_resume(resume);
+    assert!(
+        resumed.status.success(),
+        "emitted hook cleanup did not succeed after the API error cleared: {}",
+        shown(&resumed)
+    );
+    let state = retry.state();
+    assert!(
+        state["namespaces"].get(NS).is_some(),
+        "executing hook recovery must not delete the retained namespace"
+    );
+    let names: Vec<_> = state["jobs"][NS]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["metadata"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "ordinary-job",
+            "empty-hook",
+            "foreign-owner-name",
+            "foreign-owner-namespace"
+        ],
+        "recovery must delete only the exact non-empty target hook"
+    );
 
     // Foreign content and modified default furniture are both non-empty.
     let foreign = Fixture::new(
