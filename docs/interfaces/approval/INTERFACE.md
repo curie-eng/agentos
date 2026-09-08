@@ -262,6 +262,16 @@ in code now:
   decision, and the authorizer snapshot -- who resolved, how the platform authenticated
   them, and why they counted (or were refused). Rows written before ADR-0106 retain
   `principal_kind=NULL` and `authenticated=false` rather than being retroactively trusted.
+- **The declared/bound join is also checked at configuration time (landed, #2436).**
+  `check_approval_route_bindings` and its sibling helpers
+  (`apps/api/src/curie_api/deploy.py`) refuse, before a version becomes live, whenever the
+  bundle declares a route with no entry in `approval_routes`: at `POST /deployments`, at
+  both git push paths (dev deploy and prod promote), at a bundle attached to a version an
+  active deployment already references, and at an `approval_routes` write that would drop
+  a route an active deployment still declares. It deliberately checks only presence, not
+  validity, of a binding -- a binding that fails schema validation is still treated as
+  bound -- and ADR-0046's request-time escalation above is retained unchanged as the
+  backstop for that residual.
 
 ### Arming a gate: bare MCP shorthand is normalized; unresolvable names fail closed
 

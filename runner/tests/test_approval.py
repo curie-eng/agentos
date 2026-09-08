@@ -2753,3 +2753,68 @@ def test_ambiguous_connector_and_server_gate_refuses_to_boot(tmp_path) -> None:
             mcp_servers=resolution.mcp_servers,
             connector_servers=resolution.connector_servers,
         )
+
+
+def test_route_normalization_vector_matches_the_runtime_loader(tmp_path) -> None:
+    """F4 parity seam: the frozen route vector IS the runtime loader's behavior.
+
+    The runner half of the two-sided probe (`#2436`). The deploy-time reader
+    `curie_api.bundles.declared_approval_routes` must derive the same declared
+    route set this loader arms, or a bundle passes the new configuration-time
+    join and then boots with a different set of gates. Code cannot be shared
+    across that seam -- `packages/plugin-format` is frozen and the API must not
+    import `curie_runner` -- so `tests/vectors/approval-route-normalization.json`
+    is the rule and BOTH sides execute it, exactly as
+    `test_route_normalization_agrees_between_validator_and_runner` above
+    executes the validator/loader pair rather than reasoning about it.
+
+    Two properties the vector pins, both of which have already shipped as
+    fail-opens on adjacent code:
+
+    - the declared set is `set(route_by_tool.values())`, a LAST-WINS map per
+      tool, not the union of every gate's route. A repeated tool's earlier route
+      is discarded here and can never be raised at runtime, so a deploy-time
+      reader that unioned the values would refuse a deploy-valid bundle over a
+      route that does not exist.
+    - a `"rejected"` row asserts a RAISE, not an empty map. That is what keeps
+      the vector from being satisfiable by weakening this loader's #520
+      fail-closed posture: a loader that quietly returned `{}` for a gate it
+      cannot arm would satisfy an equality-only vector while booting ungated.
+    """
+
+    from pathlib import Path
+
+    vector_path = (
+        Path(__file__).resolve().parents[2]
+        / "tests"
+        / "vectors"
+        / "approval-route-normalization.json"
+    )
+    cases = json.loads(vector_path.read_text(encoding="utf-8"))["cases"]
+    assert cases, "the frozen vector must carry cases, or this test proves nothing"
+
+    for case in cases:
+        root = tmp_path / str(case["id"])
+        (root / ".claude-plugin").mkdir(parents=True)
+        # Built-in tool names ("Bash", "Write") throughout: they carry no mcp__
+        # prefix, so the namespacing rules are out of the picture and the ROUTE
+        # normalization is the only variable, the same isolation `_write_bundle`
+        # above uses.
+        manifest: dict[str, object] = {"name": "route-vector", "version": "0.1.0"}
+        if case["gates"] is not None:
+            manifest["approvalPolicy"] = {"gates": case["gates"]}
+        (root / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        if case["expected"] == "rejected":
+            with pytest.raises(ApprovalPolicyError):
+                resolve_approval_policy(str(root))
+            continue
+
+        resolved = sorted(set(resolve_approval_policy(str(root)).route_by_tool.values()))
+        assert resolved == case["expected"], (
+            f"case {case['id']!r}: the runtime loader declares {resolved!r} but the "
+            f"frozen vector says {case['expected']!r} -- normalization drift between "
+            "the deploy-time reader and the loader is the #453/#544 fail-open shape"
+        )

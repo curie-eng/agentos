@@ -1768,3 +1768,477 @@ def test_a_git_push_of_a_stale_build_bundle_creates_no_version(
     assert body["status"] == "rejected"
     assert "connectors.lock_stale" in {e["code"] for e in body["errors"]}
     assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+
+
+# --------------------------------------------------------------------------- #
+# The declared/bound approval-route join, driven by a real signed push (#2436)
+#
+# A push is the other way a version becomes the thing that boots, so the same
+# configuration-time refusal `POST /deployments` returns as a 422 arrives here
+# as `WebhookResult(status="rejected")` with code `approval_routes.unbound`.
+# Every assertion below reads the webhook response body and `GET /deployments`,
+# never an internal struct field.
+# --------------------------------------------------------------------------- #
+
+
+def _gated_manifest(route: str, gate: str = "Bash") -> str:
+    """`VALID_FILES`' manifest plus one approvalPolicy gate naming `route`.
+
+    A BUILT-IN tool name, so `validate_bundle`'s `mcp__` namespacing rules do
+    not apply and the declared ROUTE is the only variable -- the same isolation
+    `runner/tests/test_approval.py::_write_bundle` uses.
+    """
+
+    return json.dumps(
+        {
+            "name": "demo-plugin",
+            "version": "0.1.0",
+            "approvalPolicy": {"gates": [{"gate": gate, "route": route}]},
+        }
+    )
+
+
+def _gated_files(base: dict[str, str], route: str) -> dict[str, str]:
+    return {**base, ".claude-plugin/plugin.json": _gated_manifest(route)}
+
+
+def _gated_archive(route: str) -> bytes:
+    """The gated bundle as an uploadable tar.gz, for the API-upload half."""
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        for rel, content in _gated_files(VALID_FILES, route).items():
+            data = content.encode()
+            info = tarfile.TarInfo(f"demo-plugin/{rel}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _push_commit(
+    base_dir: Path,
+    files: dict[str, str],
+    branch: str = "dev",
+    repo_full_name: str = REPO,
+) -> str:
+    """Add a commit on top of `_build_bare_repo`'s tree and move `branch` to it.
+
+    A second delivery needs a second sha: git-flow keys version reuse on
+    `commit_sha`, so re-pushing the first one would take the redelivery path
+    instead of building the new bundle. The branch really moves in the bare
+    repo, so #1139's ancestry check sees the sha on the branch it claims.
+    """
+
+    work = base_dir / "_work" / repo_full_name
+    for rel, content in files.items():
+        path = work / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    _git("add", "-A", cwd=work)
+    _git("commit", "-q", "-m", "declare an approval gate", cwd=work)
+    sha = _git("rev-parse", "HEAD", cwd=work)
+    bare = base_dir / f"{repo_full_name}.git"
+    _git("push", "--quiet", "--force", str(bare), f"HEAD:refs/heads/{branch}", cwd=work)
+    return sha
+
+
+def _bind_route(
+    client: Any,
+    headers: dict[str, str],
+    agent_id: str,
+    route: str,
+    address: str = "C000000R01",
+) -> None:
+    resp = client.patch(
+        f"/agents/{agent_id}",
+        json={"approval_routes": {route: {"resolution": {"kind": "slack", "address": address}}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def _unbound_codes(body: dict[str, Any]) -> set[str]:
+    return {e["code"] for e in body.get("errors") or []}
+
+
+def test_a_push_declaring_an_unbound_route_is_rejected_and_leaves_the_prior_deployment_active(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """AC1 on the git push path: a declared route with no binding is refused.
+
+    Plan test table (gitflow), row 1. The first push is the control -- the same
+    repository, the same agent, an ungated bundle -- so the rejection below can
+    only be the new join and not a broken delivery. The still-active first
+    deployment is the "nothing is torn down" half of question (a): a refused
+    push must leave every previously active row serving.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, first_sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    first = _post(client, "push", _push_payload("refs/heads/dev", first_sha, clone_url)).json()
+    assert first["status"] == "deployed", first
+
+    gated_sha = _push_commit(trusted_clone_base, _gated_files(VALID_FILES, "ops"))
+    body = _post(client, "push", _push_payload("refs/heads/dev", gated_sha, clone_url)).json()
+
+    assert body["status"] == "rejected", body
+    assert "approval_routes.unbound" in _unbound_codes(body), body
+    assert "'ops'" in " ".join(e["message"] for e in body["errors"]), body
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 1, deployments
+    assert deployments[0]["status"] == "active"
+    assert deployments[0]["version_id"] == first["version_id"]
+
+
+def test_a_push_declaring_a_bound_route_deploys(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """AC1's falsifiable pair for the push path: bind the route and it deploys.
+
+    Plan test table (gitflow), row 3. Byte-identical to the rejection above
+    except for the binding, so a gate that rejected every gated push would turn
+    this red.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, first_sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    _post(client, "push", _push_payload("refs/heads/dev", first_sha, clone_url))
+    _bind_route(client, auth_headers, agent_id, "ops")
+
+    gated_sha = _push_commit(trusted_clone_base, _gated_files(VALID_FILES, "ops"))
+    body = _post(client, "push", _push_payload("refs/heads/dev", gated_sha, clone_url)).json()
+
+    assert body["status"] == "deployed", body
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 2, deployments
+    assert body["version_id"] in {d["version_id"] for d in deployments}, deployments
+
+
+def test_a_prod_promote_is_refused_when_the_promoting_agent_lacks_the_binding(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """AC1, question (c): the promote is judged against the PROD agent's map.
+
+    Plan test table (gitflow), row 2. ADR-0091 lets one repository build several
+    agents, so the prod agent holds a different `approval_routes` map from the
+    dev agent that already deployed this exact artifact. The join is therefore
+    re-evaluated against the resolved target agent and never inherited from the
+    dev pass -- which is what the dev half deploying green proves.
+    """
+
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(
+        trusted_clone_base, REPO, _gated_files(TWO_TARGET_FILES, "ops")
+    )
+    _bind_route(client, auth_headers, dev_id, "ops")
+
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+    assert prod["status"] == "rejected", prod
+    assert "approval_routes.unbound" in _unbound_codes(prod), prod
+    assert "'ops'" in " ".join(e["message"] for e in prod["errors"]), prod
+
+    assert (
+        client.get("/deployments", params={"agent_id": prod_id}, headers=auth_headers).json() == []
+    )
+    assert [
+        d["environment"]
+        for d in client.get(
+            "/deployments", params={"agent_id": dev_id}, headers=auth_headers
+        ).json()
+    ] == ["dev"]
+
+
+def test_a_sibling_attach_is_refused_when_the_sibling_object_declares_an_unbound_route(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """AC1 / F1 residual: the attach path checks the object it actually attaches.
+
+    Plan test table (gitflow), row 4 -- the differing-artifact case, and the test
+    that separates the two designs. The delivery clones the ORIGINAL, UNGATED
+    commit, but ADR-0091's bundle-once/bind-many reuse attaches the SIBLING's
+    stored object, which an API upload has since made a gated one. A check that
+    read the in-hand archive would pass on the ungated bytes and then commit the
+    gated reference, and `crud.attach_bundle` commits before the deployment gate
+    runs -- so the unbound bundle would already be live on the target version,
+    which an active deployment row already points at, by the time the push is
+    rejected. The null `bundle_ref` afterwards is the assertion that carries it.
+    """
+
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, TWO_TARGET_FILES)
+
+    # The target: a git-flow version row this commit left bundleless (a store
+    # that failed after the row committed), deployed out of band through
+    # `POST /deployments`, which does not require a bundle.
+    _insert_partial_version(dev_id, sha)
+    target = client.get(f"/agents/{dev_id}/versions", headers=auth_headers).json()[0]
+    assert target["bundle_ref"] is None, target
+    activated = client.post(
+        "/deployments",
+        json={"agent_id": dev_id, "version_id": target["id"], "environment": "dev"},
+        headers=auth_headers,
+    )
+    assert activated.status_code == 201, activated.text
+
+    # The sibling: the same commit on the other agent of this repository,
+    # carrying an API-uploaded GATED bundle. A different object from the archive
+    # the redelivered push below clones.
+    _insert_partial_version(prod_id, sha)
+    sibling = client.get(f"/agents/{prod_id}/versions", headers=auth_headers).json()[0]
+    upload = client.put(
+        f"/agents/{prod_id}/versions/{sibling['id']}/bundle",
+        files={"file": ("gated.tar.gz", _gated_archive("ops"))},
+        headers=auth_headers,
+    )
+    assert upload.status_code == 201, upload.text
+
+    body = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+
+    assert body["status"] == "rejected", body
+    assert "approval_routes.unbound" in _unbound_codes(body), body
+    assert "'ops'" in " ".join(e["message"] for e in body["errors"]), body
+
+    after = client.get(f"/agents/{dev_id}/versions", headers=auth_headers).json()[0]
+    assert after["bundle_ref"] is None, (
+        "the gated sibling object was attached to an already-active version: the "
+        "attach commits before the deployment gate runs, so this is live"
+    )
+
+
+def test_a_push_attaching_a_gated_bundle_to_an_already_deployed_version_is_rejected(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """AC1 / F1: the git-flow repair route hits the same conditional attach gate.
+
+    Plan test table (API file), the git-flow repair row -- kept HERE rather than
+    in `test_approval_route_config_check.py` because it needs this module's bare
+    repositories and HMAC-signed delivery, and duplicating that plumbing into a
+    second module would give the seam two implementations to drift between.
+
+    The route: a git-flow version row committed and then left bundleless by a
+    failed store, deployed out of band through `POST /deployments` (which does
+    not require a bundle), then repaired by a redelivered push. `bundle_built` is
+    true for a null `bundle_ref`, so the delivery clones and calls
+    `deploy.store_bundle` -- attaching a gated bundle to a version an active
+    deployment ALREADY points at, which is the worker's boot join, with no
+    deployment gate ever having run. The null `bundle_ref` afterwards is the
+    load-bearing half: `crud.attach_bundle` commits immediately, so a refusal
+    that ran after it would already be live.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(
+        trusted_clone_base, REPO, _gated_files(VALID_FILES, "ops")
+    )
+
+    _insert_partial_version(agent_id, sha)
+    target = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
+    assert target["bundle_ref"] is None, target
+    activated = client.post(
+        "/deployments",
+        json={"agent_id": agent_id, "version_id": target["id"], "environment": "dev"},
+        headers=auth_headers,
+    )
+    assert activated.status_code == 201, activated.text
+
+    body = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+
+    assert body["status"] == "rejected", body
+    assert "approval_routes.unbound" in _unbound_codes(body), body
+    assert "'ops'" in " ".join(e["message"] for e in body["errors"]), body
+
+    after = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
+    assert after["bundle_ref"] is None, (
+        "the gated bundle was stored onto an already-active version: the attach "
+        "commits before the deployment gate runs, so this is live"
+    )
+    assert [d["id"] for d in client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()] == [activated.json()["id"]]
+
+
+# --------------------------------------------------------------------------- #
+# Stage 5 regression pins for the Code Reviewer's two P2 findings on #2436.
+# Both are consequences of WHERE the new gate sits rather than of what it
+# decides, so both are driven end to end through a signed delivery and read
+# only the webhook body, `GET /deployments`, `GET /agents/{id}/versions` and the
+# recorded eval queue.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_rejected_push_that_is_bound_and_redelivered_deploys_and_fans_out_exactly_one_eval(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """Code review P2 (`gitflow.py:735-738`): AC1's refusal must not eat the eval fan-out.
+
+    The refused push has ALREADY committed its version row and stored its bundle
+    by the time the deployment gate rejects it, so once the operator binds the
+    missing route the redelivery finds `bundle_built` false, takes the reuse
+    path, and deploys a version eval-as-CI never ran against: the fan-out is
+    skipped permanently because the only delivery that would have enqueued it
+    was the one that was refused.
+
+    The queue is recorded across BOTH deliveries on purpose, the same way
+    `test_a_redelivered_dev_push_reuses_the_version_without_rebuilding` does:
+    zero after the rejection and exactly one after the repair is what separates
+    "the recovery path fans out" from "the fan-out stopped working entirely",
+    and from "the refusal leaked an eval for a version that never deployed".
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, _gated_files(VALID_FILES, "ops"))
+    # The SAME payload both times: a redelivery from the GitHub deliveries UI is
+    # byte-identical, and version reuse keys on `after`, so a second sha would
+    # test the ordinary first-delivery path instead of the recovery one.
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+
+    eval_queue = _RecordingEvalQueue()
+    client.app.dependency_overrides[get_eval_queue] = lambda: eval_queue
+    try:
+        refused = _post(client, "push", payload).json()
+        assert refused["status"] == "rejected", refused
+        assert "approval_routes.unbound" in _unbound_codes(refused), refused
+        assert eval_queue.jobs == [], "a refused push must not fan out an eval"
+        assert (
+            client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json()
+            == []
+        )
+
+        # The operator does exactly what the refusal told them to do.
+        _bind_route(client, auth_headers, agent_id, "ops")
+
+        redelivered = _post(client, "push", payload).json()
+    finally:
+        client.app.dependency_overrides.pop(get_eval_queue, None)
+
+    assert redelivered["status"] == "deployed", redelivered
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 1, deployments
+    assert deployments[0]["status"] == "active", deployments
+    assert deployments[0]["version_id"] == redelivered["version_id"], deployments
+
+    assert len(eval_queue.jobs) == 1, (
+        "the repaired push went live on a version eval-as-CI never ran against: the "
+        "refused delivery stored the bundle, so the redelivery took the reuse path"
+    )
+    assert str(eval_queue.jobs[0].version_id) == redelivered["version_id"], eval_queue.jobs
+    assert eval_queue.jobs[0].sha == sha, eval_queue.jobs
+
+
+def test_a_live_sibling_attach_whose_stored_object_exceeds_the_current_cap_reports_bundle_too_large(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Code review P2 (`deploy.py:204-210`): AC1's sibling gate must keep the size contract.
+
+    The conditional attach gate reads the SIBLING's stored object, which is a
+    different object from the freshly cloned archive `deploy.validate_archive`
+    passed moments earlier, so an operator who tightens the caps under a legacy
+    sibling makes `check_routes_from_bytes` raise an uncaught extraction
+    error straight out of the webhook handler. ADR-0059 decision 3 commits to a
+    specific operator-facing outcome for stored bytes that no longer fit the
+    current caps, and the gate runs BEFORE `revalidate_stored_bundle` on this
+    path, so the translation has to happen where the extraction does.
+
+    The cloned archive is deliberately far under the tightened cap and the
+    stored sibling far over it, so the cap is the only variable: a delivery that
+    reported `bundle.unsupported` for the clone instead would be a different
+    test.
+    """
+
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, TWO_TARGET_FILES)
+
+    # The target: a git-flow version row left bundleless by a store that failed
+    # after the row committed, deployed out of band through `POST /deployments`.
+    # That is what makes `attach_is_live` true and puts the sibling gate on the
+    # path at all.
+    _insert_partial_version(dev_id, sha)
+    target = client.get(f"/agents/{dev_id}/versions", headers=auth_headers).json()[0]
+    assert target["bundle_ref"] is None, target
+    activated = client.post(
+        "/deployments",
+        json={"agent_id": dev_id, "version_id": target["id"], "environment": "dev"},
+        headers=auth_headers,
+    )
+    assert activated.status_code == 201, activated.text
+
+    # The sibling: the same commit on the other agent of this repository
+    # (ADR-0091), carrying an object stored under the DEFAULT caps that is far
+    # larger than the archive this delivery clones. The filler is incompressible
+    # so the upload clears the compression-ratio cap and the uncompressed-size
+    # cap tightened below is the only thing that can refuse it. It declares no
+    # approvalPolicy, so `approval_routes.unbound` is not an available answer
+    # and `bundle.too_large` is the only correct one.
+    _insert_partial_version(prod_id, sha)
+    sibling = client.get(f"/agents/{prod_id}/versions", headers=auth_headers).json()[0]
+    members: dict[str, bytes] = {rel: text.encode() for rel, text in VALID_FILES.items()}
+    members["filler.bin"] = os.urandom(500_000)
+    legacy = io.BytesIO()
+    with tarfile.open(fileobj=legacy, mode="w:gz") as archive:
+        for rel, data in members.items():
+            info = tarfile.TarInfo(f"demo-plugin/{rel}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    upload = client.put(
+        f"/agents/{prod_id}/versions/{sibling['id']}/bundle",
+        files={"file": ("legacy.tar.gz", legacy.getvalue())},
+        headers=auth_headers,
+    )
+    assert upload.status_code == 201, upload.text
+
+    # Now the caps move under it: well above the cloned archive, well below the
+    # stored sibling object.
+    _tighten_uncompressed_cap(monkeypatch, "100000")
+
+    body = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+
+    assert body["status"] == "rejected", body
+    assert {e["code"] for e in body["errors"]} == {"bundle.too_large"}, body
+
+    after = client.get(f"/agents/{dev_id}/versions", headers=auth_headers).json()[0]
+    assert after["bundle_ref"] is None, (
+        "the over-cap sibling object was attached to an already-active version"
+    )
+    assert [
+        d["id"]
+        for d in client.get(
+            "/deployments", params={"agent_id": dev_id}, headers=auth_headers
+        ).json()
+    ] == [activated.json()["id"]]

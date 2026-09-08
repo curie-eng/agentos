@@ -41,6 +41,16 @@ async def create_deployment(
         await deploy.revalidate_stored_bundle(store, version)
     except deploy.BundleTooLarge as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    # The declared/bound approval-route join (#2436): this is the first moment
+    # both halves are known for a specific agent, and the moment the version
+    # becomes the thing that boots. AFTER the bounds check above, so an over-cap
+    # legacy bundle keeps reporting `bundle.too_large` rather than surfacing as
+    # an extraction failure in here (ADR-0059 decision 3's error contract), and
+    # in FRONT of the row creation, so a refusal leaves nothing behind.
+    try:
+        await deploy.check_approval_route_bindings(store, version, agent.approval_routes)
+    except deploy.ApprovalRoutesUnbound as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     deployment = await crud.create_deployment(session, data)
     return DeploymentOut.model_validate(deployment)
 
