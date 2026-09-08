@@ -2049,7 +2049,20 @@ fn resolve_preserved_runner_identity_values(
 
     let mut references =
         resolve_credential_values(existing, operator_sets, MODEL_CREDENTIAL_REFERENCE_KEYS);
-    if opts.fake_model || opts.local_model.is_some() || opts.credentials.is_some() {
+    // `--local-model` and `--credentials` each SUPPLY a replacement for the
+    // credential family, so clearing the recorded reference is the documented
+    // rule above: an explicit input replaces its recorded family.
+    //
+    // `--fake-model` supplies nothing. It suppresses the model for this run, and
+    // clearing on it destroyed the operator's BYO Secret wiring as a side effect
+    // of a temporary, offline, diagnostic switch. `cluster up` is a FULL upgrade
+    // rather than `--reuse-values`, so the blank was recorded and the next plain
+    // `up` preserved the blank: the ordinary sequence `up --fake-model` (take the
+    // model out of the picture) then `up` (put it back) silently did not put it
+    // back, and nothing said so (#2459). Preserving costs a mounted, unused
+    // credential on the warm pod; destroying costs a reference nobody can
+    // recover. Ambiguity keeps the recorded value.
+    if opts.local_model.is_some() || opts.credentials.is_some() {
         for (_, value) in &mut references {
             value.clear();
         }
@@ -4369,6 +4382,14 @@ impl UpValuePlan {
 }
 
 fn model_credential_source_is_set(opts: &UpOpts) -> bool {
+    // `--fake-model` wins over every credential source, exactly as it already
+    // wins over an environment credential in `resolve_up_credentials`. Without
+    // this, preserving a recorded `credentialsExistingSecret` (#2459) would make
+    // the caller pin `fakeModel=false` off the very value it just preserved, and
+    // `--fake-model` would silently install the real model instead.
+    if opts.fake_model {
+        return false;
+    }
     opts.credentials.is_some()
         || final_operator_value(opts, MODEL_CREDENTIAL_REFERENCE_KEYS[0])
             .is_some_and(|value| !value.is_empty())
@@ -12398,10 +12419,12 @@ mod tests {
     #[test]
     fn existing_secret_preservation_respects_runner_modes_and_last_inline_value() {
         let existing = byo_preservation_fixture();
-        for mode in ["fake", "local", "inline"] {
+        // Both of these SUPPLY a replacement credential, so the recorded
+        // reference is obsolete and must go. `--fake-model` supplies nothing and
+        // is covered separately below (#2459).
+        for mode in ["local", "inline"] {
             let mut input = completed_dev_up(None, vec![]);
             match mode {
-                "fake" => input.fake_model = true,
                 "local" => input.local_model = Some("acme-model".into()),
                 _ => input.credentials = Some("replacement".into()),
             }
@@ -14971,6 +14994,79 @@ mod tests {
             )
             .is_err(),
             "the conflict guard matches the key trimmed on both ends"
+        );
+    }
+
+    /// #2459: `--fake-model` must IGNORE a recorded BYO credential reference,
+    /// not destroy it.
+    ///
+    /// `cluster up` is a full upgrade, so a blank re-passed here is what Helm
+    /// records, and the next plain `up` preserves the blank. The ordinary
+    /// sequence -- `up --fake-model` to take the model out of the picture, then
+    /// `up` to put it back -- silently stopped putting it back, with no warning
+    /// and no way to notice until someone looked for the credential.
+    #[test]
+    fn fake_model_preserves_a_recorded_byo_credential_reference() {
+        let existing = byo_preservation_fixture();
+        let mut input = completed_dev_up(None, vec![]);
+        input.fake_model = true;
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            Some("acme-credentials"),
+            "--fake-model supplies no replacement, so it must not clear the reference"
+        );
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecretKey"),
+            Some("credentials-custom"),
+            "the key travels with the reference; half of a reference is not one"
+        );
+
+        // Preserving it must not turn the fake model back into the real one:
+        // `up_value_plan` pins `fakeModel=false` off any credential source, and
+        // the preserved reference is exactly such a source.
+        assert_eq!(
+            up_value_plan(&opts).effective_values().get(FAKE_MODEL_KEY),
+            None,
+            "--fake-model must not pin fakeModel=false off the value it preserved"
+        );
+
+        // And the recovery the defect broke: a following plain `up` reads the
+        // still-recorded reference and selects the real model again, with no
+        // operator re-supply.
+        let recovered = completed_dev_up(Some(&existing), vec![]);
+        assert_eq!(
+            secret_for(&recovered, "agentSandbox.runner.credentialsExistingSecret"),
+            Some("acme-credentials")
+        );
+        assert_eq!(
+            up_value_plan(&recovered)
+                .effective_values()
+                .get(FAKE_MODEL_KEY)
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    /// #2459: an explicit operator `--set` still owns the key outright, and
+    /// `--fake-model` does not resurrect a reference the operator cleared.
+    #[test]
+    fn fake_model_leaves_an_operator_set_credential_reference_alone() {
+        let existing = byo_preservation_fixture();
+        let mut input = completed_dev_up(
+            None,
+            vec!["agentSandbox.runner.credentialsExistingSecret=".into()],
+        );
+        input.fake_model = true;
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            None,
+            "the operator set the key, so the CLI supplies nothing for it"
         );
     }
 }
