@@ -34,7 +34,8 @@ use crate::chat::{
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{
-    self, connect, diagnostics, eval_case_turn, queue_thread_reset, synthetic_turn, xadd,
+    self, connect, diagnostics, eval_case_turn, queue_thread_reset, synthetic_turn,
+    thread_key_for_turn, xadd,
 };
 use crate::state::{save_turn, TurnContext, TurnVerb};
 
@@ -3449,8 +3450,11 @@ async fn run_eval_turns(
                     &placeholder_ts,
                     Some(reply_endpoint),
                 );
-                let conversation_id = event.conversation_id.clone();
-                eval_threads.push(conversation_id.clone());
+                // The worker claims under quote(kind):quote(channel):quote(conversation_id),
+                // not the bare eval-prefixed conversation_id. SADD the scoped key
+                // or the drain is a no-op and the sandbox keeps its quota slot (#2259).
+                let thread_key = thread_key_for_turn(&event);
+                eval_threads.push(thread_key.clone());
                 let started = Instant::now();
                 let stream_id = xadd(conn, &opts.stream, &event).await?;
                 let mut observe_update = |_: &str| {};
@@ -3467,7 +3471,7 @@ async fn run_eval_turns(
                 // Release this sample's sandbox on every completed/red/timed-out
                 // path so a three-case suite run twice cannot pin eight
                 // curie-thread-* claims against the default ResourceQuota (#1534).
-                queue_thread_reset(conn, &conversation_id).await?;
+                queue_thread_reset(conn, &thread_key).await?;
                 let elapsed = started.elapsed().as_secs_f64();
                 let output = match &outcome {
                     Outcome::Replied(reply) => reply.clone(),
@@ -3515,8 +3519,8 @@ async fn run_eval_turns(
     let result = run.await;
     // Suite error/cancel: still queue every case we enqueued, including the
     // in-flight one, so an abandoned retry cannot bind a late sandbox.
-    for conversation_id in &eval_threads {
-        let _ = queue_thread_reset(conn, conversation_id).await;
+    for thread_key in &eval_threads {
+        let _ = queue_thread_reset(conn, thread_key).await;
     }
     bar.finish();
     result
@@ -4849,11 +4853,15 @@ mod tests {
             "each eval case must mint through eval_case_turn so the enqueued conversation_id is isolated"
         );
         assert!(
-            src.contains("queue_thread_reset(conn, &conversation_id)"),
-            "each eval case must queue its isolated conversation_id for sandbox release"
+            src.contains("thread_key_for_turn(&event)"),
+            "each eval case must SADD the worker's scoped thread key, not the bare conversation_id"
         );
         assert!(
-            src.contains("for conversation_id in &eval_threads"),
+            src.contains("queue_thread_reset(conn, &thread_key)"),
+            "each eval case must queue its scoped thread key for sandbox release"
+        );
+        assert!(
+            src.contains("for thread_key in &eval_threads"),
             "suite error/cancel must still queue every enqueued eval thread"
         );
     }

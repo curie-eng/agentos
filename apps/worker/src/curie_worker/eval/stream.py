@@ -631,7 +631,13 @@ class EvalStreamConsumer(StreamConsumer):
             )
         finally:
             if release_key is not None:
-                await asyncio.to_thread(self._substrate.release, release_key)
+                # wait_gone: Kubernetes delete returns before the pod is gone,
+                # and a still-terminating eval sandbox pins ResourceQuota so the
+                # ladder's post-eval cluster message cannot bind inside 45s
+                # (#2259). The wait is here, after the suite and before the
+                # matrix report the CLI polls, so eval returning means quota is
+                # free.
+                await asyncio.to_thread(self._substrate.release, release_key, wait_gone=True)
 
         if run_result is None:
             return await self._report_failed(

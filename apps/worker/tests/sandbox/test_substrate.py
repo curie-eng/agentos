@@ -324,6 +324,112 @@ def test_release_deletes_claim_and_route(
     assert not substrate.release("T1")
 
 
+@dataclass
+class _DelayedDeleteClient(FakeSandboxClient):
+    """A Kubernetes delete that returns before quota is free.
+
+    Production ``delete_namespaced_custom_object`` is fire-and-forget. The
+    SandboxClaim can disappear before its sandbox/pod, and ResourceQuota
+    charges the pod. Claim-only wait is the #2259 false pass.
+    """
+
+    claim_gone_after_gets: int = 2
+    sandbox_gone_after_gets: int = 4
+    claim_gets: dict[str, int] = field(default_factory=dict)
+    sandbox_gets: dict[str, int] = field(default_factory=dict)
+
+    def delete_claim(self, name: str) -> None:
+        claim = self.claims.get(name)
+        if claim is None or name in self.claim_gets:
+            return
+        self.claim_gets[name] = 0
+        self.sandbox_gets[claim.sandbox_name] = 0
+        self.deleted.append(name)
+
+    def get_claim(self, name: str) -> ClaimView | None:
+        if name in self.claim_gets:
+            self.claim_gets[name] += 1
+            if self.claim_gets[name] >= self.claim_gone_after_gets:
+                # Drop the CR only. The sandbox/pod can outlive it.
+                self.claims.pop(name, None)
+                return None
+        return super().get_claim(name)
+
+    def get_sandbox(self, name: str) -> SandboxView | None:
+        if name in self.sandbox_gets:
+            self.sandbox_gets[name] += 1
+            if self.sandbox_gets[name] >= self.sandbox_gone_after_gets:
+                self.sandboxes.pop(name, None)
+                return None
+        return super().get_sandbox(name)
+
+
+def test_release_without_wait_gone_returns_while_claim_still_counts(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """#2259 negative: issuing delete is not the same as freeing quota.
+
+    A following claim that races the controller still sees the dying pod.
+    """
+
+    fake_k8s = _DelayedDeleteClient()
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    handle = substrate.claim("T-eval-1")
+    assert substrate.release("T-eval-1")
+    assert handle.claim_name in fake_k8s.claims
+    assert handle.sandbox_name in fake_k8s.sandboxes
+    assert handle.claim_name in fake_k8s.deleted
+
+
+def test_release_wait_gone_blocks_until_claim_and_sandbox_are_absent(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """#2259: eval-owned sandboxes must not pin ResourceQuota after the suite.
+
+    The claim CR can vanish while the pod still counts. ``wait_gone=True``
+    polls both so the next cluster message can bind inside 45s.
+    """
+
+    fake_k8s = _DelayedDeleteClient(claim_gone_after_gets=2, sandbox_gone_after_gets=4)
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+        release_gone_timeout_seconds=2.0,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-eval-1")
+    assert substrate.release("T-eval-1", wait_gone=True)
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name not in fake_k8s.sandboxes
+    assert fake_k8s.get_claim(handle.claim_name) is None
+    assert fake_k8s.get_sandbox(handle.sandbox_name) is None
+
+
+def test_release_wait_gone_does_not_return_when_only_the_claim_has_vanished(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """#2259 negative: a claim-only wait would pass while the pod still
+    holds ResourceQuota. The sandbox outlives the CR here.
+    """
+
+    fake_k8s = _DelayedDeleteClient(
+        claim_gone_after_gets=1,
+        sandbox_gone_after_gets=10_000,
+    )
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+        release_gone_timeout_seconds=0.05,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-eval-1")
+    assert substrate.release("T-eval-1", wait_gone=True)
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name in fake_k8s.sandboxes
+
+
 def test_reap_orphans_deletes_unrouted_claims(
     substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
 ) -> None:
