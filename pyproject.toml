@@ -182,6 +182,7 @@ testpaths = [
     "tools/e2e-ci-selection/tests",
     "tools/sdk-lock-gate/tests",
     "tools/p0-closes-ci/tests",
+    "tools/ci-release-target-parity/tests",
 ]
 
 [tool.ruff]
