@@ -43,8 +43,19 @@ def _wire_process_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CURIE_FAKE_MODEL", "1")
     monkeypatch.setattr(RunnerConfig, "from_env", lambda _env: config)
     monkeypatch.setattr(boot, "_resolve_harness", lambda _name: object())
-    monkeypatch.setattr(boot, "_load_memory", lambda _config: (object(), None))
-    monkeypatch.setattr(boot, "_load_history", lambda _config: (object(), None))
+
+    async def _fake_fetches(
+        _config: object, _fake_model: bool, _sdk_env: object
+    ) -> boot._BootFetches:
+        return boot._BootFetches(
+            memory_store=object(),  # type: ignore[arg-type]
+            memory_preamble=None,
+            history_store=object(),  # type: ignore[arg-type]
+            conversation_preamble=None,
+            mcp_capability=None,
+        )
+
+    monkeypatch.setattr(boot, "_load_boot_fetches", _fake_fetches)
     monkeypatch.setattr(boot, "build_runner", lambda *_args, **_kwargs: _Runner())
     monkeypatch.setattr(
         boot,

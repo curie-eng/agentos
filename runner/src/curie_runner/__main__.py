@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import anyio
@@ -48,13 +49,12 @@ from .history import (
     DEFAULT_PREAMBLE_MAX_BYTES,
     DEFAULT_PREAMBLE_MAX_TURNS,
     TranscriptStore,
-    TurnRecord,
     format_conversation_preamble,
     resolve_history,
 )
 from .hooks import _merge_pre_tool_use_hooks, load_bundle_hooks
-from .mcp_tool_capability import probe_mcp_tool_capability
-from .memory import MemoryRecord, MemoryStore, format_memory_preamble, resolve_memory
+from .mcp_tool_capability import McpToolCapabilityProbe, probe_mcp_tool_capability
+from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
@@ -126,6 +126,7 @@ def build_runner(
     memory_preamble: str | None = None,
     history_store: TranscriptStore | None = None,
     conversation_preamble: str | None = None,
+    mcp_capability: McpToolCapabilityProbe | None = None,
     harness: HarnessContribution | None = None,
     workspace_path: Path | None = None,
 ) -> SessionRunner:
@@ -261,12 +262,14 @@ def build_runner(
         # and probe failures preserve the historical fail-closed behavior. The
         # annotation remains a non-authoritative hint: it never authorizes or
         # denies tool execution.
-        capability = anyio.run(
-            probe_mcp_tool_capability,
-            config.session.plugin_dir,
-            derived_mcp_servers,
-            sdk_env,
-        )
+        capability = mcp_capability
+        if capability is None:
+            capability = anyio.run(
+                probe_mcp_tool_capability,
+                config.session.plugin_dir,
+                derived_mcp_servers,
+                sdk_env,
+            )
         observed_readonly_tools = capability.readonly_tools
         carries_request_approval = (
             carries_explicit_action_gate or capability.has_potential_write_tool
@@ -379,7 +382,7 @@ def build_runner(
     )
 
 
-def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
+async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     """Resolve CURIE_MEMORY_REF and load prior memory into a boot preamble.
 
     Runs synchronously at boot (before the port is up), so a bad ref or an
@@ -389,12 +392,8 @@ def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     """
 
     store = resolve_memory(config.session.memory_ref, os.environ)
-
-    async def _load() -> list[MemoryRecord]:
-        return await store.load()
-
     try:
-        records = anyio.run(_load)
+        records = await store.load()
     except Exception as exc:  # noqa: BLE001 - degrade to no-memory, never fail boot
         logger.warning(
             "memory load failed session=%s error_class=%s: %s (booting without memory)",
@@ -407,7 +406,7 @@ def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     return store, format_memory_preamble(records)
 
 
-def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
+async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
     """Resolve CURIE_HISTORY_REF and load this thread's transcript into a preamble.
 
     Mirrors ``_load_memory`` (ADR-0029): runs synchronously at boot so a bad ref
@@ -433,12 +432,8 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
         if config.history_max_bytes is not None
         else DEFAULT_PREAMBLE_MAX_BYTES
     )
-
-    async def _load() -> list[TurnRecord]:
-        return await store.load()
-
     try:
-        turns = anyio.run(_load)
+        turns = await store.load()
     except Exception as exc:  # noqa: BLE001 - degrade to no-history, never fail boot
         logger.warning(
             "history load failed session=%s error_class=%s: %s (booting without history)",
@@ -449,6 +444,80 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
         return store, None
     logger.info("history loaded session=%s turns=%d", config.session.session_id, len(turns))
     return store, format_conversation_preamble(turns, max_turns=max_turns, max_bytes=max_bytes)
+
+
+@dataclass(frozen=True)
+class _BootFetches:
+    """Independent boot-time loads that previously ran as sequential anyio.run calls."""
+
+    memory_store: MemoryStore
+    memory_preamble: str | None
+    history_store: TranscriptStore
+    conversation_preamble: str | None
+    mcp_capability: McpToolCapabilityProbe | None
+
+
+async def _load_boot_fetches(
+    config: RunnerConfig,
+    fake_model: bool,
+    sdk_env: dict[str, str] | None,
+) -> _BootFetches:
+    """Load memory, history, and (on the real-model path) MCP capability together.
+
+    Each loader keeps its own exception handling: a transient memory or history
+    failure degrades only that preamble, and a probe failure still returns the
+    fail-closed capability. A bad ref still fails the process visibly because
+    resolve runs before the task group, so MemoryError/HistoryError raise
+    directly rather than as an ExceptionGroup from a cancelled sibling.
+    """
+
+    # Fail-visible resolve stays outside the task group so a bad scheme still
+    # raises the same error type sequential boot raised. The loaders resolve
+    # again internally; that is cheap and keeps each loader self-contained.
+    resolve_memory(config.session.memory_ref, os.environ)
+    resolve_history(config.history_ref, os.environ)
+
+    memory: tuple[MemoryStore, str | None] | None = None
+    history: tuple[TranscriptStore, str | None] | None = None
+    capability: McpToolCapabilityProbe | None = None
+
+    async def load_memory() -> None:
+        nonlocal memory
+        memory = await _load_memory(config)
+
+    async def load_history() -> None:
+        nonlocal history
+        history = await _load_history(config)
+
+    async def probe() -> None:
+        nonlocal capability
+        derived = derive_mcp_servers(
+            config.session.plugin_dir,
+            release=config.connector_release,
+            agent=config.connector_agent,
+            namespace=config.connector_namespace,
+        )
+        capability = await probe_mcp_tool_capability(
+            config.session.plugin_dir,
+            derived,
+            sdk_env,
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(load_memory)
+        tg.start_soon(load_history)
+        if not fake_model:
+            tg.start_soon(probe)
+
+    assert memory is not None
+    assert history is not None
+    return _BootFetches(
+        memory_store=memory[0],
+        memory_preamble=memory[1],
+        history_store=history[0],
+        conversation_preamble=history[1],
+        mcp_capability=capability,
+    )
 
 
 def _serve() -> None:
@@ -489,8 +558,7 @@ def _serve() -> None:
         except UnsupportedCredentialError as exc:
             logger.error("credential resolution failed: %s", exc)
             raise
-    memory_store, memory_preamble = _load_memory(config)
-    history_store, conversation_preamble = _load_history(config)
+    fetches = anyio.run(_load_boot_fetches, config, fake_model, override)
     workspace_candidate = Path("/workspace")
     workspace_path: Path | None = (
         workspace_candidate
@@ -501,13 +569,15 @@ def _serve() -> None:
         config,
         fake_model=fake_model,
         sdk_env=override,
-        memory_store=memory_store,
-        memory_preamble=memory_preamble,
-        history_store=history_store,
-        conversation_preamble=conversation_preamble,
+        memory_store=fetches.memory_store,
+        memory_preamble=fetches.memory_preamble,
+        history_store=fetches.history_store,
+        conversation_preamble=fetches.conversation_preamble,
+        mcp_capability=fetches.mcp_capability,
         harness=harness,
         workspace_path=workspace_path,
     )
+
     def capture_mounted_workspace() -> WorkspaceSnapshot:
         # The sanitized, credential-free origin in /workspace/.git/config is
         # the repository fact. The proposal is runner-held state from the
