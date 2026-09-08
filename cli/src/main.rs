@@ -4822,15 +4822,33 @@ async fn run(command: Option<Command>) -> Result<()> {
             // Discover independently. `zip` required both flags, so a bare
             // `curie doctor` never reached the platform API (#1367). Errors
             // are discarded inside `doctor`: gather is failure-tolerant.
-            emit(
-                curie::doctor::doctor(
-                    &target.namespace,
-                    &target.release,
-                    api_url.as_deref(),
-                    api_key.as_deref(),
-                )
-                .await,
+            let out = curie::doctor::doctor(
+                &target.namespace,
+                &target.release,
+                api_url.as_deref(),
+                api_key.as_deref(),
             )
+            .await;
+            if out.release_not_serving() {
+                let release = out
+                    .checks
+                    .iter()
+                    .find(|check| check.id == "release")
+                    .expect("release_not_serving requires a release check");
+                let fix = release.fix.clone().unwrap_or_else(|| {
+                    format!(
+                        "curie cluster status --namespace {} --release {}",
+                        target.namespace, target.release
+                    )
+                });
+                return Err(ui::ui().failed_report(
+                    &out,
+                    curie::exit::CliError::failure(release.detail.clone())
+                        .with_fix(fix)
+                        .into(),
+                ));
+            }
+            emit(out)
         }
         Some(Command::Diff { file, chart }) => {
             let cfg = curie::installation::Installation::load(&file)?;
