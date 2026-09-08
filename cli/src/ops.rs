@@ -6967,6 +6967,11 @@ pub(crate) fn mail_verdict(report: &crate::mail_channel::Report) -> MailVerdict 
     }
 }
 
+/// How long `cluster status` waits for the values read that feeds the
+/// mail-adapter gate. It is an optional input to one diagnosis, not part of the
+/// report, so it must never be the reason the command produces nothing.
+const VALUES_READ_FOR_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// Whether the operator has the mail adapter turned OFF, so status must not
 /// probe for it at all -- the gate `doctor` already applies.
 ///
@@ -7024,11 +7029,21 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         convergence::observe(&opts),
         release_fullname(&opts.namespace, &opts.release),
         discover_host(),
-        // The mail-adapter gate below, and NOTHING else: `?` is deliberately
-        // never applied to this one, so a values read that fails cannot turn a
-        // reachable cluster's status into an error.
-        fetch_release_computed_values(&opts),
+        // The mail-adapter gate below, and NOTHING else. Two guards, both
+        // required: `?` is deliberately never applied to it, so a values read
+        // that FAILS cannot turn a reachable cluster's status into an error;
+        // and it is bounded, because `run_capture` waits on its subprocess
+        // without a deadline, so a helm that never returns would otherwise hold
+        // the whole `join!` and produce no status output at all. A timeout is
+        // treated exactly like a failed read.
+        tokio::time::timeout(
+            VALUES_READ_FOR_GATE_TIMEOUT,
+            fetch_release_computed_values(&opts),
+        ),
     );
+    let computed = computed.unwrap_or_else(|_| {
+        Err(crate::exit::CliError::failure("timed out reading computed Helm values").into())
+    });
 
     // (a) Helm release state -> a bright header line.
     let (helm_ok, helm_out, helm_err) = helm?;

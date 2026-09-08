@@ -59,7 +59,7 @@ impl Fixture {
         .unwrap();
         let script = r#"#!/bin/sh
 case "${0##*/}:$*" in
-  kubectl:*--raw*) cat "${0%/*}/status.json"; exit 0 ;;
+  kubectl:*--raw*) printf '%s\n' "$*" >> "${0%/*}/proxy-calls"; cat "${0%/*}/status.json"; exit 0 ;;
   kubectl:"get pods"*) cat "${0%/*}/pods.json"; exit 0 ;;
   kubectl:"config current-context") printf '%s\n' 'owned-test'; exit 0 ;;
   kubectl:*"component=api"*) printf '%s\n' 'acme-api'; exit 0 ;;
@@ -72,7 +72,9 @@ case "${0##*/}:$*" in
     exit 0 ;;
   helm:version*) printf '%s\n' 'v3.14.0'; exit 0 ;;
   helm:list*) printf '%s\n' '[{"name":"acme","chart":"curie-0.8.7"}]'; exit 0 ;;
-  helm:"get values"*) cat "${0%/*}/values.json"; exit 0 ;;
+  helm:"get values"*)
+    if [ -f "${0%/*}/values-unreadable" ]; then printf '%s\n' 'Error: unreachable' >&2; exit 1; fi
+    cat "${0%/*}/values.json"; exit 0 ;;
   docker:*) exit 0 ;;
 esac
 . "${0%/*}/converged.sh"
@@ -84,6 +86,22 @@ exit 1
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         Self(temp)
+    }
+
+    /// Make `helm get values` fail, the way an unreachable API server or a
+    /// broken helm plugin does. Distinct from a release that positively does
+    /// not exist.
+    fn break_the_values_read(&self) {
+        fs::write(self.0.path().join("values-unreadable"), "").unwrap();
+    }
+
+    /// Every `/statusz` pod-proxy read the run actually made.
+    fn proxy_calls(&self) -> Vec<String> {
+        fs::read_to_string(self.0.path().join("proxy-calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     fn run(&self, verb: &str) -> Output {
@@ -183,7 +201,21 @@ fn unreadable_mail_status_is_unknown_and_does_not_render_response_data() {
         assert!(!text.contains("private-response-sentinel"));
         let value: Value = serde_json::from_str(&text).unwrap();
         if verb == "status" {
-            assert_eq!(value["healthy"], false);
+            // #2457: a diagnosis the command could not MAKE is a warning. Every
+            // pod is Ready and the release converged; an unreadable `/statusz`
+            // says nothing about that, so it must not fail the command a script
+            // uses to ask whether the release is up.
+            assert_eq!(value["healthy"], true, "{value}");
+            assert_eq!(output.status.code(), Some(0));
+            assert!(value["pods"]["unhealthy"].as_array().unwrap().is_empty());
+            assert!(
+                value["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning.as_str().unwrap().contains("unknown")),
+                "{value}"
+            );
             assert!(value["pods"]["rows"][0]["status"]
                 .as_str()
                 .unwrap()
@@ -199,4 +231,59 @@ fn unreadable_mail_status_is_unknown_and_does_not_render_response_data() {
             assert!(check["detail"].as_str().unwrap().contains("unknown"));
         }
     }
+}
+
+/// #2457: `status` must apply the `mailAdapter.deploy` gate `doctor` already
+/// has, at the real entry point.
+///
+/// The gate matters exactly when a pod still CARRIES the mail-adapter labels on
+/// a release where the operator turned mail off -- a scale-down that has not
+/// finished, an orphan from a prior revision. The fixture is that shape: an
+/// expired token on a labelled pod, `mailAdapter.deploy: false`. Replace the
+/// gate with `if true` and this test reds, because the orphan is probed and its
+/// expired token fails the command.
+#[test]
+fn status_does_not_probe_a_release_with_the_mail_adapter_turned_off() {
+    let fixture = Fixture::with_mail_adapter_deploy("expired", serde_json::json!(false));
+
+    let output = fixture.run("status");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(value["healthy"], true, "{value}");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        fixture.proxy_calls().is_empty(),
+        "a release with no mail adapter must not be probed: {:?}",
+        fixture.proxy_calls()
+    );
+    assert!(value["pods"]["unhealthy"].as_array().unwrap().is_empty());
+    assert!(value["warnings"].as_array().unwrap().is_empty(), "{value}");
+    assert_eq!(value["pods"]["rows"][0]["mail_channel"], Value::Null);
+}
+
+/// #2457: a values read that FAILED is not a falsy `mailAdapter.deploy`.
+///
+/// Suppressing the probe on an unreadable values file would lose the very
+/// diagnosis #2456 added. It is safe to probe there precisely because an
+/// unreadable ANSWER is now only a warning -- so the worst case is noise, while
+/// the alternative silently hides an expired token.
+#[test]
+fn status_still_finds_an_expired_token_when_the_values_read_fails() {
+    let fixture = Fixture::new("expired");
+    fixture.break_the_values_read();
+
+    let output = fixture.run("status");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(value["healthy"], false, "{value}");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fixture.proxy_calls().len(), 1);
+    assert!(
+        value["pods"]["unhealthy"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("expired")),
+        "{value}"
+    );
 }
