@@ -437,6 +437,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/sandbox-emptydir-sizelimit-assertions.sh
 
+      # Prove every bundle-fetch init image rendered on the SandboxTemplate is
+      # also a container image on the runner-prewarm DaemonSet, so a fresh or
+      # image-GCed node cannot cold-pull amazon/aws-cli (~418MB) inside the
+      # 90s claim window. Compares the two rendered objects; a sandbox image
+      # with no matching prewarm container fails.
+      - name: helm render assertions (prewarm bundle-fetch images)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/prewarm-bundle-fetch-assertions.sh
+
       # Prove the dispatcher is told where the platform API is and how to
       # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET
       # uses the same helper (issue #2316). Unwired, the dispatcher falls back

@@ -4450,9 +4450,13 @@ for raw in pathlib.Path(sys.argv[1]).read_text().splitlines():
         continue
     values.extend(fields[2].split())
 values = sorted(set(values))
-if len(values) != 1:
+if not values:
     raise SystemExit("component imageID is absent or inconsistent")
-print(values[0])
+# runner-prewarm also sleeps the bundle-fetch images, so the pod carries
+# more than one imageID. api/worker stay a single first-party image.
+if want != "runner-prewarm" and len(values) != 1:
+    raise SystemExit("component imageID is absent or inconsistent")
+print(" ".join(values))
 PY
 )" || { rm -f "$inventory"; return 1; }
         local_id="$(docker image inspect --format '{{.Id}}' "$tag")" || {
@@ -4460,21 +4464,22 @@ PY
             echo "local task image is missing for cluster identity preflight" >&2
             return 1
         }
-        read -r normalized_runtime normalized_local < <(python3 - "$runtime_id" "$local_id" <<'PY'
+        python3 - "$runtime_id" "$local_id" <<'PY' || {
+            rm -f "$inventory"
+            echo "cluster product imageID mismatch for $component" >&2
+            return 1
+        }
 import re, sys
 def digest(value):
     matches = re.findall(r"sha256:[0-9a-f]{64}", value.lower())
     if not matches:
         raise SystemExit("image identity has no sha256 digest")
     return matches[-1]
-print(digest(sys.argv[1]), digest(sys.argv[2]))
+local = digest(sys.argv[2])
+runtime_ids = sys.argv[1].split()
+if local not in {digest(value) for value in runtime_ids}:
+    raise SystemExit("cluster product imageID mismatch")
 PY
-        )
-        if [[ "$normalized_runtime" != "$normalized_local" ]]; then
-            rm -f "$inventory"
-            echo "cluster product imageID mismatch for $component" >&2
-            return 1
-        fi
     done
     rm -f "$inventory"
     CLUSTER_IMAGE_IDS_MATCH="true"

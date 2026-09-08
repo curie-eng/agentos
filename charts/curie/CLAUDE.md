@@ -213,8 +213,12 @@ component and rail detail in `charts/curie/README.md`.
   worker's claim timeout (live incident 2026-07-06). The runner-prewarm
   DaemonSet (`agentSandbox.runner.prewarm`) pulls the runner image at
   install/upgrade instead, and every `helm upgrade` rolls it to refresh the
-  cache. Do not flip the runner to `Always` and do not disable the prewarm
-  on `:latest`-tag clusters without accepting stale-image risk.
+  cache. When `bundleFetch.enabled` is true it also pulls
+  `agentSandbox.runner.bundleFetch.fetchImage` and `extractImage` (the sandbox
+  init pair, default `amazon/aws-cli` ~418MB plus busybox) so those are not
+  a first-claim cold pull either. Do not flip the runner to `Always` and do
+  not disable the prewarm on `:latest`-tag clusters without accepting
+  stale-image risk.
 - **`values.schema.json` is deliberately permissive, not a full contract.**
   The chart had no values schema at all before issue #1388; Helm now
   validates the ENTIRE coalesced values tree against `values.schema.json`

@@ -2001,11 +2001,14 @@ agentSandbox:
     # Runner-image prewarm DaemonSet. Keeps this image pulled and pinned on every
     # node so per-thread sandbox cold boots (imagePullPolicy IfNotPresent above)
     # bind an already-present image instead of downloading it inside the claim
-    # window. Rendered only while the sandbox substrate is deployed
+    # window. When bundleFetch.enabled is true it also pins fetchImage and
+    # extractImage (one extra sleep container each, same values keys the sandbox
+    # init pair uses) so a fresh node does not cold-pull ~418MB of aws-cli inside
+    # that same window. Rendered only while the sandbox substrate is deployed
     # (agentSandbox.deploy). Each `helm upgrade` rolls the pods (a Release-revision
     # annotation on the pod template) so the DaemonSet's `Always` pull refreshes a
     # churned `latest` -- a plain DaemonSet would not re-pull on a digest-only
-    # change since its pod spec is unchanged. Tiny idle container (sleep infinity);
+    # change since its pod spec is unchanged. Tiny idle containers (sleep infinity);
     # the point is the pinned image, not the process.
     prewarm:
       enabled: true
@@ -2095,6 +2098,11 @@ agentSandbox:
     bundleFetch:
       enabled: true
       bucket: curie-bundles
+      # Also pinned on every node by the runner-prewarm DaemonSet (one sleep
+      # container per image) so the first claim does not cold-pull these inside
+      # the 90s window. Changing a ref here must change both the sandbox init
+      # pair and the prewarm DaemonSet; ci/prewarm-bundle-fetch-assertions.sh
+      # compares the two rendered objects.
       fetchImage: amazon/aws-cli:2.32.6
       extractImage: busybox:1.36.1
       # Shared bundle volume mount point in the sandbox pod. The plugin dir the
