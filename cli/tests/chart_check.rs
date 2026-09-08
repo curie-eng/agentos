@@ -287,11 +287,10 @@ async fn discovery_skips_non_scripts_and_non_executable_files() {
     );
 }
 
-/// The set of scripts helm-ci names, recovered from the workflow rather than
-/// from a second hardcoded list.
-fn helm_ci_referenced_scripts() -> Vec<String> {
-    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/helm-ci.yaml"))
-        .expect(".github/workflows/helm-ci.yaml is committed");
+/// The direct children of `charts/curie/ci/` named by helm-ci. Runtime scripts
+/// under `ci/runtime/` are cluster checks outside chart-check's shallow render
+/// inventory, so they must not be compared with its root-only discovery.
+fn helm_ci_referenced_root_scripts_in(workflow: &str) -> Vec<String> {
     let needle = format!("{CHART_CI_DIR}/");
     let mut found: Vec<String> = Vec::new();
     for line in workflow.lines() {
@@ -300,9 +299,38 @@ fn helm_ci_referenced_scripts() -> Vec<String> {
         };
         let rest = &line[start + needle.len()..];
         let end = rest.find(".sh").expect("a referenced script ends in .sh");
-        found.push(rest[..end + 3].to_string());
+        let script = &rest[..end + 3];
+        if !script.contains('/') {
+            found.push(script.to_string());
+        }
     }
     found
+}
+
+/// The set of root scripts helm-ci names, recovered from the workflow rather
+/// than from a second hardcoded list.
+fn helm_ci_referenced_scripts() -> Vec<String> {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/helm-ci.yaml"))
+        .expect(".github/workflows/helm-ci.yaml is committed");
+    helm_ci_referenced_root_scripts_in(&workflow)
+}
+
+#[test]
+fn helm_ci_reference_inventory_excludes_nested_runtime_scripts() {
+    let workflow = r#"
+        run: bash charts/curie/ci/first-render-assertions.sh
+        run: bash charts/curie/ci/runtime/installation-runtime.sh
+        run: bash charts/curie/ci/second-render-assertions.sh
+    "#;
+
+    assert_eq!(
+        helm_ci_referenced_root_scripts_in(workflow),
+        vec![
+            "first-render-assertions.sh".to_string(),
+            "second-render-assertions.sh".to_string(),
+        ],
+        "nested runtime checks run in helm-ci but are outside chart-check's shallow root inventory"
+    );
 }
 
 /// AC5: the verb and helm-ci cannot silently diverge.

@@ -77,6 +77,25 @@ with tempfile.TemporaryDirectory() as tmp:
     ]:
         result, _ = render(chart, "--set", f"{workload}.extraEnv[0].name={name}", "--set-string", f"{workload}.extraEnv[0].value=conflict", ok=False)
         assert result.returncode != 0 and replacement in result.stderr, result.stderr
+    # Upgrade lifecycle inputs belong to Helm even when a particular worker
+    # process does not consume every field. Reserving all three prevents a
+    # retained worker.extraEnv value from rebinding a fresh installation to an
+    # old drain key, revision, or mixed-version compatibility mode (#2374).
+    for name in (
+        "CURIE_INSTALLATION_ID",
+        "CURIE_UPGRADE_REVISION",
+        "CURIE_UPGRADE_LEGACY_QUIESCE",
+    ):
+        result, _ = render(
+            chart,
+            "--set",
+            f"worker.extraEnv[0].name={name}",
+            "--set-string",
+            "worker.extraEnv[0].value=conflict",
+            ok=False,
+        )
+        assert result.returncode != 0, f"accepted reserved worker.extraEnv {name}"
+        assert "worker.extraEnv" in result.stderr and name in result.stderr, result.stderr
     for workload in workloads:
         result, _ = render(chart, "--set", f"{workload}.extraEnv[0].name=ACME_EXTENSION", "--set-string", f"{workload}.extraEnv[0].value=same", "--set", f"{workload}.extraEnv[1].name=ACME_EXTENSION", "--set-string", f"{workload}.extraEnv[1].value=same", ok=False)
         assert result.returncode != 0 and "repeats environment variable ACME_EXTENSION" in result.stderr, result.stderr

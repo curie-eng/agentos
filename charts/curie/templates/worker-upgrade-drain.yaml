@@ -45,6 +45,10 @@ clears it on the next attempt.
      derived rather than refused. */}}
 {{- $drainTimeout := include "curie.worker.upgradeDrain.timeout" . }}
 {{- $quiesceTtl := include "curie.worker.upgradeDrain.quiesceTtl" . }}
+{{- $installationId := include "curie.installationId" . }}
+{{- $installationIdObserved := include "curie.installationIdObserved" . }}
+{{- $upgradeLegacyQuiesce := include "curie.upgradeLegacyQuiesce" . }}
+{{- $upgradeRevision := .Release.Revision | toString }}
 {{- $image := include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) }}
 apiVersion: batch/v1
 kind: Job
@@ -100,7 +104,7 @@ spec:
           {{- with .Values.worker.containerSecurityContext }}
           {{- include "curie.containerSecurityContext" . | nindent 10 }}
           {{- end }}
-          command: ["python", "-m", "curie_worker.upgrade_drain", "--mode", "drain"]
+          command: ["python", "-m", "curie_worker.upgrade_drain", "--mode", "drain", "--installation-id-observed={{ $installationIdObserved }}"]
           env:
             {{- include "curie.env.valkey" . | nindent 12 }}
             # Valkey is the ONLY wiring the gate needs. Stream, group and key
@@ -115,6 +119,12 @@ spec:
               value: {{ .Values.worker.upgradeDrain.pollIntervalSeconds | quote }}
             - name: CURIE_UPGRADE_QUIESCE_TTL_S
               value: {{ $quiesceTtl | quote }}
+            - name: CURIE_INSTALLATION_ID
+              value: {{ $installationId | quote }}
+            - name: CURIE_UPGRADE_REVISION
+              value: {{ $upgradeRevision | quote }}
+            - name: CURIE_UPGRADE_LEGACY_QUIESCE
+              value: {{ $upgradeLegacyQuiesce | quote }}
           resources:
             {{- toYaml .Values.worker.upgradeDrain.resources | nindent 12 }}
 ---
@@ -167,7 +177,7 @@ spec:
           {{- with .Values.worker.containerSecurityContext }}
           {{- include "curie.containerSecurityContext" . | nindent 10 }}
           {{- end }}
-          command: ["python", "-m", "curie_worker.upgrade_drain", "--mode", "release"]
+          command: ["python", "-m", "curie_worker.upgrade_drain", "--mode", "release", "--installation-id-observed={{ $installationIdObserved }}"]
           env:
             {{- include "curie.env.valkey" . | nindent 12 }}
             # Present so the release Job builds the SAME WorkerConfig the gate
@@ -178,6 +188,12 @@ spec:
               value: {{ $drainTimeout | quote }}
             - name: CURIE_UPGRADE_QUIESCE_TTL_S
               value: {{ $quiesceTtl | quote }}
+            - name: CURIE_INSTALLATION_ID
+              value: {{ $installationId | quote }}
+            - name: CURIE_UPGRADE_REVISION
+              value: {{ $upgradeRevision | quote }}
+            - name: CURIE_UPGRADE_LEGACY_QUIESCE
+              value: {{ $upgradeLegacyQuiesce | quote }}
           resources:
             {{- toYaml .Values.worker.upgradeDrain.resources | nindent 12 }}
 {{- end }}

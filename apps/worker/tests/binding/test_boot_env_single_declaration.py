@@ -319,6 +319,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_UPGRADE_DRAIN_TIMEOUT_S",
         "CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S",
         "CURIE_UPGRADE_QUIESCE_TTL_S",
+        # Installation-scoped upgrade authority (#2374), read only by the
+        # WORKER process and its worker-image hook entrypoint. These identify
+        # which release owns a marker, fence hook revisions, and enable the
+        # one-upgrade legacy bridge; none is injected into a runner sandbox.
+        "CURIE_INSTALLATION_ID",
+        "CURIE_UPGRADE_REVISION",
+        "CURIE_UPGRADE_LEGACY_QUIESCE",
     }
 )
 

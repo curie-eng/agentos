@@ -16,6 +16,7 @@ worker:
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
+  CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_NAMESPACE: the release namespace (Helm --namespace)
   CURIE_PUBLICATION_CPU_LIMIT: worker.publication.resources.limits.cpu
   CURIE_PUBLICATION_CPU_REQUEST: worker.publication.resources.requests.cpu
@@ -52,6 +53,8 @@ worker:
   CURIE_STATUS_TEXT: worker.statusText
   CURIE_SUSPENDED_ROUTE_TTL_SECONDS: worker.suspendedRouteTtlSeconds
   CURIE_TERMINATION_GRACE_PERIOD_S: worker.terminationGracePeriodSeconds
+  CURIE_UPGRADE_LEGACY_QUIESCE: the Helm-managed mixed-version upgrade mode (remove this override)
+  CURIE_UPGRADE_REVISION: the Helm release revision (remove this override)
   CURIE_WARM_POOL: worker.warmPool
   CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS: worker.workspace.archiveTimeoutSeconds
   CURIE_WORKSPACE_BUCKET: worker.workspace.bucket
