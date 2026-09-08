@@ -260,6 +260,13 @@ LOCAL_OTEL_SINK_ACTIVE=0
 LOCAL_OTEL_ENDPOINT=""
 LOCAL_OTEL_METRICS_ENDPOINT=""
 LOCAL_OTEL_FAILURE_MODE=0
+# Snapshots for restore_local_runner_health. Values are never printed.
+LOCAL_OTEL_SAVED_CREDENTIALS=""
+LOCAL_OTEL_SAVED_API_KEY=""
+LOCAL_OTEL_SAVED_OAUTH=""
+LOCAL_OTEL_SAVED_CREDENTIALS_SET=0
+LOCAL_OTEL_SAVED_API_KEY_SET=0
+LOCAL_OTEL_SAVED_OAUTH_SET=0
 OTEL_E2E_SECRET_SENTINEL="xapp-"
 OTEL_E2E_SECRET_SENTINEL+="0-0000000000-0000000000-$$"
 
@@ -3564,13 +3571,41 @@ pin_local_source_images() {
     export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev
 }
 
+# Affinity reuses a live sandbox across worker recreation. Reap so the next
+# claim cold-boots with the injected (or restored) model env. The substrate
+# label is host-wide; this control only runs inside the local OTel case.
+reap_local_runner_sandboxes() {
+    local runners
+    runners="$(docker ps -aq --filter "label=$SANDBOX_LABEL" 2>/dev/null || true)"
+    if [[ -n "$runners" ]]; then
+        # shellcheck disable=SC2086
+        docker rm -f $runners >/dev/null 2>&1 || true
+    fi
+}
+
 inject_local_runner_failure() {
     LOCAL_OTEL_FAILURE_MODE=1
+    LOCAL_OTEL_SAVED_CREDENTIALS="${CURIE_CREDENTIALS-}"
+    LOCAL_OTEL_SAVED_API_KEY="${ANTHROPIC_API_KEY-}"
+    LOCAL_OTEL_SAVED_OAUTH="${CLAUDE_CODE_OAUTH_TOKEN-}"
+    LOCAL_OTEL_SAVED_CREDENTIALS_SET=0
+    LOCAL_OTEL_SAVED_API_KEY_SET=0
+    LOCAL_OTEL_SAVED_OAUTH_SET=0
+    [[ -n "${CURIE_CREDENTIALS+x}" ]] && LOCAL_OTEL_SAVED_CREDENTIALS_SET=1
+    [[ -n "${ANTHROPIC_API_KEY+x}" ]] && LOCAL_OTEL_SAVED_API_KEY_SET=1
+    [[ -n "${CLAUDE_CODE_OAUTH_TOKEN+x}" ]] && LOCAL_OTEL_SAVED_OAUTH_SET=1
     export CURIE_FAKE_MODEL=0
-    export CURIE_MODEL_BASE_URL="$LOCAL_OTEL_ENDPOINT"
+    # Connection-refused on the runner's own loopback: a live model cannot
+    # answer, and the OTel sink (a reachable HTTP server) is not the backend.
+    export CURIE_MODEL_BASE_URL="http://127.0.0.1:1"
     export CURIE_MODEL_API_BACKEND=messages
+    # Empty-string export, not unset: compose `.env` must not refill a live key.
+    export CURIE_CREDENTIALS=""
+    export ANTHROPIC_API_KEY=""
+    export CLAUDE_CODE_OAUTH_TOKEN=""
     docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
         up -d --force-recreate --no-deps curie-worker >/dev/null
+    reap_local_runner_sandboxes
     sleep 3
 }
 
@@ -3581,8 +3616,24 @@ restore_local_runner_health() {
         export CURIE_FAKE_MODEL=1
     fi
     unset CURIE_MODEL_BASE_URL CURIE_MODEL_API_BACKEND
+    if (( LOCAL_OTEL_SAVED_CREDENTIALS_SET )); then
+        export CURIE_CREDENTIALS="$LOCAL_OTEL_SAVED_CREDENTIALS"
+    else
+        unset CURIE_CREDENTIALS
+    fi
+    if (( LOCAL_OTEL_SAVED_API_KEY_SET )); then
+        export ANTHROPIC_API_KEY="$LOCAL_OTEL_SAVED_API_KEY"
+    else
+        unset ANTHROPIC_API_KEY
+    fi
+    if (( LOCAL_OTEL_SAVED_OAUTH_SET )); then
+        export CLAUDE_CODE_OAUTH_TOKEN="$LOCAL_OTEL_SAVED_OAUTH"
+    else
+        unset CLAUDE_CODE_OAUTH_TOKEN
+    fi
     docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
         up -d --force-recreate --no-deps curie-worker >/dev/null
+    reap_local_runner_sandboxes
     LOCAL_OTEL_FAILURE_MODE=0
     sleep 3
 }
@@ -3855,9 +3906,10 @@ case_local_otel_runner_failure() {
     echo
     echo "=== case: local runner failure is observable and recovers ==="
     # Negative evidence requires explicit ERROR status and classified_failure
-    # outcome before the restored healthy trace. This injected model_not_found
-    # is deliberately non-retryable; manufacturing a retry would weaken the
-    # kernel's bounded failure classification rather than strengthen the proof.
+    # outcome before the restored healthy trace. The injected backend is
+    # unreachable independently of prompt text and of CURIE_E2E_LIVE=1; a live
+    # model must not be able to answer the marker. runner-error is retryable,
+    # and the kernel's bounded retry still terminates as classified_failure.
     local failure_before="$WORKDIR/otel-before-failure.json"
     local restored_before="$WORKDIR/otel-before-restored.json"
     local failure_out failure_code=0 restored_out

@@ -345,7 +345,7 @@ def test_local_runner_failure_is_falsifiable_against_the_healthy_control() -> No
         "ERROR",
         "classified_failure",
         "done_delta",
-        "deliberately non-retryable",
+        "independently of prompt",
     ):
         assert required in failure, (
             f"the local failure control does not prove {required!r} against healthy"
@@ -364,6 +364,132 @@ def test_local_runner_failure_is_falsifiable_against_the_healthy_control() -> No
     assert "same traceId" in failure, (
         "the failed turn must pair its ERROR log with the failed trace"
     )
+
+
+def test_injected_runner_failure_does_not_depend_on_prompt_or_live_model() -> None:
+    """#2260: live models answer 'runner failure control'; the inject must force the fault."""
+
+    source = LADDER_PATH.read_text()
+    inject = _shell_function(source, "inject_local_runner_failure")
+    restore = _shell_function(source, "restore_local_runner_health")
+    reap = _shell_function(source, "reap_local_runner_sandboxes")
+    case = _function_body(source, "case_local_otel_runner_failure", "# Rung 1:")
+
+    assert "runner failure control" not in inject, (
+        "the inject helper must not treat prompt text as the fault"
+    )
+    assert "$LOCAL_OTEL_ENDPOINT" not in inject, (
+        "the OTel sink is a reachable HTTP server; pointing the model at it is "
+        "not an unreachable backend and a live credential can still succeed"
+    )
+    assert "http://127.0.0.1:1" in inject, (
+        "the injected backend must be connection-refused on the runner's loopback, "
+        "independent of CURIE_E2E_LIVE and of prompt text"
+    )
+    assert "export CURIE_FAKE_MODEL=0" in inject
+    for key in ("CURIE_CREDENTIALS", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        assert f'export {key}=""' in inject, (
+            f"{key} must be blanked so a live OpenRouter/Anthropic credential cannot "
+            "skip the unreachable base-URL override"
+        )
+        assert key in restore, f"restore must put {key} back for the healthy control"
+
+    assert "SANDBOX_LABEL" in reap
+    assert "docker rm -f" in reap
+    assert "reap_local_runner_sandboxes" in inject
+    assert "reap_local_runner_sandboxes" in restore
+    assert case.index("inject_local_runner_failure") < case.index(
+        "runner failure control"
+    ), "the message is only a marker; inject must run first"
+
+
+def _stub_docker_path(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A PATH prefix whose docker/sleep record compose env and ignore sleeps."""
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "docker.log"
+    env_dir = tmp_path / "compose-env"
+    env_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'if [ "$1" = "ps" ]; then printf "fake-sandbox\\n"; exit 0; fi\n'
+        'if [ "$1" = "compose" ]; then\n'
+        f'  n=0; [ -f "{env_dir}/n" ] && n="$(cat "{env_dir}/n")"\n'
+        f'  printf "%s" "$((n + 1))" > "{env_dir}/n"\n'
+        "  python3 -c '\n"
+        "import json, os, sys\n"
+        "keys = [\n"
+        '    "CURIE_FAKE_MODEL", "CURIE_MODEL_BASE_URL", "CURIE_MODEL_API_BACKEND",\n'
+        '    "CURIE_CREDENTIALS", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",\n'
+        "]\n"
+        "json.dump({k: os.environ.get(k) for k in keys}, open(sys.argv[1], \"w\"))\n"
+        f"' \"{env_dir}/$n.json\"\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    docker.chmod(0o700)
+    sleep = bin_dir / "sleep"
+    sleep.write_text("#!/bin/sh\nexit 0\n")
+    sleep.chmod(0o700)
+    return bin_dir, log, env_dir
+
+
+def test_inject_local_runner_failure_blanks_live_credentials_and_reaps(
+    tmp_path: Path,
+) -> None:
+    """Execute the real inject/restore helpers against a stub docker."""
+
+    source = LADDER_PATH.read_text()
+    script = _shell_function(source, "reap_local_runner_sandboxes")
+    script += _shell_function(source, "inject_local_runner_failure")
+    script += _shell_function(source, "restore_local_runner_health")
+    script += """
+REPO_ROOT="$1"
+SANDBOX_LABEL="curietech.ai/managed-by=curie-sandbox-substrate"
+LOCAL_OTEL_ENDPOINT="http://otel.example:4318"
+LIVE=1
+inject_local_runner_failure
+restore_local_runner_health
+"""
+    bin_dir, log, env_dir = _stub_docker_path(tmp_path)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        "CURIE_FAKE_MODEL": "0",
+        "CURIE_CREDENTIALS": "sk-or-example",
+        "ANTHROPIC_API_KEY": "sk-ant-example",
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-example",
+        "LOCAL_OTEL_ENDPOINT": "http://otel.example:4318",
+    }
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(REPO_ROOT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    env_files = sorted(env_dir.glob("*.json"), key=lambda p: int(p.stem))
+    assert len(env_files) >= 2, f"expected inject and restore compose calls, got {env_files}"
+    injected = json.loads(env_files[0].read_text())
+    restored = json.loads(env_files[-1].read_text())
+    assert injected["CURIE_FAKE_MODEL"] == "0"
+    assert injected["CURIE_MODEL_BASE_URL"] == "http://127.0.0.1:1"
+    assert injected["CURIE_MODEL_API_BACKEND"] == "messages"
+    assert injected["CURIE_CREDENTIALS"] == ""
+    assert injected["ANTHROPIC_API_KEY"] == ""
+    assert injected["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    docker_log = log.read_text()
+    assert "label=curietech.ai/managed-by=curie-sandbox-substrate" in docker_log
+    assert "rm -f" in docker_log
+    assert restored["CURIE_FAKE_MODEL"] == "0"
+    assert restored["CURIE_MODEL_BASE_URL"] in (None, "")
+    assert restored["CURIE_CREDENTIALS"] == "sk-or-example"
+    assert restored["ANTHROPIC_API_KEY"] == "sk-ant-example"
+    assert restored["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-example"
 
 
 def test_local_otel_controls_distinguish_a_live_sink_from_a_turn() -> None:
