@@ -44,10 +44,9 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    # Compress static text payloads. The single Vite JS bundle is about
-    # 567 kB raw and about 155 kB gzipped, and it is render-blocking for the
-    # SPA, so shrinking it on the wire is worth the CPU. text/html is always
-    # gzipped by nginx and cannot be listed here.
+    # Compress static text payloads. The landing JS chunk is render-blocking
+    # for the SPA, so shrinking it on the wire is worth the CPU. text/html is
+    # always gzipped by nginx and cannot be listed here.
     gzip on;
     gzip_vary on;
     gzip_comp_level 6;

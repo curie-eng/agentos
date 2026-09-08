@@ -1,5 +1,3 @@
-import JSZip from "jszip";
-
 // Packages the editor's skill.md into a Claude Code plugin bundle, client-side.
 // jszip is the packaging choice: it is the de-facto browser zip library, ships
 // its own types, and produces an archive that apps/api's zip intake accepts
@@ -69,6 +67,7 @@ export function bundleTreeFromFiles(agentName: string, files: BundleFileEntry[])
 }
 
 async function zipTree(tree: Record<string, string>): Promise<Blob> {
+  const { default: JSZip } = await import("jszip");
   const zip = new JSZip();
   for (const [path, content] of Object.entries(tree)) {
     zip.file(path, content);
