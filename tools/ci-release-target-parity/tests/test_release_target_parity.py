@@ -72,18 +72,27 @@ def _commands(run: str) -> Iterator[str]:
 
 
 def _release_cli_targets() -> set[str]:
+    """The Rust targets `release.yaml` publishes, from `cli-binaries` and only there.
+
+    Reading every job's matrix instead would look more thorough and is wrong:
+    `target:` is also buildx vocabulary for a build STAGE, so the day someone
+    writes `- target: runtime` under the image `build` matrix this gate would
+    demand `cargo build --target runtime` and red main until somebody worked out
+    why. A rename is the case worth catching, and the assertion below catches it
+    loudly.
+    """
     jobs = _workflow("release.yaml")["jobs"]
     assert "cli-binaries" in jobs, (
         "release.yaml has no cli-binaries job. Either it was renamed -- update this gate with it "
         "-- or this gate is reading the wrong workflow."
     )
-    targets: set[str] = set()
-    for job in jobs.values():
-        matrix = (job.get("strategy") or {}).get("matrix") or {}
-        for entry in matrix.get("include") or []:
-            if isinstance(entry, dict) and entry.get("target"):
-                targets.add(entry["target"])
-    assert targets, "release.yaml publishes no CLI target; this gate is reading the wrong job"
+    matrix = (jobs["cli-binaries"].get("strategy") or {}).get("matrix") or {}
+    targets = {
+        entry["target"]
+        for entry in matrix.get("include") or []
+        if isinstance(entry, dict) and entry.get("target")
+    }
+    assert targets, "cli-binaries publishes no target; this gate is reading the wrong job"
     return targets
 
 
@@ -103,7 +112,7 @@ def _unbuilt(ci: dict[str, Any]) -> list[str]:
 def test_every_released_cli_target_is_built_by_main_ci() -> None:
     missing = _unbuilt(_workflow("ci.yaml"))
     assert not missing, (
-        f"{missing} ship in release.yaml's build matrices but no ci.yaml step builds them. "
+        f"{missing} ship in release.yaml's cli-binaries matrix but no ci.yaml step builds them. "
         "A target compiled for the first time at tag time has no pre-release signal, and a break "
         "in it fails the release run with the tag already pushed (#2458, #1341). Add a ci.yaml "
         "job that builds it the same way a tag does."
