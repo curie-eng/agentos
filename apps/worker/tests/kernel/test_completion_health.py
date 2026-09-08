@@ -5,17 +5,28 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import Any
 
-from curie_worker import completion_health as completion_health_module
-from curie_worker.completion_health import (
-    observe_completion_outbox,
-    snapshot_completion_outbox,
-)
+import pytest
 from curie_worker.markers import Markers
 from redis.exceptions import ResponseError
 
 from .test_completion_outbox import _record
 from .test_otel_runtime import _install, _metrics
+
+
+def _health() -> tuple[Any, Any, Any]:
+    """Import the observer at test time so reverse-pin collection still succeeds."""
+
+    try:
+        from curie_worker import completion_health as completion_health_module
+        from curie_worker.completion_health import (
+            observe_completion_outbox,
+            snapshot_completion_outbox,
+        )
+    except ImportError:
+        pytest.fail("curie_worker.completion_health is missing")
+    return completion_health_module, observe_completion_outbox, snapshot_completion_outbox
 
 
 async def _group_pending_lag(h) -> tuple[int, int]:
@@ -38,6 +49,7 @@ async def _group_pending_lag(h) -> tuple[int, int]:
 
 def test_empty_outbox_is_not_degraded_while_the_run_queue_is_drained(make_harness) -> None:
     async def go() -> None:
+        _module, _observe, snapshot_completion_outbox = _health()
         async with make_harness(shimmer=False) as h:
             markers = Markers(h.async_redis, h.config)
             snap = await snapshot_completion_outbox(markers, h.async_redis, h.config)
@@ -54,6 +66,7 @@ def test_empty_outbox_is_not_degraded_while_the_run_queue_is_drained(make_harnes
 
 def test_inflight_completion_inside_grace_is_not_delivery_degraded(make_harness) -> None:
     async def go() -> None:
+        _module, _observe, snapshot_completion_outbox = _health()
         async with make_harness(shimmer=False, completion_sweep_grace_s=60.0) as h:
             markers = Markers(h.async_redis, h.config)
             record = _record("inflight-1", done=True, age_s=5.0)
@@ -78,6 +91,7 @@ def test_owed_completion_with_drained_queue_is_delivery_degraded_and_metrics_cha
     monkeypatch,
 ) -> None:
     async def go() -> None:
+        completion_health_module, observe_completion_outbox, _snapshot = _health()
         probe = _install(monkeypatch)
         monkeypatch.setattr(completion_health_module, "record_metric", probe.record_metric)
         async with make_harness(shimmer=False, completion_sweep_grace_s=60.0) as h:
@@ -142,6 +156,7 @@ def test_owed_completion_with_drained_queue_is_delivery_degraded_and_metrics_cha
 
 def test_observer_does_not_clear_or_relabel_an_owed_completion(make_harness) -> None:
     async def go() -> None:
+        _module, _observe, snapshot_completion_outbox = _health()
         async with make_harness(shimmer=False, completion_sweep_grace_s=1.0) as h:
             markers = Markers(h.async_redis, h.config)
             record = _record("keep-owed", done=True, age_s=30.0)
@@ -184,6 +199,7 @@ def test_stale_generation_clear_cannot_delete_a_newer_record(make_harness) -> No
 
 def test_json_status_reader_omits_run_and_session_identifiers(make_harness, caplog) -> None:
     async def go() -> None:
+        _module, _observe, snapshot_completion_outbox = _health()
         async with make_harness(shimmer=False, completion_sweep_grace_s=1.0) as h:
             markers = Markers(h.async_redis, h.config)
             record = _record("secret-event", done=True, age_s=30.0)
