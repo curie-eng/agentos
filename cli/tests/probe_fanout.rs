@@ -136,7 +136,8 @@ RULES = {
     # -- cluster status pod health ----------------------------------------
     ("kubectl", ("get", "pods", "-n", "curie", "-o", "json")): '{"items":[]}\n',
     # -- doctor release serving set (#2349) -------------------------------
-    ("kubectl", ("get", "deployments,statefulsets", "-n", "curie", "-o", "json")):
+    ("kubectl", ("get", "deployments,statefulsets", "-n", "curie", "-l",
+                 "app.kubernetes.io/instance=curie", "-o", "json")):
         '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}\n',
     # -- resolve_node_host fallback (defensive; must not fire) -------------
     ("kubectl", ("get", "nodes", "-o", "json")): '{"items":[]}\n',

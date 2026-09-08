@@ -275,7 +275,8 @@ fn release_list_status(stdout: &str, release: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn observe_ready_workloads(namespace: &str) -> Option<usize> {
+async fn observe_ready_workloads(namespace: &str, release: &str) -> Option<usize> {
+    let selector = format!("app.kubernetes.io/instance={release}");
     let (ok, out, _) = capture(
         "kubectl",
         &[
@@ -283,6 +284,8 @@ async fn observe_ready_workloads(namespace: &str) -> Option<usize> {
             "deployments,statefulsets",
             "-n",
             namespace,
+            "-l",
+            &selector,
             "-o",
             "json",
         ],
@@ -2894,7 +2897,7 @@ mod tests {
     const KUBECTL_STUB: &str = r#"#!/bin/sh
 case "$*" in
   "config current-context") printf '%s\n' 'doctor-stub-context' ;;
-  "get deployments,statefulsets -n "*) printf '%s\n' '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}' ;;
+  *"app.kubernetes.io/instance="*) printf '%s\n' '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}' ;;
   *) printf 'unexpected kubectl invocation: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#;
@@ -4692,7 +4695,7 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     let (computed, values, ready_workloads) = tokio::join!(
         crate::ops::fetch_release_computed_values(&common),
         crate::ops::fetch_release_values(&common),
-        observe_ready_workloads(namespace),
+        observe_ready_workloads(namespace, release),
     );
     f.ready_workloads = ready_workloads;
 
