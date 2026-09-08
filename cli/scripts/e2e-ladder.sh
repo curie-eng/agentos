@@ -4464,11 +4464,7 @@ PY
             echo "local task image is missing for cluster identity preflight" >&2
             return 1
         }
-        python3 - "$runtime_id" "$local_id" <<'PY' || {
-            rm -f "$inventory"
-            echo "cluster product imageID mismatch for $component" >&2
-            return 1
-        }
+        if ! python3 - "$runtime_id" "$local_id" <<'PY'
 import re, sys
 def digest(value):
     matches = re.findall(r"sha256:[0-9a-f]{64}", value.lower())
@@ -4480,6 +4476,11 @@ runtime_ids = sys.argv[1].split()
 if local not in {digest(value) for value in runtime_ids}:
     raise SystemExit("cluster product imageID mismatch")
 PY
+        then
+            rm -f "$inventory"
+            echo "cluster product imageID mismatch for $component" >&2
+            return 1
+        fi
     done
     rm -f "$inventory"
     CLUSTER_IMAGE_IDS_MATCH="true"
