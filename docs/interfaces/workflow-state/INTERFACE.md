@@ -47,6 +47,23 @@ The state API is the store today. Every route lives in
 - `list_namespaces` — the namespaces an agent has stored, each with its key count and
   last write time (#250) (`apps/api/src/curie_api/routers/state.py::list_namespaces`)
 
+Each of those six has a binding-scoped twin on
+`.../state/bindings/{kind}/{address}/...`, implemented by the same shared function:
+
+- `get_state_for_binding` (`apps/api/src/curie_api/routers/state.py::get_state_for_binding`)
+- `put_state_for_binding` (`apps/api/src/curie_api/routers/state.py::put_state_for_binding`)
+- `list_state_for_binding` (`apps/api/src/curie_api/routers/state.py::list_state_for_binding`)
+- `delete_state_for_binding` (`apps/api/src/curie_api/routers/state.py::delete_state_for_binding`)
+- `append_state_for_binding` (`apps/api/src/curie_api/routers/state.py::append_state_for_binding`)
+- `list_namespaces_for_binding` (`apps/api/src/curie_api/routers/state.py::list_namespaces_for_binding`)
+
+Identity is `(agent_id, binding_scope, namespace, key)` with
+`postgresql_nulls_not_distinct=True`
+(`apps/api/src/curie_api/models.py::WorkflowStateEntry`). A NULL `binding_scope` is
+one agent-wide shared identity (general state when the agent has `memory=True`, and
+always for the reserved `memory` / `transcript` namespaces); a non-NULL
+`"{kind}:{address}"` scope isolates general state when `memory=False`.
+
 Memory and Conversation history are the CLEAN loaders already built over this store
 (`StateApiMemoryStore`, `StateApiTranscriptStore`).
 

@@ -116,14 +116,20 @@ in code now:
   to raise to). The reconciler is a backstop, not an unconditional exactly-once guarantee: a
   worker retry loop can keep a turn live past the grace after an inline mark failure, for
   which a worker-side in-flight lease is the named follow-up.
-- **The permission gate (landed, #245).** Per-agent config
+- **The permission gate (landed, #245, #1852).** Per-agent config
   (`agents.approval_required_tools`, forwarded as `CURIE_APPROVAL_REQUIRED_TOOLS` by the
-  worker binding) marks tools approval-required; the runner intercepts those calls
-  proactively through an SDK `can_use_tool` callback (`build_can_use_tool`,
-  `runner/src/curie_runner/approval.py`) -- the call is denied before execution, and the
-  turn ends `awaiting-approval` on the same override the policy gate uses, so both trigger
-  types share one record/suspend/resume lifecycle. An agent with no configured gates keeps
-  the historical `bypassPermissions` posture verbatim (zero behavior change).
+  worker binding) marks tools approval-required. The runner intercepts those calls
+  first through an SDK `PreToolUse` hook (`build_approval_hook`,
+  `runner/src/curie_runner/approval.py::build_approval_hook`) -- the call is denied
+  before execution, and the turn ends `awaiting-approval` on the same override the
+  policy gate uses, so both trigger types share one record/suspend/resume lifecycle.
+  The SDK `can_use_tool` callback (`build_can_use_tool`,
+  `runner/src/curie_runner/approval.py::build_can_use_tool`) is the backstop for a
+  tool the hook abstains on, or if no hook is registered. The one-shot grant is
+  spent at hook decision time; a concurrent bundle `PreToolUse` matcher can still
+  veto the approved call and burn that grant (the CLI dispatches matchers on one
+  event concurrently). An agent with no configured gates keeps the historical
+  `bypassPermissions` posture verbatim (zero behavior change).
 - **The one-shot post-approval allowance (landed, #430, ADR-0035; provenance converged, #544,
   ADR-0046).** A prior gap: after an
   approval was granted and the session resumed, the resume turn re-called the gated tool
@@ -542,7 +548,9 @@ dispatcher-attested `chat` token, a live subject-bound Console session, or a sig
 subject-bound `operator` token. The platform key alone resolves nothing. A
 notification transport credential likewise confers no resolution capability: the
 notification contains no interaction, and this contract exposes no second-channel resolver.
-The runtime `canUseTool` gate (#245) will block the *tool call*, but
+The runtime `PreToolUse` hook (`build_approval_hook`, #1852) is the first interceptor
+of a gated tool call, with the SDK `canUseTool` callback (`build_can_use_tool`, #245)
+as backstop, but
 the authorization decision (who may resolve a pending approval) stays on the server that
 owns the durable `Approval` record. Policy gate points ship versioned in the bundle; route
 bindings (where the verified card resolves, where a text-only notification goes, and who may

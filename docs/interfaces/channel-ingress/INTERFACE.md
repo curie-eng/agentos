@@ -1,7 +1,7 @@
 ---
 seam: Channel / ingress
 kind: SOFT
-impls: 1
+impls: 3 production channels (Slack, Discord, email) plus CLI stub
 grade: B-
 vision_row: Communication
 epics:
@@ -16,7 +16,7 @@ order: 4
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 1 &nbsp;·&nbsp; **Swap-readiness grade:** B-
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 3 production channels (Slack, Discord, email) plus CLI stub &nbsp;·&nbsp; **Swap-readiness grade:** B-
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -52,10 +52,12 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
 - **Ingress** — `QueuedTurn` (`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`),
   a Pydantic model in the frozen ACI package with channel-neutral fields: `event_id`
   (idempotency key), `conversation_id` (the conversation/thread key routing keeps one live
-  session per), `author`, `text`, `received_at`, and `reply_handle` — a `ReplyHandle`
+  session per), `author`, `text`, `received_at`, `source` (`QueuedTurn.source`, what
+  started the turn: a person's message or a job), and `reply_handle` — a `ReplyHandle`
   (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying the required
-  `kind` and `channel` routing pair, required nullable `placeholder`, and an optional
-  per-turn `endpoint`. The Slack adapter
+  `kind` and `channel` routing pair, required nullable `placeholder`, an optional
+  per-turn `endpoint`, and optional `adapter` (`ReplyHandle.adapter`, the egress
+  adapter identity whose credential authenticates the reply). The Slack adapter
   currently supplies the pre-posted reply ts that the worker edits in place. The
   dispatcher serializes the turn to a single Stream field via `to_stream_fields`
   (`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`), keyed by
@@ -108,15 +110,15 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
 
 ## Implementations today
 
-One proven first-party production channel: Slack. Ingress is `apps/dispatcher`
-(Bolt / Socket Mode); egress is `SlackReplyAdapter`
+Three first-party production channels, plus a CLI transport stub. Slack ingress
+is `apps/dispatcher` (Bolt / Socket Mode); Slack egress is `SlackReplyAdapter`
 (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack
-Web API. `HttpReplyAdapter`
-(`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) is also
-shipped for configured non-Slack endpoints and consumes the same versioned
-neutral events, but it is not evidence of a complete second production-channel
-lifecycle. The swap proof that the protocol (not just the service) is the seam:
-the Rust CLI mints the exact
+Web API. Discord (`adapters/discord`) and email (`apps/mail-adapter`) join on
+the authenticated HTTP edge: they neither construct a `QueuedTurn` nor implement
+`ReplySink`; the worker delivers through `HttpReplyAdapter`
+(`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) to the
+binding's server-controlled endpoint. The swap proof that the protocol (not just
+the service) is the seam: the Rust CLI mints the exact
 `QueuedTurn` wire payload with the same channel-neutral fields
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact
 via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`).
@@ -141,6 +143,7 @@ tests assert the two sets equal in both directions.
 
 | `DropReason` | Documented rationale |
 |---|---|
+| `MALFORMED_ENVELOPE` | The delivery omits a field the turn is minted from -- the event id on an event, the channel, the thread key, or the interaction identity on a click -- and refusing it before the idempotency claim beats raising after it, because Bolt has already acked and would swallow the exception while the claim survived for work that never happened. |
 | `UNSUBSCRIBED_LANE` | The delivered envelope is outside the adapter's declared subscription surface — `apps/dispatcher/slack-app-manifest.yaml` subscribes to `app_mention` and `message.im` only, so a message event on any other channel type cannot legitimately arrive, and refusing it is envelope validation rather than a relevance judgement. |
 | `BOT_AUTHORED_THREAD_REPLY` | Loop guard across installations: Curie's own replies and placeholders are always threaded, so admitting a bot-authored mention that carries a thread timestamp would let two Curie installations in one workspace mention-loop each other indefinitely, which Bolt's self filter cannot stop because the two bot identities differ. An exact operator-trusted sender/channel pair may bypass this refusal; self-event suppression remains mandatory. |
 | `NON_CONTENT_SUBTYPE` | The subtype marks something other than new user content: an edit, a delete, a tombstone, a body redacted by Enterprise Key Management, or an assistant thread-start marker. |

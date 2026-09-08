@@ -72,9 +72,10 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `connectors.ambiguous`, none set is `connectors.underspecified`. A `build` block
   (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorBuild`) carries a
   bundle-relative `context`, a `dockerfile` under it, and a required non-empty `platforms` list; it
-  never carries a digest, which lives only in the lock. Every entry names the credentials it needs
-  (`secrets`, `secret_files`, `sealed_secrets`) by NAME only, never by
-  value. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
+  never carries a digest, which lives only in the lock. Every entry names the credentials it needs:
+  `secrets` and `secret_files` by NAME only, never by value; `sealed_secrets` is the exception --
+  each blob IS the credential, carried by the bundle (see
+  [sealed-credential](../sealed-credential/INTERFACE.md)). Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,
@@ -199,9 +200,10 @@ One: the `plugin_format` package. **Unlike `aci-protocol`, it is NOT tri-languag
 types.** The Pydantic models are the source of truth and a committed JSON Schema
 (`packages/plugin-format/schema/plugin-format.schema.json`) is regenerated and drift-checked by
 `packages/plugin-format/tests/test_schema_compat.py`, but there is **no generated Rust or TS** in
-the package (contrast `packages/aci-protocol/generated/`): the Rust (CLI) and TypeScript (UI)
-consumers of this format are **hand-written mirrors with no drift gate**, so a manifest field added
-here does not fail CI if those mirrors fall behind. It also carries no `PROTOCOL_VERSION`; the
+the package (contrast `packages/aci-protocol/generated/`). The CLI hand-mirrors the format in
+Rust and is kept honest by `cli/plugin-format-mirrors.json` plus `curie dev field-parity`
+(`cli/scripts/check-field-parity.sh`). The TypeScript (UI) consumer remains a hand-written
+mirror. It also carries no `PROTOCOL_VERSION`; the
 format is pinned to the Claude Code shape and the models are lenient by design so future Claude
 Code keys still validate.
 

@@ -82,7 +82,11 @@ single ownership reader.
 Where the desired objects come from is the second port, `ManifestSource`
 (`apps/worker/src/curie_worker/connector_agent.py::ManifestSource`); one agent's
 pass is `reconcile_agent`
-(`apps/worker/src/curie_worker/connector_agent.py::reconcile_agent`), and the
+(`apps/worker/src/curie_worker/connector_agent.py::reconcile_agent`) when the
+in-force version has a stored bundle, or `prune_agent`
+(`apps/worker/src/curie_worker/connector_agent.py::prune_agent`) when it does
+not (`apps/worker/src/curie_worker/connector_loop.py`). `prune_agent` never
+renders, treats desired as empty, and deletes no Secret of any name. The
 owner label is stamped by `own`
 (`apps/worker/src/curie_worker/connector_agent.py::own`).
 
