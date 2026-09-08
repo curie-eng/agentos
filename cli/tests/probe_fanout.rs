@@ -44,10 +44,12 @@
 //!    curie --all` (issued only because the Secret listing came back empty);
 //! 3. the four `gather` probes -- docker, the kube context, the helm version
 //!    and `helm list -n curie -o json`;
-//! 4. the two `helm get values` reads, computed and operator-supplied;
+//! 4. the two `helm get values` reads, computed and operator-supplied, alongside
+//!    the exact-label worker pod selection;
 //! 5. the api Service NodePort read, which needs the fullname (a cache hit, so
-//!    no second discovery) and only happens because the values carry no
-//!    ingress.
+//!    no second discovery), alongside the worker status exec, which needs the
+//!    selected Running pod. The NodePort read only happens because the values
+//!    carry no ingress.
 //!
 //! Step 2's helm hop is the second rung of `ops::discover_api_key`'s ladder:
 //! the Secret name listing answers empty, so the key is looked for in Helm's
@@ -55,7 +57,8 @@
 //! "its chart Secret API key could not be read". That is what makes the API
 //! leg observable here without an HTTP round trip. Baseline was 13 calls in 12
 //! stages, including the duplicated label-selector read; the joined
-//! implementation is 12 calls in 5.
+//! implementation is 14 calls in 5, including the two-call bounded worker
+//! claim observation.
 //!
 //! # Why the scenario makes no HTTP call
 //!
@@ -134,6 +137,12 @@ RULES = {
                  "app.kubernetes.io/instance=curie", "-o", NAMES)): "",
     # -- cluster status pod health ----------------------------------------
     ("kubectl", ("get", "pods", "-n", "curie", "-o", "json")): '{"items":[]}\n',
+    # -- exact worker claim observation -----------------------------------
+    ("kubectl", ("get", "pods", "-n", "curie", "-l", WORKER_SELECTOR, "-o", "json")):
+        '{"items":[{"metadata":{"name":"curie-worker-current","labels":{"app.kubernetes.io/instance":"curie","app.kubernetes.io/component":"worker"}},"status":{"phase":"Running"}}]}\n',
+    ("kubectl", ("exec", "-n", "curie", "curie-worker-current", "--", "python", "-m",
+                 "curie_worker.upgrade_drain", "--mode", "status", "--json")):
+        '{"state":"claims_enabled","since":null,"revision":null}\n',
     # -- resolve_node_host fallback (defensive; must not fire) -------------
     ("kubectl", ("get", "nodes", "-o", "json")): '{"items":[]}\n',
 
@@ -312,8 +321,8 @@ fn probe_stages(log: &str) -> (usize, usize, Vec<String>, Vec<String>) {
     (intervals.len(), stages, duplicates, unexpected)
 }
 
-/// `expected_calls` pins the documented probe set from the module doc (12 for
-/// `doctor`, 8 for `cluster status`) exactly, so a probe silently added or
+/// `expected_calls` pins the documented probe set from the module doc (14 for
+/// `doctor`, 10 for `cluster status`) exactly, so a probe silently added or
 /// dropped fails here rather than only showing up as a stage-count wobble.
 fn assert_fanout(
     label: &str,
@@ -371,6 +380,46 @@ fn check_golden(name: &str, actual: &[u8]) {
     );
 }
 
+/// Preserve the byte pin for every pre-#2374 doctor field while the new
+/// `worker-claims` check is asserted exhaustively in `worker_claims.rs`. The
+/// golden files are outside this test writer's ownership, so normalize only
+/// that one additive check before comparing the old payload.
+fn check_doctor_json_golden(actual: &[u8]) {
+    let mut value: serde_json::Value = serde_json::from_slice(actual)
+        .unwrap_or_else(|error| panic!("doctor stdout is not JSON ({error})"));
+    let checks = value["checks"].as_array_mut().expect("doctor checks array");
+    let before = checks.len();
+    checks.retain(|check| check["id"] != "worker-claims");
+    assert_eq!(
+        checks.len() + 1,
+        before,
+        "doctor must add exactly one worker-claims check: {}",
+        String::from_utf8_lossy(actual)
+    );
+    let mut normalized = serde_json::to_vec(&value).expect("serialize normalized doctor JSON");
+    normalized.push(b'\n');
+    check_golden("doctor.json", &normalized);
+}
+
+fn check_doctor_human_golden(actual: &[u8]) {
+    let text = String::from_utf8(actual.to_vec()).expect("doctor human output is UTF-8");
+    let mut removed = 0usize;
+    let mut normalized = String::new();
+    for line in text.lines() {
+        if line.to_ascii_lowercase().contains("claims enabled") {
+            removed += 1;
+            continue;
+        }
+        normalized.push_str(line);
+        normalized.push('\n');
+    }
+    assert_eq!(
+        removed, 1,
+        "doctor must render one claims-enabled row: {text}"
+    );
+    check_golden("doctor.txt", normalized.as_bytes());
+}
+
 fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -380,8 +429,8 @@ fn stderr_of(output: &Output) -> String {
 }
 
 /// `curie doctor` must join its independent docker/kubectl/helm reads and
-/// resolve the release fullname once. 5 stages is the floor for this scenario
-/// (see the module doc); the sequential implementation took 12.
+/// resolve the release fullname once. The new two-call claim observation fits
+/// into the same 5 dependency stages (see the module doc).
 #[test]
 fn doctor_fans_out_independent_probes() {
     let fixture = fixture();
@@ -393,14 +442,14 @@ fn doctor_fans_out_independent_probes() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    assert_fanout("doctor", &fixture, 5, 12, wall_ms);
+    assert_fanout("doctor", &fixture, 5, 14, wall_ms);
 }
 
 /// `curie cluster status` must issue helm status, the pod list, convergence,
-/// the computed values (the `mailAdapter.deploy` gate, #2457), the fullname and
-/// the host as one stage, then the two Service reads (which consume the
-/// fullname) as a second. The sequential implementation took 6. Exit 1 is part
-/// of the contract (see `cluster_status_output_is_golden`).
+/// the computed values (the `mailAdapter.deploy` gate, #2457), the fullname,
+/// host and exact worker selection as one stage, then the two Service reads and
+/// selected-worker status exec as a second. Exit 1 is part of the contract (see
+/// `cluster_status_output_is_golden`).
 #[test]
 fn cluster_status_fans_out_independent_probes() {
     let fixture = fixture();
@@ -412,7 +461,7 @@ fn cluster_status_fans_out_independent_probes() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    assert_fanout("status", &fixture, 2, 8, wall_ms);
+    assert_fanout("status", &fixture, 2, 10, wall_ms);
 }
 
 /// Joining probes must not move a byte of what either surface prints, so both
@@ -428,7 +477,7 @@ fn doctor_output_is_golden() {
         "stderr: {}",
         stderr_of(&json_output)
     );
-    check_golden("doctor.json", &json_output.stdout);
+    check_doctor_json_golden(&json_output.stdout);
     check_golden("doctor.json.stderr", &json_output.stderr);
 
     let human_fixture = fixture();
@@ -439,7 +488,7 @@ fn doctor_output_is_golden() {
         "stderr: {}",
         stderr_of(&human_output)
     );
-    check_golden("doctor.txt", &human_output.stdout);
+    check_doctor_human_golden(&human_output.stdout);
     check_golden("doctor.txt.stderr", &human_output.stderr);
 }
 

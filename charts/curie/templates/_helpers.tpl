@@ -818,6 +818,72 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- include "curie.otel.validate" . -}}
 {{- end -}}
 
+{{/*
+Resolve the installation identity once for the whole render. The full managed
+Secret is memoized separately from its data so callers can reuse generated
+credentials without losing access to the Secret UID used by the legacy-upgrade
+bridge.
+
+Fresh installs always mint a new identity, including adoption of a retained
+Secret. Upgrades reuse the stored identity; the first upgrade from a chart that
+predates installationId adopts the live Secret UID and enables the one-release
+legacy bridge. A client-only upgrade has no lookup result, so it receives one
+memoized placeholder and marks the identity unobserved for the hook to refuse
+before contacting Valkey.
+*/}}
+{{- define "curie.installationIdentity.init" -}}
+{{- if not (hasKey . "_curieManagedSecret") -}}
+{{- $managedSecret := lookup "v1" "Secret" .Release.Namespace (include "curie.secretName" .) | default dict -}}
+{{- $_ := set . "_curieManagedSecret" $managedSecret -}}
+{{- $managedSecretData := get $managedSecret "data" | default dict -}}
+{{- $installationId := "" -}}
+{{- $observed := true -}}
+{{- $legacy := false -}}
+{{- if .Release.IsInstall -}}
+{{- $installationId = randAlphaNum 32 -}}
+{{- else if .Release.IsUpgrade -}}
+{{- $encodedId := get $managedSecretData "installationId" | default "" -}}
+{{- $decodedId := "" -}}
+{{- if ne (trim (toString $encodedId)) "" -}}
+{{- $decodedId = $encodedId | b64dec -}}
+{{- end -}}
+{{- if ne (trim $decodedId) "" -}}
+{{- $installationId = $decodedId -}}
+{{- else -}}
+{{- $legacy = true -}}
+{{- $metadata := get $managedSecret "metadata" | default dict -}}
+{{- $secretUid := get $metadata "uid" | default "" -}}
+{{- if ne (trim (toString $secretUid)) "" -}}
+{{- $installationId = toString $secretUid -}}
+{{- else -}}
+{{- $installationId = randAlphaNum 32 -}}
+{{- $observed = false -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- $installationId = randAlphaNum 32 -}}
+{{- end -}}
+{{- $_ = set . "_curieInstallationId" $installationId -}}
+{{- $_ = set . "_curieInstallationIdObserved" $observed -}}
+{{- $_ = set . "_curieUpgradeLegacyQuiesce" $legacy -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.installationId" -}}
+{{- include "curie.installationIdentity.init" . -}}
+{{- get . "_curieInstallationId" -}}
+{{- end -}}
+
+{{- define "curie.installationIdObserved" -}}
+{{- include "curie.installationIdentity.init" . -}}
+{{- get . "_curieInstallationIdObserved" | toString -}}
+{{- end -}}
+
+{{- define "curie.upgradeLegacyQuiesce" -}}
+{{- include "curie.installationIdentity.init" . -}}
+{{- get . "_curieUpgradeLegacyQuiesce" | toString -}}
+{{- end -}}
+
 {{/* ---- Auto-generated per-release chart credential (issue #195) ----
      Resolve one chart-owned secret value, generating a strong random per release
      for a sealed install instead of shipping the published dev default. Call with

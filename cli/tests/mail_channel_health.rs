@@ -60,6 +60,12 @@ impl Fixture {
         let script = r#"#!/bin/sh
 case "${0##*/}:$*" in
   kubectl:*--raw*) printf '%s\n' "$*" >> "${0%/*}/proxy-calls"; cat "${0%/*}/status.json"; exit 0 ;;
+  kubectl:"get pods -n mail-test -l app.kubernetes.io/instance=acme,app.kubernetes.io/component=worker -o json")
+    printf '%s\n' '{"items":[{"metadata":{"name":"acme-worker-abc","labels":{"app.kubernetes.io/instance":"acme","app.kubernetes.io/component":"worker"}},"status":{"phase":"Running"}}]}'
+    exit 0 ;;
+  kubectl:"exec -n mail-test acme-worker-abc -- python -m curie_worker.upgrade_drain --mode status --json")
+    printf '%s\n' '{"state":"claims_enabled","since":null,"revision":null}'
+    exit 0 ;;
   kubectl:"get pods"*) cat "${0%/*}/pods.json"; exit 0 ;;
   kubectl:"config current-context") printf '%s\n' 'owned-test'; exit 0 ;;
   kubectl:*"component=api"*) printf '%s\n' 'acme-api'; exit 0 ;;

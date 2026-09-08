@@ -7122,22 +7122,20 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     require_on_path("helm")?;
     require_on_path("kubectl")?;
 
-    // Five independent reads, issued as ONE stage.
+    // Seven independent top-level probes, issued as ONE stage.
     //
     // Safe because none of them consumes another's output: the helm status
-    // line, the pod list, the convergence observation, the release's rendered
-    // fullname and the node host each depend only on `opts`. Awaiting them in
-    // turn made an operator wait through five round trips to a cluster that
-    // could have answered all five at once, and the report is assembled below
-    // in exactly the order it was before -- concurrency here changes when the
-    // answers arrive, never which answer wins.
+    // line, pod list, convergence observation, rendered fullname, node host,
+    // computed-values gate and worker selection each depend only on `opts`.
+    // The report is assembled below in its established order -- concurrency
+    // here changes when the answers arrive, never which answer wins.
     //
     // `?` is applied to the helm result FIRST and the pod result second, so the
     // error an unreachable cluster surfaces is the same one it surfaced when
     // these ran in sequence.
     let helm_status = helm_status_cmd(&opts);
     let pods = pods_cmd(&opts);
-    let (helm, pods_read, observed, fullname, host, computed) = tokio::join!(
+    let (helm, pods_read, observed, fullname, host, computed, worker_claim_probe) = tokio::join!(
         run_capture(&helm_status),
         run_capture(&pods),
         convergence::observe(&opts),
@@ -7154,6 +7152,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
             VALUES_READ_FOR_GATE_TIMEOUT,
             fetch_release_computed_values(&opts),
         ),
+        crate::worker_claims::select_cluster(&opts.namespace, &opts.release),
     );
     let computed = computed.unwrap_or_else(|_| {
         Err(crate::exit::CliError::failure("timed out reading computed Helm values").into())
@@ -7241,8 +7240,9 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     // The same target-manifest check gates up/apply and this read surface.
     // Keep the existing JSON schema: diagnoses use its unhealthy string list.
     // Consumed here, in the position it was awaited in before, so the
-    // `unhealthy` list keeps its order: pod-summary entries, then the
-    // convergence verdict, then the listing failure.
+    // `unhealthy` list keeps its existing order: pod-summary entries, then the
+    // convergence verdict, then the listing failure. The claim diagnosis is
+    // appended after those existing entries.
     match observed {
         Ok(observation) => unhealthy.extend(observation.issues),
         Err(error) => unhealthy.push(format!("convergence could not be verified: {error}")),
@@ -7253,14 +7253,34 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
 
     // (c) URL discovery. The release's rendered fullname and the node host were
     // resolved in the stage above -- both are live-branch only, and `--dry-run`
-    // returned before reaching any of it. The two Service reads DO consume the
-    // fullname, so they wait for that stage and then fan out against each other
-    // rather than queueing up one behind the other.
-    let (ui_url, langfuse_url) = tokio::join!(
+    // returned before reaching any of it. The two Service reads and the worker
+    // exec consume results from that stage, so all three fan out here rather
+    // than queueing behind each other.
+    let (ui_url, langfuse_url, worker_claims) = tokio::join!(
         resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
         resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false),
+        worker_claim_probe.observe(),
     );
     let urls = vec![ui_url, langfuse_url];
+
+    match &worker_claims.state {
+        crate::worker_claims::ClaimsState::ClaimsEnabled => {
+            if let Some(row) = worker_claims
+                .worker_pod
+                .as_deref()
+                .and_then(|pod| pods.iter_mut().find(|row| row.name == pod))
+            {
+                row.status.push_str("; claims enabled");
+            }
+        }
+        crate::worker_claims::ClaimsState::Quiescing { .. }
+        | crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => {
+            unhealthy.push(worker_claims.state.status_diagnosis());
+        }
+        crate::worker_claims::ClaimsState::Unknown => {
+            warnings.push(worker_claims.state.status_diagnosis());
+        }
+    }
 
     let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
@@ -8500,7 +8520,7 @@ pub enum SlackApiBase {
 /// `nameOverride`/`fullnameOverride` move it again. Guessing the name is the
 /// defect `release_secret_name` already avoids by selecting on labels, and this
 /// selects the same way for the same reason.
-fn worker_deployment_selector(release: &str) -> String {
+pub(crate) fn worker_deployment_selector(release: &str) -> String {
     component_selector(release, "worker")
 }
 

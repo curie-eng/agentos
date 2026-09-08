@@ -1180,6 +1180,47 @@ async fn bounded_diagnostics(
         })
 }
 
+/// Observe the claim gate for the same tier the message targets. The local
+/// message surface has no compose-file flag, so it follows the fixed local
+/// lifecycle file and project used by `curie local up`.
+async fn observe_message_claims(
+    opts: &MessageOpts,
+    verb: TurnVerb,
+) -> crate::worker_claims::ClaimsState {
+    match verb {
+        TurnVerb::Local => {
+            crate::worker_claims::observe_local(crate::local::DEFAULT_COMPOSE_FILE).await
+        }
+        TurnVerb::Cluster => {
+            crate::worker_claims::observe_cluster(&opts.namespace, &opts.release)
+                .await
+                .state
+        }
+    }
+}
+
+/// A known marker is useful before the first reply poll: print it on stderr and
+/// attach it to the active checklist step without exposing any subprocess text.
+fn report_initial_claim_wait(
+    ui: &crate::ui::Ui,
+    step: &crate::ui::Step,
+    state: &crate::worker_claims::ClaimsState,
+) {
+    if let Some(reason) = state.wait_reason() {
+        ui.note(&reason);
+        step.tick_detail(&reason);
+    }
+}
+
+/// Keep the existing diagnostics slot and prepend only the authored current
+/// marker reason. No claim reason leaves the old diagnostics byte shape alone.
+fn diagnostics_with_claim_wait(diagnostics: String, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("  {reason}\n{diagnostics}"),
+        None => diagnostics,
+    }
+}
+
 const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
 const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
 const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
@@ -1738,6 +1779,8 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+    report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let outcome = {
         let mut observe_update = |text: &str| {
@@ -1851,12 +1894,20 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             // next `local message` can bind successfully right away regardless of
             // how long anything after this line takes (#751).
             drop(stub);
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+            let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
             let diag = if ui.json() {
+                if let Some(reason) = latest_reason.as_deref() {
+                    ui.note(reason);
+                }
                 None
             } else {
-                Some(bounded_diagnostics(&mut conn, &opts.stream, &stream_id).await)
+                Some(diagnostics_with_claim_wait(
+                    bounded_diagnostics(&mut conn, &opts.stream, &stream_id).await,
+                    latest_reason.as_deref(),
+                ))
             };
             ui.emit(&MessageOutcomeOutput::TimedOut {
                 diagnostics: diag,
@@ -2977,6 +3028,8 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+    report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let observed = {
         let mut observe_update = |text: &str| {
@@ -3070,12 +3123,20 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         }
         Outcome::TimedOut => {
             step.fail(&format!("timed out after {}s", opts.timeout_secs));
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+            let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
             let diag = if ui.json() {
+                if let Some(reason) = latest_reason.as_deref() {
+                    ui.note(reason);
+                }
                 None
             } else {
-                Some(bounded_diagnostics(&mut conn, &opts.stream, &stream_id).await)
+                Some(diagnostics_with_claim_wait(
+                    bounded_diagnostics(&mut conn, &opts.stream, &stream_id).await,
+                    latest_reason.as_deref(),
+                ))
             };
             ui.emit(&MessageOutcomeOutput::TimedOut {
                 diagnostics: diag,

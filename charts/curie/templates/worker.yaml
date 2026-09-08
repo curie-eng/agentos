@@ -301,6 +301,15 @@ spec:
             # name is knowable only here.
             - name: CURIE_RELEASE
               value: {{ .Release.Name | quote }}
+            # Stable identity for this Helm installation's claim gate. It is
+            # always owned by the release-managed Secret, independently of any
+            # BYO store or provider credential Secret.
+            - name: CURIE_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: installationId
+                  optional: false
 {{- if .Values.worker.connectorReconciler.enabled }}
             # Connector reconciler (ADR-0090, #1184). It reuses CURIE_NAMESPACE
             # and CURIE_RELEASE above deliberately: the runner dials a connector

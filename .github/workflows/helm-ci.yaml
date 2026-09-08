@@ -628,6 +628,15 @@ jobs:
         # Keep runtime checks separate from the flat chart-check render inventory.
         working-directory: charts/curie
         run: bash ci/runtime/reserved-env-upgrade-runtime.sh
+      - name: Installation identity Secret lifecycle
+        env:
+          KUBECONFIG: ${{ runner.temp }}/curie-upgrade-drain-kubeconfig
+          CURIE_UPGRADE_DRAIN_KIND_CONTEXT: kind-curie-reserved-env
+        run: |
+          set -euo pipefail
+          trap 'rm -f -- "$KUBECONFIG"' EXIT
+          install -m 600 /home/runner/.kube/config "$KUBECONFIG"
+          bash charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh
       - name: Remove owned cluster
         if: always()
         run: kind delete cluster --name curie-reserved-env

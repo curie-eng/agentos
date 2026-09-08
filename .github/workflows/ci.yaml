@@ -2118,9 +2118,11 @@ jobs:
           echo "Released-upgrade rung rejected the nil-unsafe placement mutant as expected"
           kubectl patch secret curie-negative-secrets -n curie-negative --type merge \
             -p '{"stringData":{"approvalChatAttesterSecret":""}}'
+          # Candidate hooks must run the candidate worker command surface.
           helm upgrade curie-negative "$mutant" -n curie-negative \
             --reset-then-reuse-values \
             --set api.approvalChatAttesterSecret=null \
+            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
             --timeout 15m
           if "$RUNNER_TEMP/verify-managed-attester.sh" curie-negative curie-negative; then
             echo "nil-unsafe negative control unexpectedly passed the released-upgrade assertion" >&2

@@ -51,6 +51,7 @@ pub mod slack;
 pub mod spec;
 pub mod state;
 pub mod ui;
+pub(crate) mod worker_claims;
 
 pub use retired::retired_hint;
 

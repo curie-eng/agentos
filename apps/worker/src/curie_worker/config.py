@@ -777,6 +777,25 @@ class WorkerConfig(BaseSettings):
     upgrade_quiesce_ttl_s: float = Field(
         default=1200.0, gt=0, validation_alias="CURIE_UPGRADE_QUIESCE_TTL_S"
     )
+    # The Helm installation that owns upgrade pause authority (#2374). A blank
+    # value is deliberate standalone and Compose compatibility: those surfaces
+    # have no Helm installation boundary and keep using the legacy key. Cluster
+    # workers receive a nonblank value from the chart managed Secret.
+    installation_id: str = Field(
+        default="", validation_alias="CURIE_INSTALLATION_ID"
+    )
+    # Hook revisions fence delayed drain and release Jobs numerically. Ordinary
+    # worker processes only read marker state, so this hook-only value may be
+    # absent there. An explicitly supplied revision must be positive.
+    upgrade_revision: int | None = Field(
+        default=None, gt=0, validation_alias="CURIE_UPGRADE_REVISION"
+    )
+    # True only for the first upgrade from a chart that predates installation
+    # IDs. That hook atomically bridges the scoped marker to the legacy key so
+    # old and new worker replicas pause together during the transition.
+    upgrade_legacy_quiesce: Bool = Field(
+        default=False, validation_alias="CURIE_UPGRADE_LEGACY_QUIESCE"
+    )
 
     # The platform's voluntary termination grace, injected by the chart from
     # the SAME value it renders onto the Pod's ``terminationGracePeriodSeconds``
@@ -1157,11 +1176,18 @@ class WorkerConfig(BaseSettings):
         return f"{self.key_prefix}:completions:pending"
 
     def upgrade_quiesce_key(self) -> str:
-        # The fleet-wide "stop taking new work" flag the pre-upgrade gate sets
-        # (issue #2010). One key for the whole release, not one per replica: the
-        # gate runs as a Job that knows nothing about how many replicas exist,
-        # and every consumer reads the same flag. Always written with a TTL --
-        # see ``upgrade_quiesce_ttl_s`` for why it must never be permanent.
+        # One authoritative "stop taking new work" marker per Helm installation
+        # (#2374), shared by every replica in that installation. Standalone and
+        # Compose deliberately have a blank installation ID and retain the
+        # legacy release-wide key. Every marker is written with a finite TTL.
+        legacy_key = self.upgrade_legacy_quiesce_key()
+        if not self.installation_id:
+            return legacy_key
+        return f"{legacy_key}:{self.installation_id}"
+
+    def upgrade_legacy_quiesce_key(self) -> str:
+        """The pre-#2374 global key used only by standalone or the bridge."""
+
         return f"{self.key_prefix}:upgrade:quiesce"
 
     def lock_key(self, thread_key: str) -> str:

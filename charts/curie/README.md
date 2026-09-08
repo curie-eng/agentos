@@ -85,6 +85,22 @@ it after the upgrade even when Helm fails. The commands below use
 `--reuse-values` only for same chart configuration changes, not a chart version
 upgrade.
 
+**Upgrade drain and claim state.** Before each upgrade, a hook pauses new worker
+claims and waits for accepted deliveries to finish. The chart stores an
+installation identity in its managed Secret and reuses it across upgrades. A
+reinstall mints a new identity, so a late hook from the removed installation
+cannot pause the fresh workers.
+
+`curie cluster status` and `curie doctor` report the current claim state. While
+claims are paused, `curie cluster message` reports `waiting for upgrade revision
+<revision> since <timestamp>`; if safe marker metadata is unavailable, it uses
+the platform-authored `waiting for upgrade; marker metadata unavailable` reason
+instead of echoing marker data. A post-upgrade release clears only its own
+revision. If a newer revision is already active, the older release leaves that
+marker in place, so a successful release Job means release processing completed;
+confirm the actual claim state with `curie cluster status`. The marker TTL is a
+last-resort expiry, not a promise of prompt convergence for a current pause.
+
 **Step 2 -- connect Slack + a real model.** When you have Slack tokens and a
 model credential, upgrade in place (the exact command is also printed in
 `NOTES.txt` after step 1):
