@@ -7793,6 +7793,7 @@ pub struct ClusterStatus {
     pub warnings: Vec<String>,
     pub pods_listed: bool,
     pub urls: Vec<ServiceUrl>,
+    pub delivery: crate::completion_outbox::Report,
 }
 
 impl crate::ui::CliOutput for ClusterStatusOutput {
@@ -7800,7 +7801,10 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
         match self {
             ClusterStatusOutput::DryRun(plan) => plan.to_json(),
             ClusterStatusOutput::Status(s) => {
-                let healthy = s.total > 0 && s.ready == s.total && s.unhealthy.is_empty();
+                let healthy = s.total > 0
+                    && s.ready == s.total
+                    && s.unhealthy.is_empty()
+                    && !s.delivery.degraded;
                 serde_json::json!({
                     "namespace": s.namespace,
                     "revision": s.revision,
@@ -7814,6 +7818,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     },
                     "warnings": s.warnings,
                     "urls": s.urls.iter().map(ServiceUrl::to_json).collect::<Vec<_>>(),
+                    "delivery": serde_json::to_value(&s.delivery).expect("delivery serializes"),
                     "healthy": healthy,
                 })
             }
@@ -7841,7 +7846,11 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 for url in &s.urls {
                     url.render(ui);
                 }
-                if s.total > 0 && s.ready == s.total && s.unhealthy.is_empty() {
+                if s.total > 0
+                    && s.ready == s.total
+                    && s.unhealthy.is_empty()
+                    && !s.delivery.degraded
+                {
                     ui.success(&format!("healthy ({}/{} pods ready)", s.ready, s.total));
                 } else if s.total == 0 {
                     ui.warn("no pods running");
@@ -8059,10 +8068,24 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     // returned before reaching any of it. The two Service reads and the worker
     // exec consume results from that stage, so all three fan out here rather
     // than queueing behind each other.
-    let (ui_url, langfuse_url, worker_claims) = tokio::join!(
+    let (ui_url, langfuse_url, worker_claims, delivery) = tokio::join!(
         resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
         resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false),
         worker_claim_probe.observe(),
+        async {
+            match serde_json::from_str::<serde_json::Value>(&out) {
+                Ok(value) => {
+                    let items = value
+                        .get("items")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    crate::completion_outbox::observe_pods(&opts.namespace, &opts.release, &items)
+                        .await
+                }
+                Err(_) => None,
+            }
+        },
     );
     let urls = vec![ui_url, langfuse_url];
 
@@ -8085,6 +8108,18 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         }
     }
 
+    let delivery = match delivery {
+        Some(report) => {
+            if report.known() && report.degraded {
+                unhealthy.push(report.detail.clone());
+            } else if !report.known() {
+                warnings.push(report.detail.clone());
+            }
+            report
+        }
+        None => crate::completion_outbox::Report::unknown(),
+    };
+
     let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
@@ -8098,6 +8133,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         warnings,
         pods_listed: ok,
         urls,
+        delivery,
     }));
     let json = crate::ui::CliOutput::to_json(&output);
     if json["healthy"] != true {
@@ -16569,6 +16605,7 @@ mod tests {
                 warnings,
                 pods_listed: true,
                 urls: Vec::new(),
+                delivery: crate::completion_outbox::Report::unknown(),
             }))
             .to_json()
         };
@@ -16588,5 +16625,35 @@ mod tests {
             status(Vec::new(), vec!["acme-mail-0: expired".to_string()])["healthy"],
             false
         );
+    }
+
+    #[test]
+    fn an_owed_completion_outbox_makes_status_unhealthy_even_with_ready_pods() {
+        use crate::ui::CliOutput;
+        let mut delivery = crate::completion_outbox::Report::unknown();
+        delivery.state = crate::completion_outbox::State::Retry;
+        delivery.degraded = true;
+        delivery.retry = 4;
+        delivery.count = 4;
+        delivery.detail = "completion outbox: state retry; count 4".into();
+        let json = ClusterStatusOutput::Status(Box::new(ClusterStatus {
+            namespace: "curie".to_string(),
+            revision: "3".to_string(),
+            release_state: "deployed".to_string(),
+            release_found: true,
+            release_missing_note: None,
+            pods: Vec::new(),
+            ready: 1,
+            total: 1,
+            unhealthy: Vec::new(),
+            warnings: Vec::new(),
+            pods_listed: true,
+            urls: Vec::new(),
+            delivery,
+        }))
+        .to_json();
+        assert_eq!(json["healthy"], false);
+        assert_eq!(json["delivery"]["retry"], 4);
+        assert_eq!(json["delivery"]["degraded"], true);
     }
 }

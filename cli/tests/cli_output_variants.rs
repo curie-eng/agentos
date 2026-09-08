@@ -183,6 +183,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         warnings: Vec::new(),
         pods_listed: true,
         urls: Vec::new(),
+        delivery: curie::completion_outbox::Report::unknown(),
     })
 }
 

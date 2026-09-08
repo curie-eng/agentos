@@ -137,6 +137,16 @@ _APPROVAL_PENDING_ATTRIBUTES = {
     "operation": ["observe"],
     "outcome": ["pending"],
 }
+_COMPLETION_OUTBOX_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "operation": ["observe"],
+    "outcome": ["inflight", "retry", "terminal"],
+}
+_COMPLETION_OUTBOX_AGE_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "operation": ["observe"],
+    "outcome": ["retry"],
+}
 _REPLY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "operation": ["update", "post"],
@@ -345,6 +355,20 @@ _METRICS: dict[str, dict[str, Any]] = {
     ),
     "curie.approval.pending.age": _definition(
         "gauge", "s", "Age of the oldest pending approval.", False, _APPROVAL_PENDING_ATTRIBUTES
+    ),
+    "curie.completion.outbox": _definition(
+        "gauge",
+        "{completion}",
+        "Completion-outbox records by inflight, retry, or terminal-delivery state.",
+        False,
+        _COMPLETION_OUTBOX_ATTRIBUTES,
+    ),
+    "curie.completion.outbox.age": _definition(
+        "gauge",
+        "s",
+        "Age of the oldest owed completion still retrying delivery.",
+        False,
+        _COMPLETION_OUTBOX_AGE_ATTRIBUTES,
     ),
     "curie.reply.delivery": _definition(
         "counter", "{reply}", "Reply delivery outcomes.", True, _REPLY_ATTRIBUTES

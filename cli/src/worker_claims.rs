@@ -95,6 +95,10 @@ pub(crate) struct ClusterProbe {
 }
 
 impl ClusterProbe {
+    pub(crate) fn selected_pod(&self) -> Option<&str> {
+        self.worker_pod.as_deref()
+    }
+
     /// Execute the worker reader with only the time left from selection. This
     /// method is separate so callers can overlap exec with their other
     /// dependent reads without resetting the observer budget.
