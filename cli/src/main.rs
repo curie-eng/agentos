@@ -3721,6 +3721,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     revision,
                     allow_failed_revision,
                     yes,
+                    disable_schema_gate: false,
                 })
                 .await?,
             ),

@@ -605,6 +605,10 @@ pub struct RollbackOpts {
     /// without this flag, since helm never finished applying such a revision.
     pub allow_failed_revision: bool,
     pub yes: bool,
+    /// Test-only negative control for #2296: skip the schema compatibility
+    /// gate so the status filter's unsafe v0.8.4 target is handed to Helm.
+    /// The clap path never sets this.
+    pub disable_schema_gate: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -7328,15 +7332,29 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
 // `cluster rollback` (#1899)
 // ---------------------------------------------------------------------------
 
-/// One row of `helm history -o json`. Only the fields the rollback decision
-/// needs are modelled; helm adds others (`updated`, `app_version`) that are
-/// deliberately ignored so a helm version bump cannot break parsing.
+/// One row of `helm history -o json`. Unknown fields (`updated`, and anything
+/// a newer helm adds) are ignored so a helm version bump cannot break parsing.
+/// `app_version` is kept because the schema gate (#2296) needs the target
+/// application's identity; it is optional and empty when helm omitted it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelmRevision {
     pub revision: u32,
     pub status: String,
     pub chart: String,
+    pub app_version: String,
     pub description: String,
+}
+
+impl HelmRevision {
+    /// Application version this Helm revision installed: `app_version` when
+    /// helm supplied it, otherwise the trailing version on `chart` (`curie-0.8.4`).
+    pub fn application_version(&self) -> Option<String> {
+        let app = self.app_version.trim();
+        if !app.is_empty() {
+            return Some(crate::schema_window::normalize_app_version(app));
+        }
+        crate::schema_window::version_from_chart(&self.chart)
+    }
 }
 
 /// The revision statuses it is safe to roll back TO. Everything else
@@ -7583,6 +7601,7 @@ pub fn parse_helm_history(json: &str) -> Result<Vec<HelmRevision>> {
             revision,
             status,
             chart: field("chart"),
+            app_version: field("app_version"),
             description: field("description"),
         });
     }
@@ -7622,6 +7641,29 @@ pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
+/// `kubectl exec` into the running API pod for `alembic current`. The live
+/// database revision is what the target image's migrate init container will
+/// see; reading it here is the pre-mutation half of #2296.
+pub fn live_schema_revision_cmd(o: &CommonOpts) -> OpsCommand {
+    let deploy = chart_fullname(&o.release).resource("api");
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("exec"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain(format!("deploy/{deploy}")),
+            plain("-c"),
+            plain("api"),
+            plain("--"),
+            plain("alembic"),
+            plain("-c"),
+            plain("alembic.ini"),
+            plain("current"),
+        ],
+    )
+}
+
 /// `helm rollback` to an explicit revision. Always explicit: the whole point of
 /// the verb is that helm's own default target (the immediately preceding
 /// revision) is the wrong one on a failed/superseded history.
@@ -7650,12 +7692,16 @@ fn helm_rollback_cmd_to(o: &CommonOpts, revision: String) -> OpsCommand {
 }
 
 /// The commands `curie cluster rollback` runs (and prints under `--dry-run`):
-/// the history read that decides the target, then the rollback itself. A `None`
-/// revision is one the caller has not resolved yet, and stands in the argv as
-/// [`SELECTED_REVISION`].
+/// the history read that decides the target, the live-schema probe, then the
+/// rollback itself. A `None` revision is one the caller has not resolved yet,
+/// and stands in the argv as [`SELECTED_REVISION`].
 pub fn rollback_commands(o: &CommonOpts, revision: Option<u32>) -> Vec<OpsCommand> {
     let target = revision.map_or_else(|| SELECTED_REVISION.to_string(), |r| r.to_string());
-    vec![helm_history_cmd(o), helm_rollback_cmd_to(o, target)]
+    vec![
+        helm_history_cmd(o),
+        live_schema_revision_cmd(o),
+        helm_rollback_cmd_to(o, target),
+    ]
 }
 
 /// One printed plan line. `display()` everywhere, except that it shell-quotes
@@ -7800,6 +7846,60 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         }
         None => select_rollback_revision(&history)?.require_eligible()?,
     };
+
+    if !opts.disable_schema_gate {
+        require_on_path("kubectl")?;
+        let target_row = history
+            .iter()
+            .find(|row| row.revision == choice.to_revision);
+        let target_app = target_row.and_then(HelmRevision::application_version);
+        let history_apps: Vec<String> = history
+            .iter()
+            .filter_map(HelmRevision::application_version)
+            .collect();
+        let probe = live_schema_revision_cmd(&opts.common);
+        ui.plumbing(&format!("+ {}", probe.display()));
+        let (ok, probe_out, probe_err) = run_capture(&probe).await?;
+        if !ok {
+            let detail = crate::schema_window::redact_probe_text(
+                probe_err
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("kubectl exec exited nonzero with no message"),
+            );
+            return Err(crate::exit::CliError::failure(format!(
+                "refusing rollback: could not read the live database revision from the API pod: {detail}"
+            ))
+            .with_fix(format!(
+                "confirm the API is running with `curie cluster status --release {} --namespace {}` and retry",
+                opts.common.release, opts.common.namespace
+            ))
+            .into());
+        }
+        let live =
+            crate::schema_window::parse_alembic_current_output(&probe_out).ok_or_else(|| {
+                crate::exit::CliError::failure(
+                    "refusing rollback: the API pod did not report a live database revision",
+                )
+                .with_fix("confirm the API is running with `curie cluster status` and retry")
+            })?;
+        let Some(target_app) = target_app else {
+            return Err(crate::exit::CliError::failure(format!(
+                "refusing rollback to Helm revision {}: no application version on that revision",
+                choice.to_revision
+            ))
+            .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
+            .into());
+        };
+        if let Err(refusal) =
+            crate::schema_window::check_target_schema(&target_app, &live, &history_apps)
+        {
+            return Err(crate::exit::CliError::failure(refusal.message)
+                .with_fix(refusal.fix)
+                .into());
+        }
+    }
 
     // Disclosed BEFORE the prompt, and on stderr like `cluster down` does it:
     // the operator confirms knowing both the target and what was passed over,
