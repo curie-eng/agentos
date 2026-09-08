@@ -16,7 +16,7 @@
 #   * langfuse-web / langfuse-worker running Prisma and ClickHouse boot
 #     migrations at container start (init containers do NOT re-run on a liveness
 #     restart, so the restart lands straight back in the migration),
-#   * api warming up before `/health` answers.
+#   * api waiting for its database-aware `/ready` check to succeed.
 #
 # The failure is invisible in review and invisible at install time: the manifest
 # is valid, `helm install` is green, and the damage shows up minutes later as a
@@ -37,16 +37,17 @@
 #   api             120 s vs 105 s
 #
 # WHAT THIS PINS. Deliberately the CLASS, not those four names. This script
-# walks every object carrying a pod spec in both renders -- Deployment,
+# walks every object carrying a pod spec in all three renders -- Deployment,
 # StatefulSet, DaemonSet, Job, and CronJob's spec.template.spec; a bare Pod's
 # own spec (templates/security-probe.yaml); SandboxTemplate's
 # spec.podTemplate.spec (templates/agent-sandbox.yaml); and, generically, any
 # other kind exposing the conventional spec.template.spec shape -- and checks
 # every container that has both probes, so a fifth violating container added
-# later fails CI with no list here to update -- the lesson
+# later fails CI with no cadence allowlist to update -- the lesson
 # `charts/curie/CLAUDE.md` already records for the `curie.env.otel` membership
-# boundary (#2331). There is no allowlist and no named-container table below
-# on purpose.
+# boundary (#2331). The only named set below requires the four first-party app
+# Deployments to be present in the dispatcher-enabled audit; it does not exempt
+# any container from the generic probe checks.
 #
 # THE FORMULA, matching the chart's own precedent at `templates/dispatcher.yaml`
 # lines 3-9:
@@ -70,10 +71,10 @@
 # NOT CHECKED, deliberately: containers carrying only one probe (the invariant
 # is a relation BETWEEN two probes -- `agentSandbox.runner` has readiness and no
 # liveness by design), and `startupProbe`, which defers readiness and liveness
-# equally and so leaves the comparison unchanged. Containers behind a
-# `deploy: false` toggle (`dispatcher`, `mail-adapter`, `inference`) render in
-# neither of the two renders below and are therefore outside this script's
-# reach; widening to profiled renders is a follow-up.
+# equally and so leaves the comparison unchanged. A synthetic third render
+# enables the dispatcher so the API, worker, dispatcher, and UI app shapes are
+# audited together; opt-in mail-adapter and inference remain outside this
+# script's reach.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,6 +89,12 @@ if ! helm template curie "$CHART" >"$TMP/default.yaml"; then
 fi
 if ! helm template curie "$CHART" -f "$CHART/values-dev.yaml" >"$TMP/dev.yaml"; then
   fail "values-dev.yaml render failed"
+fi
+if ! helm template curie "$CHART" \
+  --set-string dispatcher.slack.appToken=xapp-assert \
+  --set-string dispatcher.slack.botToken=xoxb-assert \
+  >"$TMP/dispatcher-enabled.yaml"; then
+  fail "dispatcher-enabled render failed"
 fi
 
 # ------------------------------------------------------------------ the checker
@@ -113,6 +120,7 @@ FORMULA = (
     "applied to omitted keys"
 )
 POD_TEMPLATE_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "Job")
+FIRST_PARTY_DEPLOYMENTS = {"api", "worker", "dispatcher", "ui"}
 
 problems = []
 
@@ -142,6 +150,13 @@ def cadence_str(c):
         f"{c['initialDelaySeconds']}/{c['periodSeconds']}/"
         f"{c['timeoutSeconds']}/{c['failureThreshold']}"
     )
+
+
+def http_target(probe):
+    handler = probe.get("httpGet") if isinstance(probe, dict) else None
+    if not isinstance(handler, dict):
+        return None, None
+    return handler.get("path"), handler.get("port")
 
 
 def pod_templates(doc):
@@ -184,6 +199,7 @@ if __name__ == "__main__":
 
     checked = 0
     liveness_seen = 0
+    first_party_seen = set()
     for doc in docs:
         for kind, name, template in pod_templates(doc):
             spec = template.get("spec") or {}
@@ -197,6 +213,23 @@ if __name__ == "__main__":
                 where = f"{kind}/{name} container={cname}"
                 readiness = container.get("readinessProbe")
                 liveness = container.get("livenessProbe")
+
+                if kind == "Deployment" and cname in FIRST_PARTY_DEPLOYMENTS:
+                    first_party_seen.add(cname)
+
+                if kind == "Deployment" and cname == "api":
+                    ready_path, ready_port = http_target(readiness)
+                    if (ready_path, ready_port) != ("/ready", 8000):
+                        problems.append(
+                            f"[{label}] {where}: api readinessProbe httpGet must target "
+                            f"/ready:8000, got {ready_path}:{ready_port}"
+                        )
+                    live_path, live_port = http_target(liveness)
+                    if (live_path, live_port) != ("/health", 8000):
+                        problems.append(
+                            f"[{label}] {where}: api livenessProbe httpGet must target "
+                            f"/health:8000, got {live_path}:{live_port}"
+                        )
 
                 if isinstance(liveness, dict):
                     liveness_seen += 1
@@ -248,6 +281,19 @@ if __name__ == "__main__":
                     f"legitimately booting, and the restart re-enters the same boot path"
                 )
 
+    if label == "dispatcher-enabled":
+        missing = sorted(FIRST_PARTY_DEPLOYMENTS - first_party_seen)
+        if missing:
+            problems.append(
+                f"[{label}] first-party Deployment audit is incomplete; missing "
+                + ", ".join(missing)
+            )
+        else:
+            print(
+                "  dispatcher-enabled: api, worker, dispatcher, and ui Deployments "
+                "were all present"
+            )
+
     print(
         f"  {label}: {checked} container(s) carry both probes and were checked for "
         f"ordering; {liveness_seen} livenessProbe(s) checked for an explicit timeoutSeconds"
@@ -262,6 +308,7 @@ PY
 
 python3 "$TMP/check.py" "$TMP/default.yaml" "default"
 python3 "$TMP/check.py" "$TMP/dev.yaml" "values-dev"
+python3 "$TMP/check.py" "$TMP/dispatcher-enabled.yaml" "dispatcher-enabled"
 
 # --------------------------------------------------------------- red controls
 # Each control mutates a REAL default render and proves the checker rejects it
@@ -311,6 +358,12 @@ if mutation == "web-liveness-kubelet-defaults":
 elif mutation == "api-drop-liveness-timeout":
     for c in find("api", "livenessProbe"):
         c["livenessProbe"].pop("timeoutSeconds", None)
+elif mutation == "api-readiness-health":
+    for c in find("api", "readinessProbe"):
+        c["readinessProbe"]["httpGet"]["path"] = "/health"
+elif mutation == "api-liveness-ready":
+    for c in find("api", "livenessProbe"):
+        c["livenessProbe"]["httpGet"]["path"] = "/ready"
 elif mutation == "ui-readiness-threshold":
     for c in find("ui", "readinessProbe"):
         c["readinessProbe"]["failureThreshold"] = 1000
@@ -359,6 +412,14 @@ assert_mutation_rejected api-drop-liveness-timeout \
   "dropping the api livenessProbe timeoutSeconds (the kubelet would silently apply 1s)" \
   "container=api" "does not declare timeoutSeconds explicitly"
 
+assert_mutation_rejected api-readiness-health \
+  "routing api readiness back to the shallow health handler" \
+  "container=api" "api readinessProbe httpGet must target /ready:8000" "got /health:8000"
+
+assert_mutation_rejected api-liveness-ready \
+  "routing api liveness to the database-aware readiness handler" \
+  "container=api" "api livenessProbe httpGet must target /health:8000" "got /ready:8000"
+
 assert_mutation_rejected ui-readiness-threshold \
   "widening the ui readiness failureThreshold to 1000 so its readiness tolerance outruns liveness" \
   "container=ui" "liveness cutoff must exceed readiness cutoff"
@@ -398,4 +459,4 @@ assert_rejected "$TMP/values-override.yaml" "red:values-override" \
   "container=postgres" "container=langfuse-web" "container=langfuse-worker" "container=api" \
   "liveness cutoff must exceed readiness cutoff"
 
-echo "PASS: in both the default and values-dev renders, every object carrying a pod spec (Deployment/StatefulSet/DaemonSet/Job/CronJob, a bare Pod, SandboxTemplate, or any kind exposing spec.template.spec) has every container carrying BOTH probes checked, and each such container has a liveness failure cutoff strictly later than its readiness cutoff, every livenessProbe declares timeoutSeconds explicitly, and postgres liveness allows pg_isready at least 5s -- so the kubelet cannot restart a container that is still inside the boot window readiness was sized to tolerate"
+echo "PASS: in the default, values-dev, and dispatcher-enabled renders, every object carrying a pod spec (Deployment/StatefulSet/DaemonSet/Job/CronJob, a bare Pod, SandboxTemplate, or any kind exposing spec.template.spec) has every container carrying BOTH probes checked, and each such container has a liveness failure cutoff strictly later than its readiness cutoff, every livenessProbe declares timeoutSeconds explicitly, postgres liveness allows pg_isready at least 5s, all four first-party app Deployments are audited, and api readiness/liveness target /ready:8000 and /health:8000 respectively -- so the kubelet cannot restart a container that is still inside the boot window readiness was sized to tolerate"

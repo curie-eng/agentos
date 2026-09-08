@@ -200,6 +200,7 @@ _HTTP_OPERATIONS = [
     "/git-flow/routing-check",
     "/github/webhook",
     "/health",
+    "/ready",
     "/hooks/{agent_id}/{hook}",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
