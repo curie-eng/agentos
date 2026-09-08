@@ -1099,3 +1099,114 @@ def test_delivery_key_helpers_are_keyed_by_the_delivery_triple(
     assert lease_key == "curie:worker:lease:curie:runs:curie-workers:1-0"
     assert state_key == "curie:worker:delivery:curie:runs:curie-workers:1-0"
     assert lease_key != state_key
+
+
+# --- The lease-expiry reclaim threshold and the not-started copy (#2433) ------
+#
+# The threshold is an ADDITION to ``reclaim_min_idle_ms``, never a replacement:
+# an entry with no delivery state carries no evidence a lease was ever granted
+# and stays on the unchanged 900 second window. It is bounded on BOTH sides
+# because each end is a distinct silent failure. Below one lease TTL the scan
+# can select an entry between a healthy owner's heartbeats, before its lease has
+# actually expired, which reintroduces the cross-replica dup-dispatch the lease
+# exists to close. At or above the backstop the pass selects nothing XAUTOCLAIM
+# was not already claiming, so it is dead code and ADR-0131's "recoverable after
+# at most one short lease" bound is silently off.
+
+
+def test_lease_expiry_idle_defaults_to_exactly_one_lease_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default DERIVES from the lease TTL rather than restating it.
+
+    A static ``Field`` default cannot reference another field, so the derivation
+    lives in a resolver both consumer lanes read, which is what keeps runs/eval
+    parity structural. Asserting only the 45000 number would pass against a
+    hard-coded literal, so the second half lowers the TTL and requires the
+    threshold to follow: an operator who shortens the lease must not be left with
+    an incoherent pair.
+    """
+    _clear_all_config_env(monkeypatch)
+
+    config = WorkerConfig()
+    assert config.lease_expired_idle_ms is None
+    assert config.lease_expired_idle_ms_value() == int(
+        config.delivery_lease_ttl_s * 1000
+    )
+    assert config.lease_expired_idle_ms_value() == 45000
+
+    shorter = _lease_config(
+        delivery_lease_ttl_s=30.0,
+        delivery_lease_heartbeat_s=10.0,
+        reclaim_interval_s=20.0,
+    )
+    assert shorter.lease_expired_idle_ms is None
+    assert shorter.lease_expired_idle_ms_value() == 30000
+
+
+def test_an_explicit_threshold_below_one_lease_ttl_is_rejected_at_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Below one lease TTL the pass can transfer a delivery somebody still owns.
+
+    The operator must learn at boot, not at 2am, so the rejection NAMES both env
+    vars and both values.
+    """
+    _clear_all_config_env(monkeypatch)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _lease_config(delivery_lease_ttl_s=45.0, lease_expired_idle_ms=44999)
+
+    message = str(exc_info.value)
+    assert "CURIE_LEASE_EXPIRED_IDLE_MS" in message
+    assert "CURIE_DELIVERY_LEASE_TTL_S" in message
+
+
+def test_an_explicit_threshold_at_or_above_the_backstop_is_rejected_at_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At or above the backstop the whole pass is dead configuration.
+
+    Rejected at the boundary rather than one past it, because 900000 exactly is
+    the value an operator reaches for when they mean "same as the backstop", and
+    it selects nothing XAUTOCLAIM was not already claiming.
+    """
+    _clear_all_config_env(monkeypatch)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _lease_config(lease_expired_idle_ms=900000)
+
+    message = str(exc_info.value)
+    assert "CURIE_LEASE_EXPIRED_IDLE_MS" in message
+    assert "reclaim_min_idle_ms" in message
+
+
+def test_a_threshold_inside_the_band_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control that stops the two rejections above passing vacuously.
+
+    Without it a validator that rejected every explicit value would keep them
+    both green while deleting the operator's ability to tune the knob at all.
+    """
+    _clear_all_config_env(monkeypatch)
+
+    config = _lease_config(lease_expired_idle_ms=60000)
+    assert config.lease_expired_idle_ms == 60000
+    assert config.lease_expired_idle_ms_value() == 60000
+
+
+def test_the_turn_not_started_text_is_operator_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every person-facing string this pipeline emits is operator-tunable (#717).
+
+    ``booting_text`` and ``status_text`` already carry a ``CURIE_`` alias so an
+    operator can retune the voice for their own users; a hard-coded literal here
+    would be the only exception, on the one line #717 is about.
+    """
+    _clear_all_config_env(monkeypatch)
+    assert WorkerConfig().turn_not_started_text
+
+    monkeypatch.setenv("CURIE_TURN_NOT_STARTED_TEXT", "Sorry, please resend that.")
+    assert WorkerConfig().turn_not_started_text == "Sorry, please resend that."

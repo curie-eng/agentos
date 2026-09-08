@@ -328,6 +328,12 @@ class EvalStreamConsumer(StreamConsumer):
             logger=logger,
             dead_letter_log="dead-lettered eval entry %s after %d deliveries (reason=%s) -> %s",
             dead_letter_fail_log="dead-lettering eval entry %s failed; left pending, not re-run",
+            # The same resolver the runs lane reads, because ADR-0131 requires both
+            # consumer lanes to share the lease implementation by construction ("a
+            # fix on only one consumer lane is incomplete"). Not a copy-paste: an
+            # eval delivery whose owner was force-killed would otherwise wait out
+            # the 900s backstop while a runs delivery recovered in one lease.
+            lease_expired_idle_ms=config.lease_expired_idle_ms_value(),
         )
 
     async def ensure_group(self) -> None:
@@ -403,6 +409,15 @@ class EvalStreamConsumer(StreamConsumer):
             except Exception:
                 logger.exception("eval reclaim tick failed")
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    def _transfer_capacity(self) -> int | None:
+        # The eval lane runs one suite at a time: ``_dispatch`` below awaits the
+        # handler (``asyncio.shield``), so ``_dispatch_reclaimed`` runs suites
+        # strictly one at a time. Subtract a suite already running inline so the
+        # expiry pass claims nothing while one is in flight -- claiming a second
+        # row would leave it XCLAIMed and unleased for the length of a whole eval
+        # run.
+        return max(0, 1 - len(self._inflight_ids))
 
     async def _dispatch(self, entry_id: str, fields: dict[str, str]) -> None:
         """Track the inline eval handler so graceful stop can drain it alive."""

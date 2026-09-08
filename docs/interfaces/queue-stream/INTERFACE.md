@@ -87,6 +87,15 @@ A second broker must honor the stream key, the payload encoding, and the Stream 
   replicas from racing through the delivery budget. A restarted generation
   also recovers rows under its own stable consumer name through the same
   pre-claim cap check before it reads new entries.
+- **Lease expiry** (#2433): a pending row whose delivery state exists and whose
+  delivery lease has expired is transferred regardless of whether its PEL consumer
+  is alive, because a handler that raised released its lease and no prompt path
+  looks at a peer that is not dead. The scan is `xpending_range` with an `IDLE`
+  filter at `CURIE_LEASE_EXPIRED_IDLE_MS` (default one delivery lease TTL) and the
+  claim is `xclaim` at that same min-idle, which makes the claim an atomic
+  compare-and-claim on the row's idle clock. An entry with no delivery state
+  carries no evidence a lease was ever granted and remains on the 900-second
+  `XAUTOCLAIM` fallback.
 - **Compatibility and the prompt cap rule** — an unknown/pre-marker peer keeps
   the unchanged 900-second `XAUTOCLAIM` backstop. For a proven-dead capable
   peer, the prompt path first reads `XPENDING` metadata and skips local
@@ -129,7 +138,9 @@ is not touched:
 - **Consumer transport** — `StreamBroker` (`apps/worker/src/curie_worker/broker.py::StreamBroker`):
   `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`, plus — since the bounded-delivery
   dead-letter path (#505, ADR-0039) — `xpending_range`/`xrange`/`xadd`, plus — since
-  dead-consumer prompt reclaim (#1532) — `xinfo_consumers`/`xclaim`. The non-sacred `StreamConsumer`
+  dead-consumer prompt reclaim (#1532): `xinfo_consumers`/`xclaim`, which the
+  lease-expiry pass (#2433) reuses as an `IDLE`-filtered `xpending_range` plus an
+  `xclaim` at the same min-idle. The non-sacred `StreamConsumer`
   base (`apps/worker/src/curie_worker/stream_consumer.py`) holds a `StreamBroker`; the sacred `consumer.py` subclass
   inherits it unchanged (its `XAUTOCLAIM` reclaim now targets the port by inheritance).
 - **Consumer liveness store** — `ConsumerLivenessStore`

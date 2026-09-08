@@ -3444,3 +3444,72 @@ def test_an_unfenced_eval_lane_has_no_deadline_at_all_while_a_fenced_one_does() 
         await _eval_cleanup(client, cfg)
 
     asyncio.run(go())
+
+
+# --- The lease-expiry reclaim knob, and the eval lane's dispatch bound (#2433) --
+
+
+def test_the_eval_lane_carries_the_configured_lease_expiry_threshold() -> None:
+    """AC5, the eval half of the parity seam.
+
+    ADR-0131 requires both consumer lanes to share the lease implementation by
+    construction: "a fix on only one consumer lane is incomplete." An eval
+    delivery whose owner was force-killed would otherwise wait out the 900 second
+    backstop while a runs delivery on the same fleet recovered in one lease.
+
+    Two assertions, and the second is the one that matters: the first alone
+    cannot tell "wired to the config resolver" from "hard-coded to today's
+    default", so an explicit non-default value is passed as well.
+
+    Red on omitting ``lease_expired_idle_ms`` from the eval ``DeliverySpec``.
+    Twin: ``tests/kernel/test_delivery_ownership.py``'s
+    ``test_the_runs_lane_carries_the_configured_lease_expiry_threshold``.
+    """
+    default_cfg = WorkerConfig()
+    default_consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=default_cfg,
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    assert (
+        default_consumer._delivery.lease_expired_idle_ms
+        == default_cfg.lease_expired_idle_ms_value()
+    )
+
+    explicit_cfg = WorkerConfig(lease_expired_idle_ms=60000)
+    explicit_consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=explicit_cfg,
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    assert explicit_consumer._delivery.lease_expired_idle_ms == 60000
+
+
+def test_the_eval_lane_claims_one_expired_row_at_a_time() -> None:
+    """The eval lane's transfer capacity is 1, because its handler runs inline.
+
+    ``EvalStreamConsumer._dispatch`` awaits ``asyncio.shield(task)``, so
+    ``_dispatch_reclaimed`` runs suites strictly one at a time. A second claimed
+    row would sit XCLAIMed and UNLEASED for the length of a whole eval run, where
+    every other replica reads it as an expired-lease candidate.
+
+    Red on inheriting the base's unbounded ``None``.
+    """
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    assert consumer._transfer_capacity() == 1

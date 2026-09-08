@@ -205,6 +205,7 @@ class Consumer(StreamConsumer):
             logger=logger,
             dead_letter_log="dead-lettered entry %s after %d deliveries (reason=%s) -> %s",
             dead_letter_fail_log="dead-lettering entry %s failed; left pending, not dispatched",
+            lease_expired_idle_ms=config.lease_expired_idle_ms_value(),
         )
 
     async def ensure_group(self) -> None:
@@ -276,6 +277,14 @@ class Consumer(StreamConsumer):
             ),
             self._dispatch,
         )
+
+    def _transfer_capacity(self) -> int | None:
+        # Mirrors the semaphore rather than reading it: ``_dispatch`` adds to
+        # ``_inflight_ids`` immediately after ``self._sem.acquire()`` and
+        # ``_handle``'s finally discards it beside ``self._sem.release()``, so the
+        # two move together and this is the free-slot count without touching
+        # asyncio.Semaphore internals.
+        return max(0, self._max_concurrency - len(self._inflight_ids))
 
     async def _dispatch(self, entry_id: str, fields: dict[str, str]) -> None:
         if entry_id in self._inflight_ids:
@@ -398,7 +407,10 @@ class Consumer(StreamConsumer):
                         else:
                             await self._kernel.process_event(qevent, lease=lease)
                     except Exception as exc:
-                        # Leave the entry pending: XAUTOCLAIM will reclaim and retry.
+                        # Leave the entry pending: the lease-expiry reclaim pass
+                        # picks it up one lease TTL after this handler released
+                        # its lease, with XAUTOCLAIM still the 15 minute backstop
+                        # behind that (#2433).
                         if hasattr(span, "set_status"):
                             span.set_status(StatusCode.ERROR)
                         span.add_event(
@@ -414,6 +426,36 @@ class Consumer(StreamConsumer):
                             attributes={**metric_attributes, "outcome": "pending"},
                         )
                         logger.exception("processing failed for entry %s; left pending", entry_id)
+                        # Best-effort, and belt and braces: the kernel method
+                        # already swallows its own failures, but an exception
+                        # escaping THIS branch is the #673 shape exactly, and a
+                        # notice may never change the settlement outcome of a
+                        # delivery. The return below stays unconditional.
+                        try:
+                            # This branch can run AFTER lease loss and sits ahead
+                            # of the pre-ACK guard below, so terminality alone is
+                            # not permission to edit. A replacement that holds the
+                            # fence now owns this thread and will speak for it;
+                            # talking over it is worse than saying nothing. On the
+                            # leaseless sentinel this never raises, so a base-only
+                            # consumer still notifies.
+                            lease.raise_if_lost()
+                            await self._kernel.notify_turn_not_started(
+                                qevent, lease=lease
+                            )
+                        except LeaseLostError:
+                            logger.warning(
+                                "skipping the not-started notice for entry %s: this "
+                                "owner lost the delivery lease, and the current owner "
+                                "speaks for the thread",
+                                entry_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "not-started notice failed for entry %s",
+                                entry_id,
+                                exc_info=True,
+                            )
                         return
                     try:
                         # A stale owner may not ACK. Checked immediately before

@@ -31,18 +31,21 @@ hide exactly the difference that matters.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker import kernel as kernel_module
 from curie_worker.consumer import Consumer
+from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heartbeat_key
 from curie_worker.delivery_lease import DeliveryLeaseStore
 
-from .conftest import _pending_rows, _ProcessEventSpy
+from .conftest import _failing_process_event, _pending_rows, _ProcessEventSpy
 
 DONE = SessionStatus.DONE
 
@@ -785,3 +788,983 @@ def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_
 
     asyncio.run(go())
 
+
+
+# --- AC2: the lease-expiry reclaim pass ---------------------------------------
+#
+# The gap #1532 and #1971 deliberately left open: a LIVE consumer's own pending
+# row. A handler that RAISED released its delivery lease and left the entry
+# pending, but no prompt path looks at a peer that is not dead, so the row waited
+# out the 900 second XAUTOCLAIM backstop.
+#
+# Every test below pins ``reclaim_min_idle_ms`` at its PRODUCTION 900000,
+# deliberately not shortened the way the harness default is. With the backstop
+# out of reach, any redelivery observed can only have come from the new pass.
+# That is the whole measurement.
+#
+# PEL idle is driven by ``XCLAIM ... IDLE ... JUSTID`` rather than by sleeping.
+# Two properties make that the right lever, both observed against the live
+# Valkey (see ``.projects/plans/task-2433-lease-expiry-reclaim.valkey-probe.md``
+# and the XCLAIM documentation): ``JUSTID`` returns ids only and does NOT
+# increment ``times_delivered``, so arming a boundary does not spend the
+# ADR-0039 budget these tests measure; and passing the row's CURRENT owner as
+# the consumer name leaves ownership untouched, so only idle moves.
+
+# The threshold under test: one lease TTL, which is both the derived default and
+# the floor the config validator allows.
+_EXPIRY_IDLE_MS = int(_TTL_S * 1000)
+
+_EXPIRY_KNOBS: dict[str, object] = {
+    **_LEASE_KNOBS,
+    "lease_expired_idle_ms": _EXPIRY_IDLE_MS,
+    # NOT shortened. See the banner above: this is the measurement.
+    "reclaim_min_idle_ms": 900000,
+}
+
+# The proven-dead peer recipe needs a sustained-absence window short enough to
+# sleep through. ``consumer_capability_ttl_ms`` keeps its 1800000 default, which
+# the ``_capability_outlives_reclaim_backstop`` validator requires to exceed the
+# 900000 backstop above.
+_DEAD_PEER_KNOBS: dict[str, object] = {
+    **_EXPIRY_KNOBS,
+    "dead_consumer_idle_ms": 0,
+    "consumer_heartbeat_ttl_ms": 200,
+}
+
+
+async def _arm_pel_idle(h: Any, entry_id: str, *, owner: str, idle_ms: int) -> None:
+    """Set one PEL row's idle explicitly, spending no delivery and moving no owner.
+
+    ``justid=True`` is load-bearing: a plain XCLAIM bumps ``times_delivered``
+    (probe: 1 -> 2), which is the very number these tests measure. Passing the
+    row's current ``owner`` keeps the PEL consumer unchanged, so this moves the
+    idle clock and nothing else.
+    """
+    claimed = await h.async_redis.xclaim(
+        h.config.stream,
+        h.config.consumer_group,
+        owner,
+        0,
+        [entry_id],
+        idle=idle_ms,
+        justid=True,
+    )
+    assert claimed, f"arming idle for {entry_id} claimed nothing"
+
+
+async def _pel_owners(h: Any) -> dict[str, str]:
+    """Every pending entry id -> the consumer that currently owns its PEL row."""
+    rows = await h.async_redis.xpending_range(
+        h.config.stream, h.config.consumer_group, min="-", max="+", count=50
+    )
+    return {str(row["message_id"]): str(row["consumer"]) for row in rows}
+
+
+async def _fenced_failing_consumer(h: Any) -> tuple[Consumer, DeliveryLeaseStore, list[str]]:
+    """A fenced ``Consumer`` (leases=store) plus the incident's failing handler.
+
+    Five tests below open with exactly this: a ``DeliveryLeaseStore``, a
+    single ``Consumer`` bound to it via ``leases=store``, its group ensured, and
+    ``process_event`` replaced with the raiser. Kept here rather than repeated so
+    the shape of a fenced consumer cannot quietly drift between call sites; a
+    test whose consumer varies (a second replica, ``max_concurrency``, no lease
+    store at all) builds its own ``Consumer`` instead of calling this.
+    """
+    store = DeliveryLeaseStore(h.async_redis, h.config)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    await consumer.ensure_group()
+    attempts = _failing_process_event(h)
+    return consumer, store, attempts
+
+
+async def _lease_expired_row(
+    h: Any, store: DeliveryLeaseStore, *, event_id: str, owner: str
+) -> tuple[str, dict[str, str]]:
+    """A pending row with delivery state present and its lease gone.
+
+    Taken through the store rather than by cancelling a real handler, because
+    that asymmetry IS the signal the new pass keys on: ``release`` drops only the
+    lease key and deliberately leaves the state hash, so a handler that raised
+    looks exactly like this. Only ``settle`` removes the state.
+    """
+    await h.async_redis.xadd(
+        h.config.stream,
+        to_stream_fields(_qevent(event_id, thread=event_id, event_id=event_id)),
+    )
+    entry_id, fields = await _read_one(h, owner)
+    lease = await store.acquire(
+        h.config.stream, h.config.consumer_group, entry_id, consumer=owner
+    )
+    await store.release(
+        h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner
+    )
+    return entry_id, fields
+
+
+async def _prove_peer_dead(h: Any, consumer: Consumer, peer: str) -> None:
+    """Make ``peer`` proven-dead to ``consumer``'s prompt path (#1961).
+
+    The proof is deliberately expensive: the peer must have advertised the
+    liveness protocol, and its alive lease must be absent on TWO observations at
+    least one heartbeat TTL apart. Call this BEFORE arming any idle: the priming
+    observation is a full ``_reclaim_once`` and would otherwise let the expiry
+    pass claim the very row the test is about to set up.
+    """
+    liveness = ConsumerLivenessStore(h.async_redis)
+    await liveness.publish(
+        stream=h.config.stream,
+        group=h.config.consumer_group,
+        consumer=peer,
+        heartbeat_ttl_ms=1,
+        capability_ttl_ms=h.config.consumer_capability_ttl_ms,
+    )
+    alive_key = consumer_heartbeat_key(h.config.stream, h.config.consumer_group, peer)
+    deadline = time.monotonic() + 5.0
+    while await h.async_redis.exists(alive_key):
+        if time.monotonic() > deadline:
+            raise AssertionError(f"the alive lease for {peer} never expired")
+        await asyncio.sleep(0.005)
+    assert await consumer._reclaim_once() == 0, (
+        "the first absent observation transferred work: the sustained-absence "
+        "proof is not being required"
+    )
+    await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.02)
+
+
+def _synchronize_first_eligibility_read(
+    consumer: Consumer, barrier: asyncio.Barrier
+) -> None:
+    """Barrier the FIRST ``_lease_is_live`` per consumer; the re-read runs free.
+
+    A plain ``asyncio.gather`` does not force the interleaving the AC4 tests are
+    about: one replica can finish its whole pass before the other starts, and the
+    test then passes just as happily against a ``min_idle_time=0`` claim.
+    Barriering EVERY call instead deadlocks a CORRECT implementation, because the
+    mandatory post-claim re-read would wait for a second participant that has
+    already left. One-shot is the shape that forces the read and leaves the
+    revalidation alone.
+    """
+    inner = consumer._lease_is_live
+    state = {"armed": True}
+
+    async def wrapped(entry_id: str) -> bool:
+        result = await inner(entry_id)
+        if state["armed"]:
+            state["armed"] = False
+            await barrier.wait()
+        return result
+
+    consumer._lease_is_live = wrapped  # type: ignore[method-assign,assignment]
+
+
+class _ClaimGate:
+    """Delegates to the real client, ordering ONE replica's ``XCLAIM`` against another.
+
+    A rendezvous alone leaves the claim order free, and if the dead pass claims
+    first its competitor's positive min-idle correctly rejects it and the test
+    passes for the wrong reason. This makes the order an input.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        before: asyncio.Event | None = None,
+        after: asyncio.Event | None = None,
+    ) -> None:
+        self._inner = inner
+        self._before = before
+        self._after = after
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def xclaim(self, *args: Any, **kwargs: Any) -> Any:
+        if self._before is not None:
+            await asyncio.wait_for(self._before.wait(), timeout=20.0)
+        result = await self._inner.xclaim(*args, **kwargs)
+        if self._after is not None:
+            self._after.set()
+        return result
+
+
+def test_a_failed_turn_is_reclaimed_after_one_lease_not_after_the_backstop(
+    make_harness,
+) -> None:
+    """AC2, the boundary measurement, on a LIVE consumer's own pending row.
+
+    A real turn is driven into ``Consumer._handle``'s ``except`` branch, so the
+    row's shape is the incident's: this consumer still owns the PEL entry, its
+    delivery state survives, and its lease is gone.
+
+    Red on reverting EB-9/EB-10: nothing is redelivered at all, which is the
+    reported symptom. The negative control is the pass BELOW the threshold, which
+    keeps the positive from passing against an implementation that reclaims
+    everything on sight. ``reclaim_min_idle_ms`` is pinned at 900000 throughout,
+    so the redelivery cannot have come from the backstop.
+
+    The exact ``+1`` on ``times_delivered`` is the ADR-0039 half: one logical
+    retry charges exactly one delivery of the budget, never two.
+
+    Twin: ``test_the_running_consumer_redelivers_a_failed_turn_without_a_manual_reclaim``
+    observes the same behavior through the real ``Consumer.run()`` maintenance
+    tick with no reclaim helper called at all.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            consumer, store, attempts = await _fenced_failing_consumer(h)
+
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(_qevent("expired", thread="exp-1", event_id="exp-1")),
+            )
+            entry_id, fields = await _read_one(h, h.config.consumer_name)
+            before = (await _pending_rows(h))[entry_id]
+            await consumer._dispatch(entry_id, fields)
+            await _settle(consumer)
+            assert attempts == ["exp-1"], "the first delivery never reached the kernel"
+
+            # NEGATIVE CONTROL: under the threshold the pass selects nothing.
+            assert await consumer._reclaim_once() == 0
+            assert attempts == ["exp-1"]
+            assert (await _pending_rows(h))[entry_id] == before
+
+            await _arm_pel_idle(
+                h,
+                entry_id,
+                owner=h.config.consumer_name,
+                idle_ms=_EXPIRY_IDLE_MS + 200,
+            )
+            assert await consumer._reclaim_once() == 1
+            await _settle(consumer)
+
+            assert attempts == ["exp-1", "exp-1"], "the retry never reached the kernel"
+            assert (await _pending_rows(h))[entry_id] == before + 1, (
+                "one logical retry charged more than one delivery of the budget"
+            )
+
+    asyncio.run(go())
+
+
+def test_a_live_lease_is_never_reclaimed_by_the_expiry_pass(make_harness) -> None:
+    """AC2's primary fence: a live delivery is never transferred, however idle.
+
+    The peer's lease is kept alive with a bare ``PEXPIRE``, never
+    ``store.heartbeat``: a real heartbeat also resets PEL idle with
+    ``XCLAIM ... JUSTID`` (probe: JUSTID resets idle and does not bump the
+    delivery count), which would take the row out of the scan's IDLE filter
+    entirely and let this test pass without ever exercising the lease check.
+
+    Red on dropping the ``_lease_is_live`` guard from the pass. The positive
+    control -- the same row, the same pass, with the lease key deleted -- is what
+    keeps the refusal from being a dead code path.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            consumer, store, attempts = await _fenced_failing_consumer(h)
+
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(_qevent("live", thread="live-1", event_id="live-1")),
+            )
+            entry_id, _fields = await _read_one(h, "live-peer")
+            await store.acquire(
+                h.config.stream, h.config.consumer_group, entry_id, consumer="live-peer"
+            )
+            lease_key = h.config.delivery_lease_key(
+                h.config.stream, h.config.consumer_group, entry_id
+            )
+            await h.async_redis.pexpire(lease_key, 60000)
+            before = (await _pending_rows(h))[entry_id]
+            await _arm_pel_idle(
+                h, entry_id, owner="live-peer", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            assert await consumer._reclaim_once() == 0
+            assert attempts == []
+            assert (await _pending_rows(h))[entry_id] == before, (
+                "the row was XCLAIMed, so a delivery was burnt off a live turn"
+            )
+
+            # POSITIVE CONTROL: the fence, not a dead pass.
+            await h.async_redis.delete(lease_key)
+            assert await consumer._reclaim_once() == 1
+            await _settle(consumer)
+            assert attempts == ["live-1"]
+            assert (await _pending_rows(h))[entry_id] == before + 1
+
+    asyncio.run(go())
+
+
+def test_the_expiry_pass_is_inert_without_a_lease_store(make_harness) -> None:
+    """A base-only consumer keeps its pre-ADR-0131 behavior exactly.
+
+    Red on dereferencing ``self._leases`` unconditionally in the new pass, and
+    red on keying the pass on the CONFIGURED threshold alone: the config carries
+    a threshold here, and the leaseless consumer must still do nothing with it,
+    because with no lease store there is no evidence to key on.
+
+    The fenced consumer on the same row is the positive control.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            leaseless = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await leaseless.ensure_group()
+            attempts = _failing_process_event(h)
+
+            entry_id, _fields = await _lease_expired_row(
+                h, store, event_id="inert-1", owner="peer-one"
+            )
+            before = (await _pending_rows(h))[entry_id]
+            await _arm_pel_idle(
+                h, entry_id, owner="peer-one", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            assert await leaseless._reclaim_once() == 0
+            assert attempts == []
+            assert (await _pending_rows(h))[entry_id] == before
+
+            # POSITIVE CONTROL: the same row, a fenced consumer.
+            fenced = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            assert await fenced._reclaim_once() == 1
+            await _settle(fenced)
+            assert attempts == ["inert-1"]
+
+    asyncio.run(go())
+
+
+def test_the_runs_lane_carries_the_configured_lease_expiry_threshold(
+    make_harness,
+) -> None:
+    """AC5, the runs half of the parity seam.
+
+    Both lanes must read the SAME resolver, which is what makes ADR-0131's
+    runs/eval parity structural rather than a review promise. Red on hard-coding
+    the threshold anywhere in the reclaim machinery instead of carrying it on the
+    ``DeliverySpec``.
+
+    Twin: ``tests/eval/test_stream.py``'s
+    ``test_the_eval_lane_carries_the_configured_lease_expiry_threshold``.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+
+            assert h.config.lease_expired_idle_ms_value() == _EXPIRY_IDLE_MS
+            assert consumer._delivery.lease_expired_idle_ms == _EXPIRY_IDLE_MS
+
+    asyncio.run(go())
+
+
+# --- AC3: no delivery state means the unchanged backstop still applies --------
+
+
+def test_an_entry_with_no_delivery_state_stays_on_the_backstop(make_harness) -> None:
+    """AC3, the mixed-version rule, as one control pair in a single pass.
+
+    A pre-lease or pre-marker consumer's pending entry carries no evidence a
+    lease was ever granted, so "the lease is gone" cannot be told apart from
+    "there never was one". Such a row stays on the unchanged 900 second backstop.
+    Its lease-aware sibling, armed identically in the same pass, is redelivered.
+
+    The legacy row is asserted to really BE the legacy shape (``peek`` returns
+    ``{}``) before anything else, so a change that silently started writing state
+    on read would fail here rather than making the pair vacuous.
+
+    Red on dropping the ``has_state`` guard: every legacy consumer's pending
+    entry becomes reclaimable by a replica that never had any evidence about it.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            consumer, store, attempts = await _fenced_failing_consumer(h)
+
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(
+                    _qevent("legacy", thread="legacy-1", event_id="legacy-1")
+                ),
+            )
+            legacy_id, _legacy_fields = await _read_one(h, "legacy-peer")
+            assert (
+                await store.peek(h.config.stream, h.config.consumer_group, legacy_id)
+                == {}
+            ), "the legacy row carries delivery state, so it is not the legacy shape"
+
+            new_id, _new_fields = await _lease_expired_row(
+                h, store, event_id="new-1", owner="lease-aware-peer"
+            )
+            before = await _pending_rows(h)
+            await _arm_pel_idle(
+                h, legacy_id, owner="legacy-peer", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+            await _arm_pel_idle(
+                h, new_id, owner="lease-aware-peer", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            assert await consumer._reclaim_once() == 1
+            await _settle(consumer)
+
+            assert attempts == ["new-1"]
+            after = await _pending_rows(h)
+            assert after[legacy_id] == before[legacy_id], (
+                "a row with no delivery state was XCLAIMed off the backstop"
+            )
+            assert after[new_id] == before[new_id] + 1
+
+    asyncio.run(go())
+
+
+def test_an_unreadable_delivery_state_read_leaves_the_entry_on_the_backstop(
+    make_harness, caplog
+) -> None:
+    """AC3's fail-closed posture, which is the MIRROR of ``_lease_is_live``'s.
+
+    ``_lease_is_live`` fails closed as OWNED and ``_has_delivery_state`` fails
+    closed as ABSENT. Both answers refuse the claim: failing open here would let
+    one Valkey blip manufacture a duplicate dispatch of a turn somebody may still
+    be running.
+
+    Red on ``return True`` in the ``except``, and red on swallowing the failure
+    with no WARNING. The positive control restores the read and reclaims the very
+    same row in the very same pass shape.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            consumer, store, attempts = await _fenced_failing_consumer(h)
+
+            entry_id, _fields = await _lease_expired_row(
+                h, store, event_id="unreadable-1", owner="peer-one"
+            )
+            before = (await _pending_rows(h))[entry_id]
+            await _arm_pel_idle(
+                h, entry_id, owner="peer-one", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            readable = store.has_state
+
+            async def unreadable(stream: str, group: str, entry: str) -> bool:
+                raise ConnectionError("injected delivery-state read failure")
+
+            store.has_state = unreadable  # type: ignore[method-assign,assignment]
+            with caplog.at_level(logging.WARNING, logger="curie_worker.consumer"):
+                assert await consumer._reclaim_once() == 0
+            assert attempts == []
+            assert (await _pending_rows(h))[entry_id] == before
+            assert any(entry_id in message for message in caplog.messages), (
+                "an unreadable delivery state was swallowed silently"
+            )
+
+            # POSITIVE CONTROL: the read, not a dead pass.
+            store.has_state = readable  # type: ignore[method-assign]
+            assert await consumer._reclaim_once() == 1
+            await _settle(consumer)
+            assert attempts == ["unreadable-1"]
+            assert (await _pending_rows(h))[entry_id] == before + 1
+
+    asyncio.run(go())
+
+
+# --- AC4: two transfer paths cannot both move one row -------------------------
+
+
+def test_two_replicas_reclaiming_the_same_expired_row_dispatch_it_once(
+    make_harness,
+) -> None:
+    """AC4, same-path: two expiry passes, one row, one dispatch.
+
+    ``_reclaim_lock`` is per-process and proves nothing across replicas, and this
+    pass takes no ``try_acquire_reclaim`` arbitration lease (that one is keyed per
+    DEAD consumer, which does not apply when the owner is alive). The only
+    serializer is the claim itself: ``XCLAIM`` with a positive min-idle is an
+    atomic compare-and-claim on the row's idle clock, and the winner resets that
+    clock to about zero (probe: replica B's ``XCLAIM min-idle=1000`` on a row A
+    just claimed returns ``[]``).
+
+    The interleaving is FORCED, because a plain gather lets one replica finish
+    before the other starts and would pass against a broken implementation.
+
+    Mutation map: this test goes red, and only red, on ``min_idle_ms=0`` in the
+    EXPIRY pass. It says nothing about the proven-dead pass, which is the
+    cross-path test's job. The two assertions isolate different failures:
+    ``sum(dispatched) == 1`` catches "both claims succeed", and the exact ``+1``
+    on ``times_delivered`` catches the silent form where the loser steals the row,
+    the winner is fenced out on its next heartbeat, and nobody runs the turn while
+    a delivery was still charged.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
+            cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
+            consumer_a = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
+            )
+            consumer_b = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
+            )
+            await consumer_a.ensure_group()
+            attempts = _failing_process_event(h)
+
+            entry_id, _fields = await _lease_expired_row(
+                h, store, event_id="race-1", owner="departed-peer"
+            )
+            before = (await _pending_rows(h))[entry_id]
+            await _arm_pel_idle(
+                h, entry_id, owner="departed-peer", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            barrier = asyncio.Barrier(2)
+            _synchronize_first_eligibility_read(consumer_a, barrier)
+            _synchronize_first_eligibility_read(consumer_b, barrier)
+
+            async with asyncio.timeout(30):
+                dispatched = await asyncio.gather(
+                    consumer_a._reclaim_once(), consumer_b._reclaim_once()
+                )
+            await _settle(consumer_a)
+            await _settle(consumer_b)
+
+            assert sum(dispatched) == 1, f"both replicas dispatched: {dispatched}"
+            assert attempts == ["race-1"]
+            assert (await _pending_rows(h))[entry_id] == before + 1, (
+                "two transfer paths both moved one row: a delivery was charged "
+                "for a turn nobody ran"
+            )
+
+    asyncio.run(go())
+
+
+def test_a_dead_consumer_pass_does_not_steal_a_row_the_expiry_pass_just_claimed(
+    make_harness,
+) -> None:
+    """AC4, cross-path: the pre-existing zero-idle competitor is the real hazard.
+
+    One row is eligible for BOTH passes: its owner is proven dead to replica A,
+    and its lease has expired with its state intact, which is replica B's expiry
+    candidate. The interleaving under test is the one that costs two deliveries
+    and runs the turn zero times: B claims and acquires the lease, A's stale
+    ``XCLAIM`` steals the PEL row anyway, B's next heartbeat fails its PEL-owner
+    guard and B is fenced out mid-turn, and A skips dispatch on B's now-live
+    lease.
+
+    Both halves of the ordering are inputs, not luck: the one-shot barrier makes
+    A's eligibility read provably precede B's claim (which is what makes A's
+    observed idle stale), and the claim gate makes B claim first.
+
+    Mutation map: this test goes red, and only red, on the proven-dead pass
+    reverting to a batched ``min_idle_time=0``. The last assertion catches the
+    silent form: with the counts alone a reviewer cannot tell a clean handoff
+    from a fenced-out winner, so the winner is required to settle.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_DEAD_PEER_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
+            cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
+            consumer_a = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
+            )
+            consumer_b = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
+            )
+            await consumer_a.ensure_group()
+            spy = _ProcessEventSpy(h.kernel)
+
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="one run", status=DONE)]
+
+            entry_id, _fields = await _lease_expired_row(
+                h, store, event_id="steal-1", owner="dying-peer"
+            )
+            before = (await _pending_rows(h))[entry_id]
+
+            await _prove_peer_dead(h, consumer_a, "dying-peer")
+            await _arm_pel_idle(
+                h, entry_id, owner="dying-peer", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            b_claimed = asyncio.Event()
+            consumer_a._redis = _ClaimGate(  # type: ignore[assignment]
+                h.async_redis, before=b_claimed
+            )
+            consumer_b._redis = _ClaimGate(  # type: ignore[assignment]
+                h.async_redis, after=b_claimed
+            )
+            barrier = asyncio.Barrier(2)
+            _synchronize_first_eligibility_read(consumer_a, barrier)
+            _synchronize_first_eligibility_read(consumer_b, barrier)
+
+            async with asyncio.timeout(60):
+                dispatched = await asyncio.gather(
+                    consumer_a._reclaim_once(), consumer_b._reclaim_once()
+                )
+
+            assert sum(dispatched) == 1, f"both passes moved the row: {dispatched}"
+            await _wait_until(lambda: h.runner.turn_active)
+            assert (await _pending_rows(h))[entry_id] == before + 1, (
+                "the dead pass stole a row the expiry pass had already claimed: "
+                "two deliveries charged for one logical retry"
+            )
+
+            hold.set()
+            await _settle(consumer_a)
+            await _settle(consumer_b)
+
+            assert spy.entries_for("steal-1") == 1
+            winner = spy.leases_for("steal-1")[0]
+            assert winner is not None, "the kernel was handed no lease"
+            assert not winner.lost.is_set(), (
+                "the winner was fenced out mid-turn by a competing claim"
+            )
+            assert entry_id not in await _pending_rows(h), (
+                "nobody settled the row: the turn was charged and never finished"
+            )
+
+    asyncio.run(go())
+
+
+def test_a_delayed_handoff_loses_the_row_to_a_peer_without_a_double_run(
+    make_harness, caplog
+) -> None:
+    """The ACCEPTED residual, pinned as a bounded number rather than left as prose.
+
+    Selection completes before any dispatch, and the runs lane's ``_dispatch``
+    then waits on a semaphore. If that wait exceeds one lease TTL, the row this
+    process claimed has been idle long enough to become a legitimate expiry-pass
+    candidate for a peer. The peer compare-and-claims it, and this process's late
+    ``acquire`` is refused ``not-owner`` and returns WITHOUT acking.
+
+    The cost is exactly one extra charged delivery. Never a double run, never a
+    stranded turn. The ``+2`` is deliberately exact: it documents the residual as
+    a known number, so a future change that made the cost three goes red here
+    rather than being absorbed silently.
+
+    Red on a residual that grows, and red on a late handler that runs anyway
+    (which would be the double run this whole design exists to prevent).
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
+            cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
+            consumer_a = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
+            )
+            consumer_b = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
+            )
+            await consumer_a.ensure_group()
+            attempts = _failing_process_event(h)
+
+            entry_id, _fields = await _lease_expired_row(
+                h, store, event_id="delayed-1", owner="departed-peer"
+            )
+            before = (await _pending_rows(h))[entry_id]
+            await _arm_pel_idle(
+                h, entry_id, owner="departed-peer", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            released = asyncio.Event()
+            dispatch_a = consumer_a._delivery.handler
+
+            async def held(held_id: str, fields: dict[str, str]) -> None:
+                await released.wait()
+                await dispatch_a(held_id, fields)
+
+            consumer_a._delivery = replace(consumer_a._delivery, handler=held)
+
+            with caplog.at_level(logging.WARNING, logger="curie_worker.consumer"):
+                task_a = asyncio.create_task(consumer_a._reclaim_once())
+                deadline = time.monotonic() + 10.0
+                while (await _pel_owners(h)).get(entry_id) != "worker-a":
+                    if time.monotonic() > deadline:
+                        raise AssertionError("replica A never claimed the row")
+                    await asyncio.sleep(0.01)
+
+                # A's dispatch is still parked, so its claimed row is unleased and
+                # ages back past the threshold, exactly as a saturated node's does.
+                await _arm_pel_idle(
+                    h, entry_id, owner="worker-a", idle_ms=_EXPIRY_IDLE_MS + 200
+                )
+                assert await consumer_b._reclaim_once() == 1
+                await _settle(consumer_b)
+
+                released.set()
+                await asyncio.wait_for(task_a, timeout=20.0)
+                await _settle(consumer_a)
+
+            assert attempts == ["delayed-1"], (
+                f"the delayed handoff ran the turn more than once: {attempts}"
+            )
+            assert any(
+                "refused the delivery lease for entry" in message
+                for message in caplog.messages
+            ), "the late handler was not refused; it may have run beside the peer"
+            assert entry_id in await _pending_rows(h), (
+                "the late owner acked a delivery it no longer held"
+            )
+            assert (await _pending_rows(h))[entry_id] == before + 2, (
+                "the accepted residual is exactly one EXTRA charged delivery"
+            )
+
+    asyncio.run(go())
+
+
+# --- The capacity bound: claim only what this process can dispatch now --------
+
+
+def test_a_saturated_consumer_claims_no_more_expired_rows_than_it_can_dispatch(
+    make_harness,
+) -> None:
+    """The capacity budget, and why an unbounded pass is worse than a slow one.
+
+    Every row this pass claims sits XCLAIMed but UNLEASED until its dispatched
+    handler acquires the delivery lease, and ``_dispatch`` waits on the semaphore
+    before it gets that far. On a saturated node an unbounded pass therefore parks
+    claimed-but-unowned rows for the whole wait, where every other replica reads
+    them as expired-lease candidates.
+
+    Neither row being XCLAIMed AT ALL is the assertion that matters: it proves the
+    pass stopped before claiming rather than claiming and discarding. The passes
+    after the slot frees prove the bound is a DEFERRAL, not a refusal, and that
+    the surplus is routed rather than dropped.
+
+    Red on an unbounded expiry pass.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                max_concurrency=1,
+                leases=store,
+            )
+            await consumer.ensure_group()
+
+            real_process = h.kernel.process_event
+            attempts: list[str] = []
+
+            async def routed(qevent: QueuedTurn, *, lease: Any = None) -> None:
+                attempts.append(qevent.event_id)
+                if qevent.event_id != "held-1":
+                    raise RuntimeError("simulated handler failure")
+                if lease is None:
+                    await real_process(qevent)
+                else:
+                    await real_process(qevent, lease=lease)
+
+            h.kernel.process_event = routed  # type: ignore[method-assign,assignment]
+
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=DONE)]
+
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(_qevent("held", thread="sat-held", event_id="held-1")),
+            )
+            held_id, held_fields = await _read_one(h, h.config.consumer_name)
+            await consumer._dispatch(held_id, held_fields)
+            await _wait_until(lambda: h.runner.turn_active)
+            assert len(consumer._inflight_ids) == 1, "the only slot is not occupied"
+
+            first_id, _first = await _lease_expired_row(
+                h, store, event_id="sat-1", owner="peer-one"
+            )
+            second_id, _second = await _lease_expired_row(
+                h, store, event_id="sat-2", owner="peer-two"
+            )
+            before = await _pending_rows(h)
+            await _arm_pel_idle(
+                h, first_id, owner="peer-one", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+            await _arm_pel_idle(
+                h, second_id, owner="peer-two", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            assert await consumer._reclaim_once() == 0
+            after = await _pending_rows(h)
+            assert after[first_id] == before[first_id]
+            assert after[second_id] == before[second_id]
+            owners = await _pel_owners(h)
+            assert owners[first_id] == "peer-one", "a row was claimed then discarded"
+            assert owners[second_id] == "peer-two", "a row was claimed then discarded"
+
+            hold.set()
+            await _settle(consumer)
+            assert not consumer._inflight_ids
+
+            # One free slot means exactly one claim, and the deferred row follows
+            # on the next tick rather than being dropped.
+            assert await consumer._reclaim_once() == 1
+            await _settle(consumer)
+
+            # Exactly one row was deferred, and it is re-armed explicitly so the
+            # next tick cannot pick the row this one already took: the claim
+            # above reset that row's idle, and which of the two was claimed is
+            # not this test's business.
+            owners_now = await _pel_owners(h)
+            deferred = [
+                row
+                for row in (first_id, second_id)
+                if owners_now[row] != h.config.consumer_name
+            ]
+            assert len(deferred) == 1, f"the bound claimed {2 - len(deferred)} rows"
+            await _arm_pel_idle(
+                h,
+                deferred[0],
+                owner=owners_now[deferred[0]],
+                idle_ms=_EXPIRY_IDLE_MS + 200,
+            )
+            assert await consumer._reclaim_once() == 1
+            await _settle(consumer)
+
+            final = await _pending_rows(h)
+            assert final[first_id] == before[first_id] + 1
+            assert final[second_id] == before[second_id] + 1
+            assert sorted(attempts) == ["held-1", "sat-1", "sat-2"]
+
+    asyncio.run(go())
+
+
+def test_the_expiry_pass_leaves_no_room_for_a_row_the_dead_pass_already_took(
+    make_harness,
+) -> None:
+    """``already_selected``: the two passes share one tick's capacity, not two.
+
+    Nothing is dispatched until every pass has finished selecting, so a
+    concurrency-one consumer whose proven-dead pass just took a row still sees a
+    free slot when the expiry pass runs. Without subtracting what the dead pass
+    already selected, it claims a second row that then waits behind the first,
+    which is the very parking the budget exists to prevent.
+
+    The dead-pass row carries NO delivery state on purpose, so only the dead pass
+    can select it and the two passes cannot be confused for one another.
+
+    Red on dropping ``already_selected=len(selected)`` from the ``_reclaim_once``
+    call: both rows are claimed and both are charged.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_DEAD_PEER_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                max_concurrency=1,
+                leases=store,
+            )
+            await consumer.ensure_group()
+            attempts = _failing_process_event(h)
+
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(
+                    _qevent("dead row", thread="budget-dead", event_id="dead-1")
+                ),
+            )
+            dead_id, _dead_fields = await _read_one(h, "dying-peer")
+            expiry_id, _expiry_fields = await _lease_expired_row(
+                h, store, event_id="budget-1", owner="other-peer"
+            )
+            before = await _pending_rows(h)
+
+            await _prove_peer_dead(h, consumer, "dying-peer")
+            await _arm_pel_idle(
+                h, expiry_id, owner="other-peer", idle_ms=_EXPIRY_IDLE_MS + 200
+            )
+
+            assert await consumer._reclaim_once() == 1
+            await _settle(consumer)
+
+            assert attempts == ["dead-1"]
+            after = await _pending_rows(h)
+            assert after[dead_id] == before[dead_id] + 1
+            assert after[expiry_id] == before[expiry_id], (
+                "the expiry pass claimed a row the tick had no capacity to dispatch"
+            )
+
+    asyncio.run(go())
+
+
+# --- The Fix pin: the same behavior through the real maintenance tick ---------
+
+
+def test_the_running_consumer_redelivers_a_failed_turn_without_a_manual_reclaim(
+    make_harness,
+) -> None:
+    """The Fix pin (#2433). No reclaim helper is called by this test at all.
+
+    Every other AC2 test invokes ``_reclaim_once()`` by hand, which proves the
+    algorithm and nothing about the deployed worker ever scheduling it. This one
+    drives the real ``Consumer.run()``, whose maintenance loop calls the pass on
+    ``reclaim_interval_s``, and observes AC1's placeholder edit and AC2's
+    redelivery together through one running consumer, which is the shape the
+    incident had.
+
+    ``reclaim_min_idle_ms`` stays pinned at 900000, so the redelivery still
+    cannot have come from the backstop.
+
+    Red on wiring the pass anywhere the maintenance tick does not reach, red on a
+    pass that only works when a test calls it directly, and red on a retry that
+    charges more than one delivery of the ADR-0039 budget.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_EXPIRY_KNOBS) as h:
+            consumer, store, attempts = await _fenced_failing_consumer(h)
+
+            entry_id = await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(
+                    _qevent("lifecycle", thread="life-1", event_id="life-1")
+                ),
+            )
+
+            task = asyncio.create_task(consumer.run())
+            try:
+                await _wait_until(lambda: len(attempts) >= 2, timeout=30.0)
+            finally:
+                consumer.request_stop()
+                await asyncio.wait_for(task, timeout=20.0)
+                await _settle(consumer)
+
+            delivered = list(attempts)
+            rows = await _pending_rows(h)
+
+            assert delivered == ["life-1"] * len(delivered)
+            assert len(delivered) >= 2, "the running consumer never redelivered"
+            assert entry_id in rows, "the redelivered turn was acked or dead-lettered"
+            assert rows[entry_id] == len(delivered), (
+                "each redelivery must charge exactly one delivery of the budget"
+            )
+            assert h.sink.updates == [
+                ("C1", "p-1", h.config.turn_not_started_text)
+            ] * len(delivered), (
+                "AC1 and AC2 must be observable together: the person is told on "
+                "every failed delivery while the redelivery is waited out"
+            )
+
+    asyncio.run(go())

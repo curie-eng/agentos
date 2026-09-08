@@ -466,6 +466,25 @@ class DeliveryLeaseStore:
         lease_key, _state_key = self._keys(stream, group, entry_id)
         return bool(await self._redis.exists(lease_key))
 
+    async def has_state(self, stream: str, group: str, entry_id: str) -> bool:
+        """Was a lease ever granted for this delivery?
+
+        A bare ``EXISTS`` on the state key, the cheap counterpart of
+        :meth:`is_live`'s ``EXISTS`` on the lease key. It exists rather than a
+        truthiness test on :meth:`peek` because that would drag the whole hash
+        back for a question that is one bit.
+
+        What it is FOR: positive evidence. It separates "a lease-aware owner died
+        or failed here", which is reclaimable once its lease is gone, from "a
+        pre-lease or pre-marker consumer's entry", which has no evidence at all
+        and stays on the unchanged XAUTOCLAIM backstop (the mixed-version rule in
+        ``apps/worker/CLAUDE.md``). Absence is authoritative for the second case
+        because only :meth:`settle` removes the state: a ``release`` leaves it, so
+        a failed handler's entry still carries it long after its lease is gone.
+        """
+        _lease_key, state_key = self._keys(stream, group, entry_id)
+        return bool(await self._redis.exists(state_key))
+
     async def peek(self, stream: str, group: str, entry_id: str) -> dict[str, str]:
         """The delivery state hash for diagnostics, ``{}`` when absent."""
         _lease_key, state_key = self._keys(stream, group, entry_id)
