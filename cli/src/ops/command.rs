@@ -44,7 +44,10 @@ pub struct OpsCommand {
 pub enum CmdArg {
     Plain(String),
     HelmSetExpression(String),
-    SecretSet { key: String, value: String },
+    SecretSet {
+        key: String,
+        value: String,
+    },
     SecretValuesFile(Vec<(String, String)>),
     PrivateJsonValuesFile(PrivateHelmValues),
     SecretPatchFile {
