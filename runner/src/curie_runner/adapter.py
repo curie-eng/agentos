@@ -141,7 +141,9 @@ def build_options(
         include_partial_messages=True,
         # Optional operator deny list (#2429). Empty/None keeps the SDK default
         # (no tools removed). Names are removed from the model context and cannot
-        # be used even under bypassPermissions.
+        # be used even under bypassPermissions. This removes a tool, not the
+        # capability behind it: it does not revoke CURIE_STATE_TOKEN, which a
+        # still-permitted tool can still use to reach the same API directly.
         disallowed_tools=list(disallowed_tools or ()),
     )
 
