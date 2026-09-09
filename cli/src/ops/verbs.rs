@@ -1837,7 +1837,12 @@ pub struct PodRow {
 
 impl PodRow {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({"pod": self.name, "ready": self.ready, "status": self.status})
+        let mut row =
+            serde_json::json!({"pod": self.name, "ready": self.ready, "status": self.status});
+        if let Some(report) = &self.mail_channel {
+            row["mail_channel"] = serde_json::to_value(report).expect("mail_channel serializes");
+        }
+        row
     }
 }
 

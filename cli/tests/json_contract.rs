@@ -2411,20 +2411,46 @@ fn cluster_status_output_validates_both_variants() {
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());
-    let mut with_mail = out.to_json();
-    with_mail["pods"]["rows"][0]["mail_channel"] =
-        serde_json::to_value(curie::mail_channel::Report {
-            pod: "acme-mail-0".to_string(),
-            channel_token: Some(curie::mail_channel::Token {
-                present: true,
-                exp: Some(1_800_000_000),
-                state: curie::mail_channel::TokenState::Expired,
+    assert!(
+        out.to_json()["pods"]["rows"][0]["mail_channel"].is_null(),
+        "an unprobed row omits mail_channel so consumers read null"
+    );
+    let with_mail = ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![PodRow {
+            mail_channel: Some(curie::mail_channel::Report {
+                pod: "acme-mail-0".to_string(),
+                channel_token: Some(curie::mail_channel::Token {
+                    present: true,
+                    exp: Some(1_800_000_000),
+                    state: curie::mail_channel::TokenState::Expired,
+                }),
+                last_ingress_status: None,
+                detail: "mail channel token: expired".to_string(),
+                fix: Some("re-mint".to_string()),
             }),
-            last_ingress_status: None,
-            detail: "mail channel token: expired".to_string(),
-            fix: Some("re-mint".to_string()),
-        })
-        .unwrap();
+            name: "acme-mail-0".to_string(),
+            ready: "1/1".to_string(),
+            status: "Running".to_string(),
+        }],
+        ready: 1,
+        total: 1,
+        unhealthy: vec![],
+        warnings: vec![],
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
+        delivery: curie::completion_outbox::Report::unknown(),
+    };
+    let with_mail = ClusterStatusOutput::Status(Box::new(with_mail)).to_json();
+    assert_eq!(
+        with_mail["pods"]["rows"][0]["mail_channel"]["channel_token"]["state"],
+        "expired"
+    );
     assert_valid("cluster-status.schema.json", &with_mail);
 
     let dry = ClusterStatusOutput::DryRun(DryRunPlan {
