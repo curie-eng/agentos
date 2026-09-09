@@ -191,11 +191,13 @@ class FakeModelSession:
         can_use_tool: CanUseTool | None = None,
         approval_gate: ApprovalGate | None = None,
         emit_partial_boundaries: bool = False,
+        disallowed_tools: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self._script_factory = script_factory or self._default_script
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
         self._emit_partial_boundaries = emit_partial_boundaries
+        self._disallowed_tools = tuple(disallowed_tools or ())
         # The shared policy gate (#561): a scripted request_approval block must
         # run the SAME route-resolution decision table the real MCP tool does, or
         # the fake tier omits the sole-route auto-bind / unknown-route refusal and
@@ -291,6 +293,13 @@ class FakeModelSession:
                 # untouched, so this is the only thing that sets the policy fields.
                 payload = block.input if isinstance(block.input, dict) else {}
                 process_approval_request(self._approval_gate, payload)
+            if block.name in self._disallowed_tools:
+                # Mirror ClaudeAgentOptions.disallowed_tools: the named tool is
+                # not usable. The ToolUseBlock is still delivered (the real SDK
+                # emits it), then the turn stops so the scripted result cannot
+                # execute the write (#2429).
+                self._halted = True
+                continue
             if self._can_use_tool is not None:
                 decision = await self._can_use_tool(
                     block.name, block.input, ToolPermissionContext()
