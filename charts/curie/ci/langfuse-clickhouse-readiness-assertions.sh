@@ -41,6 +41,20 @@
 # securityContext as its application container (the #351 named-image-user class
 # applies to init containers too), and is operator-disableable.
 #
+# Issue #2314 (BYO ClickHouse over TLS) extends the same file. Every consumer
+# used to hardcode `http://` when composing the ClickHouse endpoint, so a BYO
+# ClickHouse reachable only over TLS could not be used at all: the Langfuse app
+# containers and this gate both spoke cleartext to an HTTPS listener. The scheme
+# now comes from the `curie.clickhouse.scheme` helper (explicit
+# `clickhouse.scheme` wins, otherwise https is derived on the conventional HTTPS
+# port 8443 with `deploy: false`), feeding `CLICKHOUSE_URL`,
+# `CLICKHOUSE_MIGRATION_URL`, and the `CLICKHOUSE_MIGRATION_SSL` flag Langfuse's
+# migrator uses for the native port. The assertions below cover the rendered
+# shape AND -- because a rendered `https://` URL proves nothing about whether
+# the probe can speak TLS -- run the rendered gate against a stub ClickHouse
+# serving real TLS, with a cleartext negative control so the pass cannot come
+# from anything but a completed TLS handshake.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
 
@@ -48,8 +62,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TMP="$(mktemp -d)"
+STUB_PID=""
+GATE_PID=""
+stop_owned_processes() {
+  local pid
+  for pid in "$GATE_PID" "$STUB_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "$GATE_PID" "$STUB_PID"; do
+    [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
+  done
+  GATE_PID=""
+  STUB_PID=""
+}
 cleanup() {
-  [[ -n "${STUB_PID:-}" ]] && kill "$STUB_PID" 2>/dev/null || true
+  stop_owned_processes
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -63,6 +92,8 @@ PATIENT="$TMP/patient.yaml"
 FAST="$TMP/fast.yaml"
 TOLERANT="$TMP/tolerant.yaml"
 DISABLED="$TMP/disabled.yaml"
+SECURE="$TMP/secure.yaml"
+EXPLICIT="$TMP/explicit.yaml"
 
 echo "=== Rendering templates/langfuse.yaml (defaults) ==="
 helm template rel "$CHART" --show-only templates/langfuse.yaml > "$DEFAULT"
@@ -86,6 +117,21 @@ helm template rel "$CHART" --show-only templates/langfuse.yaml \
 echo "=== Rendering templates/langfuse.yaml (gate disabled) ==="
 helm template rel "$CHART" --show-only templates/langfuse.yaml \
   --set langfuse.clickhouseReadiness.enabled=false > "$DISABLED"
+
+echo "=== Rendering templates/langfuse.yaml (BYO ClickHouse on the TLS port) ==="
+helm template rel "$CHART" --show-only templates/langfuse.yaml \
+  --set clickhouse.deploy=false \
+  --set-string clickhouse.host=ch.example.com \
+  --set clickhouse.httpPort=8443 \
+  --set clickhouse.nativePort=9440 \
+  --set langfuse.clickhouseReadiness.maxAttempts=3 \
+  --set langfuse.clickhouseReadiness.intervalSeconds=1 > "$SECURE"
+
+echo "=== Rendering templates/langfuse.yaml (BYO ClickHouse, explicit clickhouse.scheme) ==="
+helm template rel "$CHART" --show-only templates/langfuse.yaml \
+  --set clickhouse.deploy=false \
+  --set-string clickhouse.host=ch.example.com \
+  --set-string clickhouse.scheme=https > "$EXPLICIT"
 
 # ---------------------------------------------------------------- render shape
 
@@ -169,6 +215,138 @@ if ! out="$(python3 "$TMP/shape.py" "$DEFAULT" "$DISABLED" 2>&1)"; then
 fi
 echo "$out"
 
+# ------------------------------------------------- ClickHouse scheme (#2314)
+
+cat > "$TMP/scheme.py" <<'PY'
+import sys, yaml
+
+default_path, secure_path, explicit_path = sys.argv[1:4]
+
+
+def deployments(path):
+    return [
+        doc
+        for doc in yaml.safe_load_all(open(path))
+        if doc and doc.get("kind") == "Deployment"
+    ]
+
+
+def containers(dep):
+    spec = dep["spec"]["template"]["spec"]
+    return (spec.get("initContainers") or []) + (spec.get("containers") or [])
+
+
+def named(dep, name):
+    for container in containers(dep):
+        if container.get("name") == name:
+            return container
+    raise SystemExit(f"{dep['metadata']['name']}: no {name!r} container rendered")
+
+
+def env_of(container, name):
+    for entry in container.get("env") or []:
+        if entry.get("name") == name:
+            return entry.get("value")
+    return None
+
+
+def app_of(dep):
+    name = dep["metadata"]["name"]
+    return named(dep, "langfuse-web" if name.endswith("-langfuse-web") else "langfuse-worker")
+
+
+def check(path, label, url, migration_url, migration_ssl, url_prefix=None):
+    """`url`/`migration_url` of None skip the exact comparison; `url_prefix`
+    asserts a prefix instead, which is how the default render is pinned to
+    cleartext without hardcoding the release name."""
+    deps = deployments(path)
+    if len(deps) != 2:
+        raise SystemExit(f"{label}: expected both Langfuse Deployments, got {len(deps)}")
+    for dep in deps:
+        name = dep["metadata"]["name"]
+        app = app_of(dep)
+        gate = named(dep, "wait-for-clickhouse")
+        for container, label_c in ((app, "app"), (gate, "gate")):
+            actual = env_of(container, "CLICKHOUSE_URL")
+            if url is not None and actual != url:
+                raise SystemExit(
+                    f"{label}: {name} {label_c} CLICKHOUSE_URL is {actual!r}, expected {url!r}"
+                )
+            if url_prefix is not None and not (actual or "").startswith(url_prefix):
+                raise SystemExit(
+                    f"{label}: {name} {label_c} CLICKHOUSE_URL is {actual!r}, "
+                    f"expected it to start with {url_prefix!r}"
+                )
+        actual = env_of(app, "CLICKHOUSE_MIGRATION_URL")
+        if migration_url is not None and actual != migration_url:
+            raise SystemExit(
+                f"{label}: {name} CLICKHOUSE_MIGRATION_URL is {actual!r}, "
+                f"expected {migration_url!r}"
+            )
+        # The migration DSN must stay bare: Langfuse's up.sh appends its own
+        # `?username=...`, so a query string here yields two `?` and the
+        # migration fails.
+        if "?" in (actual or ""):
+            raise SystemExit(
+                f"{label}: {name} CLICKHOUSE_MIGRATION_URL carries a query string "
+                f"({actual!r}); Langfuse's migrator appends its own"
+            )
+        actual = env_of(app, "CLICKHOUSE_MIGRATION_SSL")
+        if migration_ssl is None:
+            if any(
+                entry.get("name") == "CLICKHOUSE_MIGRATION_SSL"
+                for entry in app.get("env") or []
+            ):
+                raise SystemExit(
+                    f"{label}: {name} renders CLICKHOUSE_MIGRATION_SSL on the cleartext "
+                    f"path; the default render must be unchanged"
+                )
+        elif actual != migration_ssl:
+            raise SystemExit(
+                f"{label}: {name} CLICKHOUSE_MIGRATION_SSL is {actual!r}, "
+                f"expected {migration_ssl!r}"
+            )
+
+
+# Default: chart-owned ClickHouse, cleartext, and no TLS migration flag at all.
+check(default_path, "default", None, None, None, url_prefix="http://")
+
+check(
+    secure_path,
+    "byo-8443",
+    "https://ch.example.com:8443",
+    "clickhouse://ch.example.com:9440",
+    "true",
+)
+check(
+    explicit_path,
+    "byo-explicit-https",
+    "https://ch.example.com:8123",
+    "clickhouse://ch.example.com:9000",
+    "true",
+)
+print("  ok: default stays cleartext with no CLICKHOUSE_MIGRATION_SSL")
+print("  ok: httpPort 8443 derives https://ch.example.com:8443 with CLICKHOUSE_MIGRATION_SSL=true")
+print("  ok: an explicit clickhouse.scheme=https wins on the default ports")
+PY
+
+echo
+echo "=== Assertion 1b: the ClickHouse scheme reaches both the app and the gate (#2314) ==="
+if ! out="$(python3 "$TMP/scheme.py" "$DEFAULT" "$SECURE" "$EXPLICIT" 2>&1)"; then
+  fail "$out"
+fi
+echo "$out"
+
+if helm template rel "$CHART" --show-only templates/langfuse.yaml \
+  --set clickhouse.deploy=false \
+  --set-string clickhouse.host=ch.example.com \
+  --set-string clickhouse.scheme=ftp >/dev/null 2>"$TMP/bad-scheme.stderr"; then
+  fail "an unsupported clickhouse.scheme rendered instead of failing closed"
+fi
+grep -qF "clickhouse.scheme" "$TMP/bad-scheme.stderr" \
+  || fail "the rejected render did not name clickhouse.scheme: $(cat "$TMP/bad-scheme.stderr")"
+echo "  ok: clickhouse.scheme=ftp is rejected by name instead of falling back to cleartext"
+
 # ------------------------------------------------------------------ behaviour
 
 # Extract the rendered gate script so the assertions below execute exactly what
@@ -188,19 +366,25 @@ PY
 python3 "$TMP/extract.py" "$PATIENT" > "$TMP/gate-patient.sh"
 python3 "$TMP/extract.py" "$FAST" > "$TMP/gate-fast.sh"
 python3 "$TMP/extract.py" "$TOLERANT" > "$TMP/gate-tolerant.sh"
-[[ -s "$TMP/gate-patient.sh" && -s "$TMP/gate-fast.sh" && -s "$TMP/gate-tolerant.sh" ]] || fail "an extracted gate script is empty"
+python3 "$TMP/extract.py" "$SECURE" > "$TMP/gate-secure.sh"
+[[ -s "$TMP/gate-patient.sh" && -s "$TMP/gate-fast.sh" && -s "$TMP/gate-tolerant.sh" && -s "$TMP/gate-secure.sh" ]] || fail "an extracted gate script is empty"
 
 # A free port that nothing is listening on: the delayed/absent ClickHouse.
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 
-# Stub ClickHouse. $1 = seconds to stay down before binding, $2 = /ping status,
-# $3 = port, $4 = seconds each /ping response is held back (slow but healthy).
+# Stub ClickHouse. $1 = private release marker, $2 = seconds to stay down after
+# release before binding, $3 = /ping status, $4 = port, $5 = seconds each /ping
+# response is held back (slow but healthy).
+# Set STUB_TLS_CERT/STUB_TLS_KEY to serve real TLS instead of cleartext (#2314).
 cat > "$TMP/stub.py" <<'PY'
-import sys, time
+import os, ssl, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-delay, status, port = float(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-response_delay = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+release_marker, delay = sys.argv[1], float(sys.argv[2])
+status, port = int(sys.argv[3]), int(sys.argv[4])
+response_delay = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
+tls_cert = os.environ.get("STUB_TLS_CERT")
+tls_key = os.environ.get("STUB_TLS_KEY")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -225,35 +409,76 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+while not os.path.exists(release_marker):
+    time.sleep(0.05)
 time.sleep(delay)
-HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+server = HTTPServer(("127.0.0.1", port), Handler)
+if tls_cert:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(tls_cert, tls_key)
+    # Wrapping the LISTENING socket makes the handshake part of accept(), so a
+    # cleartext client (the negative control below) is dropped as an OSError
+    # before any handler runs rather than printing a traceback.
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
 PY
 
-run_gate() {  # run_gate <gate-script> <outfile>; returns the gate's exit status
+run_gate_url() {  # run_gate_url <url> <gate-script> <outfile>; returns the gate's exit status
   set +e
-  CLICKHOUSE_URL="http://127.0.0.1:$PORT" sh "$1" > "$2" 2>&1
+  CLICKHOUSE_URL="$1" sh "$2" > "$3" 2>&1
   local status=$?
   set -e
   return $status
 }
 
+run_gate() {  # run_gate <gate-script> <outfile>; returns the gate's exit status
+  run_gate_url "http://127.0.0.1:$PORT" "$1" "$2"
+}
+
+wait_for_gate_waiting() {  # wait_for_gate_waiting <outfile> <gate-pid>
+  local output="$1"
+  local gate_pid="$2"
+  local deadline=$((SECONDS + 10))
+  while ! grep -q "Waiting for ClickHouse readiness" "$output"; do
+    if ! kill -0 "$gate_pid" 2>/dev/null; then
+      wait "$gate_pid" 2>/dev/null || true
+      GATE_PID=""
+      fail "the gate exited before it observed a failed ClickHouse probe; the fixture remains unreleased"
+    fi
+    (( SECONDS < deadline )) \
+      || fail "the gate did not log a failed ClickHouse probe within 10s (output: $(cat "$output"))"
+    sleep 0.1
+  done
+  if ! kill -0 "$gate_pid" 2>/dev/null; then
+    wait "$gate_pid" 2>/dev/null || true
+    GATE_PID=""
+    fail "the gate exited after reporting a failed ClickHouse probe but before fixture release"
+  fi
+}
+
 echo
 echo "=== Assertion 2: a DELAYED ClickHouse is waited for, not crash-looped ==="
-python3 "$TMP/stub.py" 4 200 "$PORT" & STUB_PID=$!
+RELEASE_MARKER="$TMP/release-delayed-clickhouse"
+python3 "$TMP/stub.py" "$RELEASE_MARKER" 5 200 "$PORT" & STUB_PID=$!
 started="$(date +%s)"
-if ! run_gate "$TMP/gate-patient.sh" "$TMP/delayed.log"; then
+run_gate "$TMP/gate-patient.sh" "$TMP/delayed.log" & GATE_PID=$!
+wait_for_gate_waiting "$TMP/delayed.log" "$GATE_PID"
+touch "$RELEASE_MARKER"
+if ! wait "$GATE_PID"; then
   echo "--- gate output ---"; cat "$TMP/delayed.log"
-  fail "the gate exited non-zero against a ClickHouse that came up after 4s; a routine upgrade would still CrashLoopBackOff (#2009)"
+  GATE_PID=""
+  fail "the gate exited non-zero against a ClickHouse released after a 5s startup delay; a routine upgrade would still CrashLoopBackOff (#2009)"
 fi
+GATE_PID=""
 elapsed=$(( $(date +%s) - started ))
 kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
 grep -q "Waiting for ClickHouse readiness" "$TMP/delayed.log" \
   || fail "the gate did not report waiting; it cannot have observed the dependency being down (output: $(cat "$TMP/delayed.log"))"
 grep -q "exiting for init container restart" "$TMP/delayed.log" \
-  && fail "the gate gave up and asked for a restart instead of waiting out a 4s ClickHouse delay"
-(( elapsed >= 3 )) \
-  || fail "the gate returned after ${elapsed}s against a ClickHouse that was down for 4s -- it cannot have probed the real endpoint"
-echo "  ok: gate waited ${elapsed}s for the delayed dependency, then exited 0 in a single run (zero restarts)"
+  && fail "the gate gave up and asked for a restart instead of waiting out the controlled 5s ClickHouse startup delay"
+(( elapsed >= 4 )) \
+  || fail "the gate returned after ${elapsed}s despite the fixture's controlled 5s startup delay -- it cannot have probed the real endpoint"
+echo "  ok: gate logged a failed probe before fixture release, then waited ${elapsed}s for the delayed dependency and exited 0 in a single run (zero restarts)"
 
 echo
 echo "=== Assertion 3: a ClickHouse that never comes up fails the gate (bounded) ==="
@@ -267,7 +492,8 @@ echo "  ok: gate exits non-zero after its bounded attempts and names the endpoin
 
 echo
 echo "=== Assertion 4: reachable but not serving (HTTP 503) does not open the gate ==="
-python3 "$TMP/stub.py" 0 503 "$PORT" & STUB_PID=$!
+touch "$TMP/release-refusing-clickhouse"
+python3 "$TMP/stub.py" "$TMP/release-refusing-clickhouse" 0 503 "$PORT" & STUB_PID=$!
 sleep 1
 if run_gate "$TMP/gate-fast.sh" "$TMP/refusing.log"; then
   echo "--- gate output ---"; cat "$TMP/refusing.log"
@@ -278,7 +504,8 @@ echo "  ok: a non-200 /ping keeps the gate closed"
 
 echo
 echo "=== Assertion 5: the probe timeout is a values knob, and it is honoured ==="
-python3 "$TMP/stub.py" 0 200 "$PORT" 3 & STUB_PID=$!
+touch "$TMP/release-slow-clickhouse"
+python3 "$TMP/stub.py" "$TMP/release-slow-clickhouse" 0 200 "$PORT" 3 & STUB_PID=$!
 sleep 1
 if run_gate "$TMP/gate-fast.sh" "$TMP/slow-strict.log"; then
   echo "--- gate output ---"; cat "$TMP/slow-strict.log"
@@ -292,4 +519,33 @@ kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB
 echo "  ok: a 3s /ping fails at timeoutSeconds=2 and passes at timeoutSeconds=10"
 
 echo
-echo "PASS: both Langfuse deployments gate startup on ClickHouse's HTTP /ping; the rendered gate waits out a delayed dependency and exits 0 once, fails bounded when ClickHouse never appears, and stays closed while ClickHouse answers non-200, and honours the operator's probe timeout (issue #2009)."
+echo "=== Assertion 6: the rendered gate actually speaks TLS to an https endpoint (#2314) ==="
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout "$TMP/key.pem" -out "$TMP/cert.pem" -days 1 \
+  -subj '/CN=localhost' -addext 'subjectAltName=IP:127.0.0.1' >/dev/null 2>&1 \
+  || fail "could not generate the self-signed certificate the TLS stub serves"
+
+touch "$TMP/release-tls-clickhouse"
+STUB_TLS_CERT="$TMP/cert.pem" STUB_TLS_KEY="$TMP/key.pem" \
+  python3 "$TMP/stub.py" "$TMP/release-tls-clickhouse" 0 200 "$PORT" & STUB_PID=$!
+sleep 1
+if ! NODE_EXTRA_CA_CERTS="$TMP/cert.pem" \
+  run_gate_url "https://127.0.0.1:$PORT" "$TMP/gate-secure.sh" "$TMP/tls.log"; then
+  echo "--- gate output ---"; cat "$TMP/tls.log"
+  fail "the gate failed against a ClickHouse serving TLS on an https:// CLICKHOUSE_URL; a BYO ClickHouse behind TLS can never start Langfuse (#2314)"
+fi
+grep -q "ClickHouse ready" "$TMP/tls.log" \
+  || fail "the gate exited 0 without reporting readiness over TLS (output: $(cat "$TMP/tls.log"))"
+echo "  ok: the rendered probe completes a TLS handshake and reads a 200 /ping"
+
+echo
+echo "=== Assertion 7: cleartext against that same TLS listener does NOT pass ==="
+if run_gate_url "http://127.0.0.1:$PORT" "$TMP/gate-secure.sh" "$TMP/tls-negative.log"; then
+  echo "--- gate output ---"; cat "$TMP/tls-negative.log"
+  fail "the gate passed while speaking cleartext to a TLS-only listener; assertion 6 cannot have proved TLS support"
+fi
+kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true; STUB_PID=""
+echo "  ok: the same gate fails on http:// against the TLS stub, so assertion 6's pass came from real TLS"
+
+echo
+echo "PASS: both Langfuse deployments gate startup on ClickHouse's HTTP /ping; the rendered gate waits out a delayed dependency and exits 0 once, fails bounded when ClickHouse never appears, and stays closed while ClickHouse answers non-200, and honours the operator's probe timeout (issue #2009); the ClickHouse scheme is operator-selectable and the rendered gate really speaks TLS when it is https (issue #2314)."

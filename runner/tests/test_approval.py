@@ -1031,6 +1031,121 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
     anyio.run(go)
 
 
+def _managed_publish_gate() -> ApprovalGate:
+    """The exact gate a managed-workspace boot assembles (publish only)."""
+
+    gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
+    assert gate is not None
+    assert PUBLISH_TOOL_NAME in gate.required
+    return gate
+
+
+def test_observe_publication_records_the_pending_approval_without_a_halt() -> None:
+    # revert: drop observe_publication (or make it a no-op) -> this fails, and a
+    # publish call that neither gate layer saw leaves the turn with nothing to
+    # approve -- the #2294 defect. The record must be field-for-field what a hook
+    # block writes, because the worker keys the trusted publication path on that
+    # exact runner-stamped provenance.
+    gate = _managed_publish_gate()
+
+    recorded = gate.observe_publication({"title": "  Ship changes  ", "body": "Full body"})
+
+    assert recorded is True
+    assert gate.pending_summary is not None
+    assert gate.pending_summary.startswith(APPROVAL_SUMMARY_PREFIX)
+    assert PUBLISH_TOOL_NAME in gate.pending_summary
+    assert gate.pending_gate_kind == "permission"
+    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    # Platform-owned gate: the request thread owns the card, so no bundle route.
+    assert gate.pending_route is None
+    assert gate.publication_title == "Ship changes"
+    assert gate.publication_body == "Full body"
+    # The stream observer never ASKED the CLI to stop, so it must not claim it
+    # did: pending_halt is what rescues an error-shaped terminal result, and
+    # setting it here would relabel an unrelated failure as awaiting-approval.
+    assert gate.pending_halt is False
+
+
+def test_observe_publication_is_idempotent_for_a_duplicate_call() -> None:
+    # revert: let a second observation overwrite the record -> a model that calls
+    # publish_changes twice in one turn creates two approvals for one action, and
+    # the human resolves against the second while the first stays pending.
+    gate = _managed_publish_gate()
+    assert gate.observe_publication({"title": "First proposal", "body": "one"}) is True
+    first_summary = gate.pending_summary
+
+    second = gate.observe_publication({"title": "Second proposal", "body": "two"})
+
+    assert second is False
+    assert gate.pending_summary == first_summary
+    assert gate.publication_title == "First proposal"
+    assert gate.publication_body == "one"
+    assert gate.pending_halt is False
+
+
+def test_observe_publication_rejects_a_malformed_title_and_records_nothing() -> None:
+    # revert: swallow the validation (or record the raw input) -> a blank-titled
+    # proposal becomes an approval card a human cannot act on, and the worker
+    # captures a patch with no title. The session turns this raise into a
+    # fail-closed classified failure; it must never be a silent pass.
+    gate = _managed_publish_gate()
+
+    with pytest.raises(ValueError):
+        gate.observe_publication({"title": "   ", "body": "ignored"})
+
+    assert gate.pending_summary is None
+    assert gate.pending_granted_tool is None
+    assert gate.publication_title is None
+    assert gate.publication_body is None
+    assert gate.pending_halt is False
+
+
+def test_observe_publication_never_overwrites_a_hook_recorded_block() -> None:
+    # revert: record unconditionally -> when the PreToolUse hook DID fire (the
+    # normal path) the stream observer would overwrite the hook's record and drop
+    # its halt-backed provenance, turning the working path into a second one.
+    gate = _managed_publish_gate()
+    gate.block(PUBLISH_TOOL_NAME, {"title": "Hook recorded", "body": "hook body"})
+    hook_summary = gate.pending_summary
+
+    assert gate.observe_publication({"title": "Stream observed", "body": "stream body"}) is False
+
+    assert gate.pending_summary == hook_summary
+    assert gate.publication_title == "Hook recorded"
+    assert gate.publication_body == "hook body"
+    assert gate.pending_gate_kind == "permission"
+    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    # The hook's own halt marker survives untouched: the observer only ever adds
+    # a record, it never edits what another layer already decided.
+    assert gate.pending_halt is True
+
+
+def test_observe_publication_never_mints_a_grant() -> None:
+    # revert: have observe_publication set (or restore) grant_tool, or let the
+    # publish tool consume a grant -> this fails. The observer is the one gate
+    # layer that can never ALLOW: publication happens outside the sandbox after
+    # approval, so an injected or stale grant must never let a second call walk
+    # through, and recording a request must never mint the allowance for it.
+    gate = build_approval_gate(
+        operator_tools=None,
+        policy_routes={},
+        grant_tool=PUBLISH_TOOL_NAME,
+        managed_workspace=True,
+    )
+    assert gate is not None
+    # build_approval_gate already refuses to carry a publish grant (safe_grant_tool).
+    assert gate.grant_tool is None
+
+    assert gate.observe_publication({"title": "Ship changes", "body": "body"}) is True
+
+    assert gate.grant_tool is None
+    assert gate.consume_grant(PUBLISH_TOOL_NAME) is False
+    # And the record it wrote is still the one-per-turn record: a second call
+    # blocks again rather than being waved through.
+    assert gate.observe_publication({"title": "Ship changes", "body": "body"}) is False
+    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+
+
 def test_build_approval_gate_carries_the_grant_tool() -> None:
     """The ADR-0035/0046 one-shot grant still reaches the gate unchanged."""
 
@@ -2739,4 +2854,69 @@ def test_ambiguous_connector_and_server_gate_refuses_to_boot(tmp_path) -> None:
             bundle_name=resolution.bundle_name,
             mcp_servers=resolution.mcp_servers,
             connector_servers=resolution.connector_servers,
+        )
+
+
+def test_route_normalization_vector_matches_the_runtime_loader(tmp_path) -> None:
+    """F4 parity seam: the frozen route vector IS the runtime loader's behavior.
+
+    The runner half of the two-sided probe (`#2436`). The deploy-time reader
+    `curie_api.bundles.declared_approval_routes` must derive the same declared
+    route set this loader arms, or a bundle passes the new configuration-time
+    join and then boots with a different set of gates. Code cannot be shared
+    across that seam -- `packages/plugin-format` is frozen and the API must not
+    import `curie_runner` -- so `tests/vectors/approval-route-normalization.json`
+    is the rule and BOTH sides execute it, exactly as
+    `test_route_normalization_agrees_between_validator_and_runner` above
+    executes the validator/loader pair rather than reasoning about it.
+
+    Two properties the vector pins, both of which have already shipped as
+    fail-opens on adjacent code:
+
+    - the declared set is `set(route_by_tool.values())`, a LAST-WINS map per
+      tool, not the union of every gate's route. A repeated tool's earlier route
+      is discarded here and can never be raised at runtime, so a deploy-time
+      reader that unioned the values would refuse a deploy-valid bundle over a
+      route that does not exist.
+    - a `"rejected"` row asserts a RAISE, not an empty map. That is what keeps
+      the vector from being satisfiable by weakening this loader's #520
+      fail-closed posture: a loader that quietly returned `{}` for a gate it
+      cannot arm would satisfy an equality-only vector while booting ungated.
+    """
+
+    from pathlib import Path
+
+    vector_path = (
+        Path(__file__).resolve().parents[2]
+        / "tests"
+        / "vectors"
+        / "approval-route-normalization.json"
+    )
+    cases = json.loads(vector_path.read_text(encoding="utf-8"))["cases"]
+    assert cases, "the frozen vector must carry cases, or this test proves nothing"
+
+    for case in cases:
+        root = tmp_path / str(case["id"])
+        (root / ".claude-plugin").mkdir(parents=True)
+        # Built-in tool names ("Bash", "Write") throughout: they carry no mcp__
+        # prefix, so the namespacing rules are out of the picture and the ROUTE
+        # normalization is the only variable, the same isolation `_write_bundle`
+        # above uses.
+        manifest: dict[str, object] = {"name": "route-vector", "version": "0.1.0"}
+        if case["gates"] is not None:
+            manifest["approvalPolicy"] = {"gates": case["gates"]}
+        (root / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        if case["expected"] == "rejected":
+            with pytest.raises(ApprovalPolicyError):
+                resolve_approval_policy(str(root))
+            continue
+
+        resolved = sorted(set(resolve_approval_policy(str(root)).route_by_tool.values()))
+        assert resolved == case["expected"], (
+            f"case {case['id']!r}: the runtime loader declares {resolved!r} but the "
+            f"frozen vector says {case['expected']!r} -- normalization drift between "
+            "the deploy-time reader and the loader is the #453/#544 fail-open shape"
         )

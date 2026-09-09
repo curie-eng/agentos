@@ -23,7 +23,8 @@ use crate::evals::{
 use crate::render::{boxed_summary, status_str, TurnPart, TurnPrinter};
 use crate::runner::RunnerClient;
 use crate::scaffold::{
-    derive_plugin_name, read_declared_secrets, read_manifest, scaffold, scaffold_from_spec,
+    derive_plugin_name, read_declared_secrets, read_manifest, refuse_unowned_nonempty_dir,
+    scaffold, scaffold_from_spec,
 };
 use crate::state::{self, RunnerState};
 
@@ -442,6 +443,10 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
     } else {
         std::env::temp_dir().join(format!("curie-try-{}", uuid::Uuid::new_v4()))
     };
+
+    if keep {
+        refuse_unowned_nonempty_dir(&dir)?;
+    }
 
     if let Err(err) = scaffold(&dir, DEMO_NAME) {
         if !keep && dir.exists() {

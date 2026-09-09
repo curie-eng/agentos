@@ -28,10 +28,9 @@ on:
       - "apps/worker/src/curie_worker/bundle_store.py"
       - "uv.lock"
       - "pyproject.toml"
-      # The Langfuse image-pin assertion step below renders compose.dev.yaml
-      # as the second shipping surface for the pinned Langfuse version. A PR
-      # that floats the tag only there would match no path here, skip this
-      # job, and never run the gate that catches exactly that.
+      # The unpinned-image gate (#2319) and the Langfuse image-pin gate
+      # (#2190) both read compose.dev.yaml to check third-party image tags,
+      # so a compose-only edit that unpins one must run this workflow too.
       - "compose.dev.yaml"
 
 permissions:
@@ -108,6 +107,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      - name: Reject chart-owned extraEnv duplicates
+        run: bash charts/curie/ci/reserved-env-assertions.sh
+
       # Prove the API Service keeps a stable NodePort when enabled, allows an
       # override, and omits the field for ClusterIP or explicit auto allocation.
       - name: helm render assertions (api service NodePort)
@@ -157,16 +159,41 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/clickhouse-logging-assertions.sh
 
-      # Prove Langfuse honors valkey.existingSecret on a BYO valkey install
-      # (#2052). A supported BYO install (valkey.deploy=false + host +
-      # existingSecret) had every component read the operator's Secret except
-      # Langfuse, which stayed pinned to the chart-managed Secret -- so trace
-      # ingestion died alone while the rest of the release stayed healthy,
-      # which is why nothing pointed at the cause.
-      - name: helm render assertions (langfuse valkey existingSecret)
+      # Prove Langfuse honors existingSecret for BYO valkey, postgres, and its
+      # own app keys (#2052, #2327). A supported BYO install has every other
+      # component read the operator's Secret except Langfuse: api and worker
+      # authenticate against the real postgres while both Langfuse Deployments
+      # present the chart-generated password and crash-loop at Prisma auth --
+      # so ingestion dies alone while the rest of the release stays healthy.
+      - name: helm render assertions (langfuse store existingSecret)
         run: |
           set -euo pipefail
           bash charts/curie/ci/valkey-existing-secret-assertions.sh
+
+      # Prove a BYO Valkey can be reached over TLS, and that the signal reaches
+      # every consumer of that store rather than some of them (#2315). Every
+      # managed Redis-compatible service an operator would bring is TLS-only or
+      # TLS-by-default and redis-py never downgrades, so a half-applied
+      # transport takes down the api, worker, dispatcher and both Langfuse
+      # Deployments at once with a healthy-looking render. Also proves the
+      # guard refuses valkey.tls against the in-chart store, which serves no
+      # TLS listener.
+      - name: helm render assertions (valkey TLS)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/valkey-tls-assertions.sh
+
+      # Prove every Postgres DSN carries a TLS parameter when asked, and that
+      # the signal reaches both driver families rather than one of them (#2431).
+      # SQLAlchemy/asyncpg needs ?ssl=require; Prisma needs ?sslmode=no-verify;
+      # the api migrate probe must lift ssl= into the connect kwarg or asyncpg
+      # forwards it as a server setting and the API never leaves init. Also
+      # proves the guard refuses require against the in-chart store, which
+      # serves no TLS listener, and that false/0/prefer are refused by name.
+      - name: helm render assertions (postgres TLS mode)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/postgres-ssl-mode-assertions.sh
 
       # Prove the tenant capacity ceiling actually binds the pods it is meant to.
       # The quota is PriorityClass-scoped, so if its scope is not the name the
@@ -225,6 +252,36 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
 
+      # Refuse untagged, :latest and major/minor-alias image references in
+      # values *Image keys, in rendered container image fields, and in
+      # compose.dev.yaml services (#2318, #2319). The security probe's netshoot
+      # image was the first miss: a bare repository pulls :latest with implicit
+      # Always. An alias like postgres:16-alpine is the subtler one -- it has a
+      # tag, but upstream republishes it under the chart version.
+      - name: helm render assertions (unpinned images)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/unpinned-image-assertions.sh
+
+      # Prove postgres.podSecurityContext.fsGroup is the gid of the `postgres`
+      # user inside the digest-pinned image, by running that image (#2319). The
+      # chart shipped the Debian 999 against an Alpine build where it is 70,
+      # which no render-only assertion can see.
+      - name: helm render assertions (postgres fsGroup matches the image)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/postgres-fsgroup-assertions.sh
+
+      # Prove Claim 5 drops in-cluster Postgres:5432 when postgres.deploy is
+      # false, names postgres.host:postgres.port on the skip path, and still
+      # probes the in-chart Service while deploy stays true (#2432). Pointing
+      # Claim 5 at RDS would fail helm test: there is no in-cluster ingress
+      # rail on an external host.
+      - name: helm render assertions (BYO postgres security probe)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/security-probe-byo-postgres-assertions.sh
+
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
       # the default must stay on 25.12 and AVX-required (#2210).
@@ -259,13 +316,45 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-runasuser-assertions.sh
 
-      # Prove the web-only Postgres readiness gate is ordered before Langfuse,
-      # credential-free, bounded/tunable, hardened like the web container, and
-      # removable through its explicit values switch. Includes a red mutation.
+      # Prove the Postgres readiness gate is rendered on BOTH Langfuse
+      # Deployments (#2330: it was web-only, so langfuse-worker crash-looped on
+      # the same Prisma P1001 that #1853 fixed for web), ordered before the
+      # ClickHouse gate on each, credential-free, bounded/tunable, hardened from
+      # each Deployment's OWN containerSecurityContext, and removable through its
+      # values switch. `langfuse.web.postgresReadiness` stays honoured as a
+      # deprecated alias applied to both Deployments -- not refused, because a
+      # render fail would abort `helm upgrade --reuse-values` on exactly the
+      # releases that need the gate. Includes red mutations, armed per Deployment.
       - name: helm render assertions (langfuse postgres readiness)
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-postgres-readiness-assertions.sh
+
+      # Prove langfuse-worker carries both probes on its :3030 endpoint -- #71's
+      # criterion is that every Deployment with a persistent process has both a
+      # readiness and a liveness probe, and the worker was the last violation.
+      # Readiness is the SIGTERM-aware /api/ready so a terminating pod drains;
+      # liveness is tcpSocket so a Postgres or Valkey blip cannot restart the
+      # single replica into its boot migrations (#71, #2330).
+      - name: helm render assertions (langfuse worker probes)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/langfuse-worker-probe-assertions.sh
+
+      # Prove the probe-window invariant across the WHOLE render, not a named
+      # list: for every container carrying both probes, the liveness failure
+      # cutoff -- initialDelaySeconds + (failureThreshold - 1) * periodSeconds,
+      # kubelet defaults applied to omitted keys -- must be strictly LATER than
+      # the readiness one, or the kubelet restarts a container that is still
+      # inside the boot window readiness was sized to tolerate. postgres (WAL
+      # replay), langfuse-web and langfuse-worker (Prisma/ClickHouse boot
+      # migrations) and api all inverted the two probes. Also requires an
+      # explicit livenessProbe timeoutSeconds everywhere, since the kubelet's
+      # invisible 1s default is the silent half of the postgres case.
+      - name: helm render assertions (probe windows)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/probe-window-assertions.sh
 
       # Prove the controller NetworkPolicy RBAC split (issue #350): exactly one
       # read-only cluster grant (get/list/watch) so the informer syncs, no
@@ -377,10 +466,23 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/sandbox-emptydir-sizelimit-assertions.sh
 
+      # Prove every bundle-fetch init image rendered on the SandboxTemplate is
+      # also a container image on the runner-prewarm DaemonSet, so a fresh or
+      # image-GCed node cannot cold-pull amazon/aws-cli (~418MB) inside the
+      # 90s claim window. Compares the two rendered objects; a sandbox image
+      # with no matching prewarm container fails.
+      - name: helm render assertions (prewarm bundle-fetch images)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/prewarm-bundle-fetch-assertions.sh
+
       # Prove the dispatcher is told where the platform API is and how to
-      # authenticate to it (issue #442). Unwired, it falls back to its code
-      # default http://localhost:8000 -- itself -- and every Slack Approve click
-      # dead-ends with only a warning.
+      # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET
+      # uses the same helper (issue #2316). Unwired, the dispatcher falls back
+      # to its code default http://localhost:8000 -- itself -- and every Slack
+      # Approve click dead-ends with only a warning. An unwired UI stays Ready
+      # while every /api/ request fails at the proxy, so api.deploy=false with
+      # an empty ui.apiBaseUrl must fail the render closed.
       - name: helm render assertions (dispatcher API wiring)
         run: |
           set -euo pipefail
@@ -504,6 +606,25 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/object-store-byo-egress-assertions.sh
 
+      # Prove the same for the other two in-chart runner carve-outs: a BYO
+      # collector or API endpoint renders its own ipBlock allow and is refused
+      # at render without one. Assertion 10 is the class guard -- a future
+      # `.deploy` carve-out added without a BYO else branch fails here rather
+      # than in a customer's silently trace-less or amnesiac install (#2317).
+      - name: helm render assertions (BYO collector/API runner egress)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/byo-endpoint-egress-assertions.sh
+
+      # Prove a nil worker.publication.githubHttpsCidrs cannot collapse the
+      # tokenless publication job's GitHub egress rule to an empty to: (allow-all
+      # on 443). Also rejects that empty-to shape on every rendered
+      # NetworkPolicy, not just this one template (#2321).
+      - name: helm render assertions (NetworkPolicy empty egress to)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/networkpolicy-empty-to-assertions.sh
+
       - name: helm template + kubeconform (values-dev overlay)
         run: |
           set -euo pipefail
@@ -517,3 +638,37 @@ jobs:
           helm template "$CHART" -f "$CHART/values-dev.yaml" -f "$CHART/values-e2e-nogvisor.yaml" \
             | python3 -c "import sys, yaml; yaml.safe_dump_all(yaml.safe_load_all(sys.stdin), sys.stdout)" \
             | kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version "$KUBE_VERSION"
+
+  reserved-env-upgrade:
+    name: Reject legacy extraEnv before upgrade mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          cluster_name: curie-reserved-env
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+      - name: Install YAML parser
+        run: pip install pyyaml
+      - name: Released retained-values rejection and removed-guard control
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+        # Keep runtime checks separate from the flat chart-check render inventory.
+        working-directory: charts/curie
+        run: bash ci/runtime/reserved-env-upgrade-runtime.sh
+      - name: Installation identity Secret lifecycle
+        env:
+          KUBECONFIG: ${{ runner.temp }}/curie-upgrade-drain-kubeconfig
+          CURIE_UPGRADE_DRAIN_KIND_CONTEXT: kind-curie-reserved-env
+        run: |
+          set -euo pipefail
+          trap 'rm -f -- "$KUBECONFIG"' EXIT
+          install -m 600 /home/runner/.kube/config "$KUBECONFIG"
+          bash charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh
+      - name: Remove owned cluster
+        if: always()
+        run: kind delete cluster --name curie-reserved-env

@@ -78,7 +78,9 @@ hits `/healthz`); replacement authority comes only from authenticated
   bytes, a nonpositive value falls back to the default),
   `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
   the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
-  (offline smoke; no model call).
+  (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional
+  comma-separated tool names removed from the session and refused even under
+  bypassPermissions; unset keeps every tool available).
 
 ## Build and smoke
 

@@ -320,6 +320,9 @@ Each has an integration test under `apps/worker/tests/`:
    preventing replacement replicas from racing through the delivery budget;
    unknown older consumers retain `XAUTOCLAIM` as the compatibility backstop
    ([`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`](apps/worker/src/curie_worker/stream_consumer.py)).
+   The same `_reclaim_once` also transfers a delivery whose lease has expired even
+   when its PEL consumer is still alive, so a live handler that raised and released
+   its lease is not stuck waiting for a peer to be proven dead.
    A restarted generation first recovers rows under its own stable consumer name.
    The runs consumer group is created at `$`, so a cold worker never replays ancient
    backlog ([`apps/worker/src/curie_worker/consumer.py::Consumer.ensure_group`](apps/worker/src/curie_worker/consumer.py)).
@@ -686,7 +689,7 @@ Security rails are all chart defaults (ADR-0006,
 
 - **Default-deny egress NetworkPolicy** with an explicit `except: 169.254.169.254/32` carve-out so the cloud metadata endpoint stays blocked ([`charts/curie/templates/security-networkpolicy.yaml`](charts/curie/templates/security-networkpolicy.yaml)).
 - **gVisor RuntimeClass** option on the runner, plus a preflight Job that runs under the class and fails if the kernel is not gVisor ([`charts/curie/templates/preflight-gvisor.yaml`](charts/curie/templates/preflight-gvisor.yaml)).
-- **AVX (a CPU instruction-set extension)/ClickHouse preflight** - a blocking pre-install hook that fails when the CPU lacks AVX and the ClickHouse tag is not in `clickhouse.sse42SafeTags` ([`charts/curie/templates/preflight-avx.yaml`](charts/curie/templates/preflight-avx.yaml)). Chart defaults pin ClickHouse `:25.12` (coupled to the Langfuse pin, #2210), so AVX is required unless the operator overrides to an SSE4.2-safe tag.
+- **AVX (a CPU instruction-set extension)/ClickHouse preflight** - a blocking pre-install hook that fails when the CPU lacks AVX and the ClickHouse tag is not in `clickhouse.sse42SafeTags` ([`charts/curie/templates/preflight-avx.yaml`](charts/curie/templates/preflight-avx.yaml)). Chart defaults pin ClickHouse `:25.12.11.4` (coupled to the Langfuse pin, #2210; a patch build rather than a moving `25.12` alias, #2319), so AVX is required unless the operator overrides to an SSE4.2-safe tag.
 - **Bundle-fetch init containers** on the sandbox template, fail-closed if a bundle ref is set but no archive is fetched ([`charts/curie/templates/agent-sandbox.yaml`](charts/curie/templates/agent-sandbox.yaml)), with a RustFS egress carve-out.
 - **A chart-managed platform Secret** ([`charts/curie/templates/secrets.yaml`](charts/curie/templates/secrets.yaml)) carries:
   - backing-store passwords

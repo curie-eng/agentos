@@ -26,7 +26,7 @@ import logging
 import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol import BootEnv
@@ -93,6 +93,33 @@ logger = logging.getLogger(__name__)
 # sandbox, and the next claim() takes the existing _evict_stale path, which
 # drops the stale route and rebinds. Slow turn, not corruption.
 REAP_GRACE_MARGIN_SECONDS = 30.0
+
+
+def _poll_sleeps(config: SubstrateConfig) -> Iterator[float]:
+    """Yield the successive sleep lengths for ONE substrate wait loop.
+
+    The first ``poll_fast_polls`` sleeps are the configured interval, so the
+    warm-pool fast path polls exactly as often as the old fixed loop did; after
+    that each sleep grows by ``poll_backoff_factor`` up to the cap. The result
+    is that a cold boot costs tens of ``get_claim``/``get_sandbox`` calls rather
+    than hundreds, without making a warm bind any slower to notice.
+
+    Each wait loop takes its own generator, so the serviceFQDN phase restarts at
+    the fast interval: it begins the moment the claim binds, which is exactly
+    when the sandbox address is about to appear, and inheriting the bind phase's
+    backed-off interval would add half a second to every cold claim.
+
+    The generator is deliberately clock-free. Bounding a sleep by the shared
+    deadline is the caller's job, because only the caller knows the deadline.
+    """
+
+    interval = config.poll_interval_seconds
+    cap = max(config.poll_interval_max_seconds, config.poll_interval_seconds)
+    for _ in range(max(0, config.poll_fast_polls)):
+        yield interval
+    while True:
+        interval = min(interval * config.poll_backoff_factor, cap)
+        yield interval
 
 
 def _sandbox_attributes(operation: str, outcome: str) -> dict[str, str]:
@@ -449,10 +476,19 @@ class SandboxSubstrate:
 
     # -- release / reap -------------------------------------------------------
 
-    def release(self, thread_key: str) -> bool:
+    def release(self, thread_key: str, *, wait_gone: bool = False) -> bool:
         """End the thread's session: delete the claim (the claim's lifecycle
         deletes its sandbox and pod) and drop the route. True if a route
-        existed."""
+        existed.
+
+        Kubernetes delete of a SandboxClaim returns while the object (and its
+        pod) still exist under a deletionTimestamp. ``wait_gone=True`` polls
+        until ``get_claim`` is None so ResourceQuota is actually free before
+        the caller continues (#2259). A wait that times out is logged, not
+        raised: the delete was issued, and a following claim is no worse off
+        than today's fire-and-forget path. Operator reset-thread keeps the
+        default False so it stays inside the kernel's 5s release cap.
+        """
 
         started = time.monotonic()
         released = False
@@ -466,9 +502,13 @@ class SandboxSubstrate:
             try:
                 record = self._affinity.get(thread_key)
                 if record is not None:
-                    self._k8s.delete_claim(record.handle.claim_name)
-                    self._affinity.delete_if_claim(thread_key, record.handle.claim_name)
+                    claim_name = record.handle.claim_name
+                    sandbox_name = record.handle.sandbox_name
+                    self._k8s.delete_claim(claim_name)
+                    self._affinity.delete_if_claim(thread_key, claim_name)
                     released = True
+                    if wait_gone:
+                        self._await_quota_freed(claim_name, sandbox_name)
             except Exception as exc:
                 error = exc
                 if hasattr(span, "set_status"):
@@ -493,6 +533,33 @@ class SandboxSubstrate:
         if error is not None:
             raise error
         return released
+
+    def _await_quota_freed(self, claim_name: str, sandbox_name: str) -> None:
+        """Poll until the deleted claim AND its sandbox are absent.
+
+        ResourceQuota charges the pod, not the SandboxClaim. A default
+        background delete can hide the CR while the pod is still terminating,
+        which is the #2259 race: eval reports, the CLI starts cluster message,
+        and the new claim waits on quota the dying pod still holds. Timeout
+        logs and returns: the delete was issued, and a stuck finalizer must
+        not turn a successful eval report into a CLI hang.
+        """
+
+        deadline = time.monotonic() + self._config.release_gone_timeout_seconds
+        sleeps = _poll_sleeps(self._config)
+        while time.monotonic() < deadline:
+            claim_gone = self._k8s.get_claim(claim_name) is None
+            sandbox_gone = self._k8s.get_sandbox(sandbox_name) is None
+            if claim_gone and sandbox_gone:
+                return
+            time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))
+        logger.warning(
+            "sandbox claim %s / sandbox %s still present %.1fs after delete; "
+            "quota may stay held until the controller finishes (#2259)",
+            claim_name,
+            sandbox_name,
+            self._config.release_gone_timeout_seconds,
+        )
 
     def reap_orphans(self) -> list[str]:
         """Measure orphan cleanup at the substrate seam for every backend."""
@@ -708,6 +775,7 @@ class SandboxSubstrate:
         last_quota_rejection = None
         last_ready_condition: tuple[str | None, str | None] | None = None
         consecutive_quota = 0
+        sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
             claim = self._k8s.get_claim(claim_name)
             if claim is not None:
@@ -726,7 +794,10 @@ class SandboxSubstrate:
                     last_ready_condition = (claim.ready_reason, claim.ready_message)
                 if claim.ready and claim.sandbox_name:
                     return claim.sandbox_name
-            time.sleep(self._config.poll_interval_seconds)
+            # Clamped to the time left in the shared budget: an unclamped
+            # backed-off sleep would overshoot the deadline by up to the cap and
+            # steal that much from the serviceFQDN phase downstream.
+            time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))
         if last_quota_rejection is not None:
             raise CapacityExhaustedError(last_quota_rejection)
         condition_detail = "no Ready condition was observed"
@@ -739,11 +810,12 @@ class SandboxSubstrate:
         )
 
     def _await_service_fqdn(self, sandbox_name: str, deadline: float) -> SandboxView:
+        sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
             sandbox = self._k8s.get_sandbox(sandbox_name)
             if sandbox is not None and sandbox.service_fqdn:
                 return sandbox
-            time.sleep(self._config.poll_interval_seconds)
+            time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))
         raise ClaimTimeoutError(
             f"sandbox {sandbox_name} has no serviceFQDN within "
             f"{self._config.claim_timeout_seconds}s (is spec.service true in the template?)"

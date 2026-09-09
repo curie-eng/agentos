@@ -202,7 +202,7 @@ OBSERVABILITY_POLL_INTERVAL_SECONDS=2
 # installs, upgrades, uninstalls, or deletes cluster state in this mode.
 PRODUCT_OBSERVABILITY="${CURIE_E2E_PRODUCT_OBSERVABILITY:-0}"
 MCP_RECEIPT_FIXTURE="$REPO_ROOT/cli/scripts/fixtures/mcp-receipt"
-MCP_RECEIPT_CONNECTOR="mcp-receipt"
+MCP_RECEIPT_CONNECTOR="receipt"
 MCP_RECEIPT_ALIAS=""
 MCP_RECEIPT_IMAGE=""
 LAST_ORDINARY_TRACE_ID=""
@@ -260,6 +260,13 @@ LOCAL_OTEL_SINK_ACTIVE=0
 LOCAL_OTEL_ENDPOINT=""
 LOCAL_OTEL_METRICS_ENDPOINT=""
 LOCAL_OTEL_FAILURE_MODE=0
+# Snapshots for restore_local_runner_health. Values are never printed.
+LOCAL_OTEL_SAVED_CREDENTIALS=""
+LOCAL_OTEL_SAVED_API_KEY=""
+LOCAL_OTEL_SAVED_OAUTH=""
+LOCAL_OTEL_SAVED_CREDENTIALS_SET=0
+LOCAL_OTEL_SAVED_API_KEY_SET=0
+LOCAL_OTEL_SAVED_OAUTH_SET=0
 OTEL_E2E_SECRET_SENTINEL="xapp-"
 OTEL_E2E_SECRET_SENTINEL+="0-0000000000-0000000000-$$"
 
@@ -2139,7 +2146,52 @@ YAML
 # already carries the approval gate for the declared write connector.
 prepare_connector_bundle() {
     local dir="$1"
+    local plugin="$dir/.claude-plugin/plugin.json"
+    local hosted_names
     cp "$CONNECTOR_FIXTURE" "$dir/connectors.yaml"
+    # The fixture is a subset of the example's connectors. The scratch
+    # plugin.json still carries gates for connectors the fixture does not
+    # host; leaving those in place makes the owned copy fail
+    # approval_policy.gate_not_namespaced at skill up (#2423). This stage
+    # owns both files on the scratch copy.
+    hosted_names="$(mktemp)"
+    awk '
+        $0 == "connectors:" { inside = 1; next }
+        inside && /^  [a-zA-Z0-9-]+:/ { print substr($1, 1, length($1) - 1) }
+        inside && /^[^[:space:]#]/ { inside = 0 }
+    ' "$dir/connectors.yaml" > "$hosted_names"
+    if ! python3 - "$plugin" "$hosted_names" <<'PY'
+import json, sys
+from pathlib import Path
+
+plugin_path = Path(sys.argv[1])
+hosted = {line.strip() for line in Path(sys.argv[2]).read_text().splitlines() if line.strip()}
+if not plugin_path.is_file():
+    raise SystemExit(0)
+data = json.loads(plugin_path.read_text())
+policy = data.get("approvalPolicy")
+if not isinstance(policy, dict):
+    raise SystemExit(0)
+gates = policy.get("gates")
+if not isinstance(gates, list):
+    raise SystemExit(0)
+kept = []
+for gate in gates:
+    name = gate.get("gate") if isinstance(gate, dict) else None
+    if isinstance(name, str) and name.startswith("mcp__"):
+        parts = name.split("__")
+        if len(parts) >= 3 and parts[1] not in hosted:
+            continue
+    kept.append(gate)
+policy["gates"] = kept
+plugin_path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+    then
+        rm -f "$hosted_names"
+        echo "error: connector fixture setup could not align approval gates in $plugin." >&2
+        exit 1
+    fi
+    rm -f "$hosted_names"
     echo "connector fixture applied to $dir (connectors.yaml)"
 }
 
@@ -2148,19 +2200,34 @@ prepare_connector_bundle() {
 # file can be evidence because the sandbox is destroyed with the turn.
 prepare_mcp_receipt_bundle() {
     local dir="$1"
-    local destination="$dir/connectors/mcp-receipt"
+    local destination="$dir/connectors/$MCP_RECEIPT_CONNECTOR"
+    # This stage owns $destination and the `$MCP_RECEIPT_CONNECTOR` block in
+    # connectors.yaml. A rerun or a second stage that finds either already
+    # present must refuse: appending a duplicate or copying over an existing
+    # tree is the collision that made the default live lane boot an invalid
+    # bundle (#2423).
+    if [[ -e "$destination" ]]; then
+        echo "error: MCP receipt setup refusing to recreate $destination: already exists." >&2
+        echo "fix: give this setup stage its own scratch copy, or remove the owned directory before rerunning." >&2
+        exit 1
+    fi
+    if [[ -f "$dir/connectors.yaml" ]] && grep -qE "^  ${MCP_RECEIPT_CONNECTOR}:" "$dir/connectors.yaml"; then
+        echo "error: MCP receipt setup refusing to recreate connector '$MCP_RECEIPT_CONNECTOR' in $dir/connectors.yaml: already exists." >&2
+        echo "fix: give this setup stage its own scratch copy, or remove the owned connector before rerunning." >&2
+        exit 1
+    fi
     mkdir -p "$destination"
     cp "$MCP_RECEIPT_FIXTURE/Dockerfile" "$MCP_RECEIPT_FIXTURE/server.py" "$destination/"
     if [[ ! -f "$dir/connectors.yaml" ]]; then
         printf '%s\n' 'connectors:' > "$dir/connectors.yaml"
     fi
-    cat >> "$dir/connectors.yaml" <<'YAML'
-  mcp-receipt:
+    cat >> "$dir/connectors.yaml" <<YAML
+  ${MCP_RECEIPT_CONNECTOR}:
     build:
-      context: connectors/mcp-receipt
+      context: connectors/${MCP_RECEIPT_CONNECTOR}
       platforms: [linux/amd64, linux/arm64]
 YAML
-    echo "MCP receipt fixture applied to $dir (fixtures/mcp-receipt)"
+    echo "MCP receipt fixture applied to $dir (fixtures/mcp-receipt as $MCP_RECEIPT_CONNECTOR)"
 }
 
 # One build before the first rung, so every rung consumes the same lock and the
@@ -3564,13 +3631,44 @@ pin_local_source_images() {
     export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev
 }
 
+# Affinity reuses a live sandbox across worker recreation. Reap so the next
+# claim cold-boots with the injected (or restored) model env. Match the
+# task-owned sink endpoint, not the host-wide substrate label alone, so a
+# concurrent session's runners are left alone.
+reap_local_runner_sandboxes() {
+    local runner
+    [[ -n "$LOCAL_OTEL_ENDPOINT" ]] || return 0
+    while IFS= read -r runner; do
+        [[ -n "$runner" ]] || continue
+        if [[ "$(container_env_value "$runner" OTEL_EXPORTER_OTLP_ENDPOINT)" == "$LOCAL_OTEL_ENDPOINT" ]]; then
+            docker rm -f "$runner" >/dev/null 2>&1 || true
+        fi
+    done < <(docker ps -aq --filter "label=$SANDBOX_LABEL" --format '{{.Names}}' 2>/dev/null)
+}
+
 inject_local_runner_failure() {
     LOCAL_OTEL_FAILURE_MODE=1
+    LOCAL_OTEL_SAVED_CREDENTIALS="${CURIE_CREDENTIALS-}"
+    LOCAL_OTEL_SAVED_API_KEY="${ANTHROPIC_API_KEY-}"
+    LOCAL_OTEL_SAVED_OAUTH="${CLAUDE_CODE_OAUTH_TOKEN-}"
+    LOCAL_OTEL_SAVED_CREDENTIALS_SET=0
+    LOCAL_OTEL_SAVED_API_KEY_SET=0
+    LOCAL_OTEL_SAVED_OAUTH_SET=0
+    [[ -n "${CURIE_CREDENTIALS+x}" ]] && LOCAL_OTEL_SAVED_CREDENTIALS_SET=1
+    [[ -n "${ANTHROPIC_API_KEY+x}" ]] && LOCAL_OTEL_SAVED_API_KEY_SET=1
+    [[ -n "${CLAUDE_CODE_OAUTH_TOKEN+x}" ]] && LOCAL_OTEL_SAVED_OAUTH_SET=1
     export CURIE_FAKE_MODEL=0
-    export CURIE_MODEL_BASE_URL="$LOCAL_OTEL_ENDPOINT"
+    # Connection-refused on the runner's own loopback: a live model cannot
+    # answer, and the OTel sink (a reachable HTTP server) is not the backend.
+    export CURIE_MODEL_BASE_URL="http://127.0.0.1:1"
     export CURIE_MODEL_API_BACKEND=messages
+    # Empty-string export, not unset: compose `.env` must not refill a live key.
+    export CURIE_CREDENTIALS=""
+    export ANTHROPIC_API_KEY=""
+    export CLAUDE_CODE_OAUTH_TOKEN=""
     docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
         up -d --force-recreate --no-deps curie-worker >/dev/null
+    reap_local_runner_sandboxes
     sleep 3
 }
 
@@ -3581,8 +3679,24 @@ restore_local_runner_health() {
         export CURIE_FAKE_MODEL=1
     fi
     unset CURIE_MODEL_BASE_URL CURIE_MODEL_API_BACKEND
+    if (( LOCAL_OTEL_SAVED_CREDENTIALS_SET )); then
+        export CURIE_CREDENTIALS="$LOCAL_OTEL_SAVED_CREDENTIALS"
+    else
+        unset CURIE_CREDENTIALS
+    fi
+    if (( LOCAL_OTEL_SAVED_API_KEY_SET )); then
+        export ANTHROPIC_API_KEY="$LOCAL_OTEL_SAVED_API_KEY"
+    else
+        unset ANTHROPIC_API_KEY
+    fi
+    if (( LOCAL_OTEL_SAVED_OAUTH_SET )); then
+        export CLAUDE_CODE_OAUTH_TOKEN="$LOCAL_OTEL_SAVED_OAUTH"
+    else
+        unset CLAUDE_CODE_OAUTH_TOKEN
+    fi
     docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
         up -d --force-recreate --no-deps curie-worker >/dev/null
+    reap_local_runner_sandboxes
     LOCAL_OTEL_FAILURE_MODE=0
     sleep 3
 }
@@ -3855,9 +3969,10 @@ case_local_otel_runner_failure() {
     echo
     echo "=== case: local runner failure is observable and recovers ==="
     # Negative evidence requires explicit ERROR status and classified_failure
-    # outcome before the restored healthy trace. This injected model_not_found
-    # is deliberately non-retryable; manufacturing a retry would weaken the
-    # kernel's bounded failure classification rather than strengthen the proof.
+    # outcome before the restored healthy trace. The injected backend is
+    # unreachable independently of prompt text and of CURIE_E2E_LIVE=1; a live
+    # model must not be able to answer the marker. runner-error is retryable,
+    # and the kernel's bounded retry still terminates as classified_failure.
     local failure_before="$WORKDIR/otel-before-failure.json"
     local restored_before="$WORKDIR/otel-before-restored.json"
     local failure_out failure_code=0 restored_out
@@ -4454,9 +4569,13 @@ for raw in pathlib.Path(sys.argv[1]).read_text().splitlines():
         continue
     values.extend(fields[2].split())
 values = sorted(set(values))
-if len(values) != 1:
+if not values:
     raise SystemExit("component imageID is absent or inconsistent")
-print(values[0])
+# runner-prewarm also sleeps the bundle-fetch images, so the pod carries
+# more than one imageID. api/worker stay a single first-party image.
+if want != "runner-prewarm" and len(values) != 1:
+    raise SystemExit("component imageID is absent or inconsistent")
+print(" ".join(values))
 PY
 )" || { rm -f "$inventory"; return 1; }
         local_id="$(docker image inspect --format '{{.Id}}' "$tag")" || {
@@ -4464,17 +4583,19 @@ PY
             echo "local task image is missing for cluster identity preflight" >&2
             return 1
         }
-        read -r normalized_runtime normalized_local < <(python3 - "$runtime_id" "$local_id" <<'PY'
+        if ! python3 - "$runtime_id" "$local_id" <<'PY'
 import re, sys
 def digest(value):
     matches = re.findall(r"sha256:[0-9a-f]{64}", value.lower())
     if not matches:
         raise SystemExit("image identity has no sha256 digest")
     return matches[-1]
-print(digest(sys.argv[1]), digest(sys.argv[2]))
+local = digest(sys.argv[2])
+runtime_ids = sys.argv[1].split()
+if local not in {digest(value) for value in runtime_ids}:
+    raise SystemExit("cluster product imageID mismatch")
 PY
-        )
-        if [[ "$normalized_runtime" != "$normalized_local" ]]; then
+        then
             rm -f "$inventory"
             echo "cluster product imageID mismatch for $component" >&2
             return 1

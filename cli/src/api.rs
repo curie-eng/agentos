@@ -1646,6 +1646,42 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Mint a scoped `chn` token for one binding (`POST /channels/token`).
+    ///
+    /// Returns the token string. Callers must not print it; decode `exp` from
+    /// the `chn.` payload instead. An empty token is refused so a success
+    /// cannot carry nothing.
+    pub async fn mint_channel_token(
+        &self,
+        kind: &str,
+        address: &str,
+        ttl_s: i64,
+    ) -> Result<String> {
+        let resp = self
+            .http
+            .post(format!("{}/channels/token", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json(&json!({
+                "kind": kind,
+                "address": address,
+                "ttl_s": ttl_s,
+            }))
+            .send()
+            .await
+            .context("POST /channels/token")?;
+        let resp = Self::expect_ok(resp, "minting the channel token").await?;
+        let body: serde_json::Value = resp.json().await.context("decoding the channel token")?;
+        let token = body
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                crate::exit::CliError::failure("platform returned an empty channel token")
+                    .with_fix("retry; if it persists, the binding may be missing or unroutable")
+            })?;
+        Ok(token.to_string())
+    }
+
     /// Bind the per-agent connector secrets (ADR-0009, #429). The values travel
     /// in the JSON request body (over the API's X-API-Key channel), never in
     /// argv; the API stores them and returns the agent with names only.

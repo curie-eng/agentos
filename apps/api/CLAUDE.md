@@ -76,6 +76,13 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   modal, or a git push. Do not
   duplicate validation logic in a new entry point; route through
   `bundles.py`.
+- **The declared/bound approval-route join has exactly one home
+  (`apps/api/src/curie_api/deploy.py`'s `check_approval_route_bindings` family,
+  #2436).** It is called in front of every deployment-creation site, every
+  bundle attachment onto a version an active deployment already references,
+  and the `approval_routes` write. It checks presence of a binding, not its
+  validity -- the worker keeps the validity backstop. Do not duplicate this
+  check per entry point.
 - **Observability endpoints are read-only proxies, not new stores.** The
   `/observability/metrics/*` endpoints compute aggregates from Langfuse's
   public API (`metrics.py` + `langfuse.py`); the runner-pod-log endpoint

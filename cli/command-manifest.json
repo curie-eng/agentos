@@ -4325,6 +4325,113 @@
           "name": "surfaces"
         },
         {
+          "about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id that owns the binding",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Channel kind to mint for (e.g. email). Required unless --show-exp",
+              "id": "kind",
+              "long": "kind",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Channel address to mint for (e.g. the inbox). Required unless --show-exp",
+              "id": "address",
+              "long": "address",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "7d"
+              ],
+              "global": false,
+              "help": "Token lifetime: 7d, 24h, 60m, or seconds. Default 7d; at most 7 days",
+              "id": "ttl",
+              "long": "ttl",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the installed token's exp and whether the platform still accepts it. Read-only: no mint, no write",
+              "id": "show_exp",
+              "long": "show-exp",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`).\n\nWrites the Secret the adapter actually reads (chart Secret or `mailAdapter.channelTokenExistingSecret`), rolls the adapter, prints `exp`, and never prints the token. `--show-exp` is read-only.",
+          "name": "channel-token"
+        },
+        {
           "about": "Set an agent's budget via the platform API (`PUT /agents/{id}/budget`)",
           "args": [
             {
@@ -5456,6 +5563,37 @@
           "about": "Assert every direct `ClassName.model_validate*(...)` call on an `_AciModel` subclass threads `READER_CONTEXT` or is a declared exception in `tools/wire-tolerance-gate/allowlist.json` (#625, following #492's forgotten-context bug, `bash scripts/check-wire-tolerance.sh`). Offline, no credential",
           "hidden": false,
           "name": "wire-tolerance"
+        },
+        {
+          "about": "Bounded synthetic restore drill for #2427: back up postgres, bundles, mail SQLite, and Valkey from a disposable compose install, restore onto a distinct target, and refuse an omitted or corrupt component (`bash cli/scripts/restore-drill.sh`). Not a production backup product and not an RPO/RTO claim",
+          "args": [
+            {
+              "global": false,
+              "help": "Validate an existing backup directory without starting a stack",
+              "id": "check_backup",
+              "long": "check-backup",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "JSON object of separately supplied key names. Required with --check-backup",
+              "id": "supplied_config",
+              "long": "supplied-config",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Omit this required component and expect the completeness guard to refuse",
+              "id": "negative",
+              "long": "negative",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "restore-drill"
         },
         {
           "about": "Set the release version across cli/Cargo.toml + Chart.yaml version/appVersion (and refresh the CLI lockfile) so a release cut can't leave the three out of sync. Does not commit or tag",

@@ -65,6 +65,27 @@ simplification.
   sustained-absence proof. That path still reads pre-claim `XPENDING` metadata
   and applies the local `_inflight_ids` skip before either a direct
   dead-letter or an `XCLAIM`; it never charges a live peer another delivery.
+- **Lease-expiry exception (#2433).** A pending row whose delivery state exists
+  but whose delivery lease has expired is cap-evaluated and graveyard-eligible
+  at `lease_expired_idle_ms` (`CURIE_LEASE_EXPIRED_IDLE_MS`, default one lease
+  TTL, 45 s) rather than at `reclaim_min_idle_ms` (900 s), regardless of whether
+  its PEL consumer is still alive. It still reads the delivery count from the
+  pre-claim `XPENDING` row, caps at `>=`, and keeps the `_inflight_ids` skip
+  ahead of the cap check. Implementation:
+  `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._select_lease_expired_entries`.
+  An entry with no delivery state carries no evidence a lease was ever granted
+  and stays on the unchanged 900-second backstop.
+- **Compare-and-claim: every transfer `XCLAIM` passes the idle the caller
+  observed for that row, and `0` is never passed.** The lease-expiry pass passes
+  its scan `IDLE`; the proven-dead pass passes each row's own
+  `time_since_delivered` from the pre-claim `XPENDING` read. `XCLAIM` with a
+  positive min-idle is an atomic compare-and-claim on the row's idle clock, and
+  any competing transfer (a claim, a heartbeat, `XAUTOCLAIM`) resets that clock,
+  so two transfer paths cannot both move one row. Accepted residual: a row this
+  process claimed whose dispatch then waits past one lease TTL can be re-claimed
+  by a peer, and the late handler's `acquire` is refused `not-owner` and returns
+  without acking. The cost is one charged delivery, logged at WARNING, never a
+  double run and never a stranded turn.
 - **`XADD` before `XACK`, never the reverse.** A crash between them costs a
   duplicate graveyard row; the reverse costs the entry.
 - **`max_delivery` is not `max_attempts`.** The latter is the kernel's
@@ -130,6 +151,15 @@ string-key verbs.
   consumer is not guessed dead by the prompt path; its PEL entries stay on the
   existing 900-second `XAUTOCLAIM` backstop. The prompt path is additional
   recovery for a proven-dead capable peer, not a shorter global idle timeout.
+- **A live consumer's own stranded row is not a prompt-path case (#2433).** A
+  handler that raised released its delivery lease and left the entry pending,
+  and no prompt path looks at a peer that is not dead. `_reclaim_once`'s
+  lease-expiry pass recovers such a row once its lease has expired, whoever owns
+  it. A pre-lease or pre-marker entry with no delivery state still waits out the
+  unchanged 900-second backstop. While the row waits,
+  `apps/worker/src/curie_worker/kernel.py::Kernel.notify_turn_not_started` edits
+  the placeholder to `turn_not_started_text` (`CURIE_TURN_NOT_STARTED_TEXT`),
+  best effort, so the thread is not silent.
 - **Runs/eval parity is mandatory.** Both
   `apps/worker/src/curie_worker/consumer.py::Consumer` and
   `apps/worker/src/curie_worker/eval/stream.py::EvalStreamConsumer` use the shared

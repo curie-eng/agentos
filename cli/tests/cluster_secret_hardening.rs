@@ -64,6 +64,15 @@ fn repo_root() -> PathBuf {
 }
 
 fn write_exec(dir: &Path, name: &str, body: &str) {
+    let body = if matches!(name, "helm" | "kubectl") {
+        format!(
+            "#!/bin/sh\n{}\n{}",
+            include_str!("data/converged-installation-read.sh"),
+            body.strip_prefix("#!/bin/sh\n").unwrap_or(body)
+        )
+    } else {
+        body.to_string()
+    };
     let path = dir.join(name);
     fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
     let mut permissions = fs::metadata(&path)
@@ -133,6 +142,9 @@ exit 64
             "kubectl",
             r#"#!/bin/sh
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
+    if [ "$3" = "acme-namespace" ]; then
+        printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"acme-namespace","labels":{"curietech.ai/created-by":"acme-release","curietech.ai/created-in":"acme-namespace"},"uid":"uid-acme-namespace","resourceVersion":"17"}}'
+    fi
     exit 0
 fi
 
@@ -406,6 +418,7 @@ fn assert_parser_edge_cases_are_masked(rendered: &str, surface: &str) {
 
 fn pure_up() -> UpOpts {
     UpOpts {
+        retained_mail_values: None,
         common: CommonOpts {
             namespace: TARGET_NAMESPACE.to_string(),
             release: TARGET_RELEASE.to_string(),

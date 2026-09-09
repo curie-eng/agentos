@@ -74,8 +74,11 @@ from curie_runner.approval import (
     _DENY_MESSAGE,
     APPROVAL_SERVER_NAME,
     APPROVAL_SUMMARY_PREFIX,
+    APPROVAL_TOOL_NAME,
+    PUBLISH_TOOL_NAME,
     ApprovalGate,
     ApprovalPolicyError,
+    build_approval_gate,
     build_approval_hook,
     build_can_use_tool,
 )
@@ -1140,3 +1143,601 @@ def test_permission_result_deny_still_carries_an_interrupt_field() -> None:
     fields = {f.name for f in dataclasses.fields(PermissionResultDeny)}
     assert {"message", "interrupt"} <= fields
     assert PermissionResultDeny().interrupt is False  # the default we must override
+
+
+# --- L. the runner-owned stream fallback for publication (#2294) -----------------
+#
+# Both SDK-level gate layers can miss a call: ``can_use_tool`` is skipped whenever
+# another permission rule already allowed it, and the PreToolUse hook was observed
+# live NOT to gate an in-process ``mcp__curie__*`` call. When both miss, the
+# stream still carries the ``ToolUseBlock`` -- so the runner itself observes it and
+# either records the pending approval or fails the turn closed. It can never allow.
+
+
+def _publish_block(
+    title: str = "Ship changes",
+    body: str = "The proposed change.",
+    *,
+    call_id: str = "p1",
+) -> AssistantMessage:
+    return AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id=call_id,
+                name=PUBLISH_TOOL_NAME,
+                input={"title": title, "body": body},
+            )
+        ],
+        model="m",
+    )
+
+
+def _publish_then_clean_done(
+    title: str = "Ship changes", body: str = "The proposed change."
+) -> list[Any]:
+    """The observed live shape: the publish call runs, then the turn ends clean.
+
+    Neither gate layer denied, so the in-process tool body executed and returned
+    its defensive ``is_error`` result; the model then finished its turn normally
+    and the CLI reported a SUCCESS terminal result. Before #2294 that finalized
+    DONE with no approval record at all.
+    """
+
+    return [
+        _publish_block(title, body),
+        AssistantMessage(content=[TextBlock(text="I requested publication.")], model="m"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="I requested publication.",
+        ),
+    ]
+
+
+def _managed_publish_gate() -> ApprovalGate:
+    """The gate a managed-workspace boot assembles: publish is the only member."""
+
+    gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
+    assert gate is not None
+    assert PUBLISH_TOOL_NAME in gate.required
+    return gate
+
+
+def _run_lines(runner: SessionRunner) -> list[str]:
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
+            lines.append(line)
+
+    anyio.run(go)
+    return lines
+
+
+def test_publish_call_neither_gate_layer_saw_still_pauses_awaiting_approval(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # revert: drop _observe_publication_calls from _drive_turn -> this fails with
+    # status == done and no approval_summary, which is the verbatim #2294 live
+    # observation: the tool body ran, returned its defensive is_error, and the
+    # turn finalized DONE with nothing for a human to approve.
+    #
+    # NO can_use_tool is wired here on purpose: that models BOTH SDK layers
+    # skipping the call (the hook did not gate the in-process MCP tool, and the
+    # callback was never consulted). The stream is then the only observer left.
+    gate = _managed_publish_gate()
+    runner, _session = _runner_over(_publish_then_clean_done(), gate=gate)
+
+    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+        lines = _run_lines(runner)
+
+    events = parse_ndjson("".join(lines))
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert final.status != SessionStatus.DONE
+    assert final.approval_summary
+    assert final.approval_summary.startswith(APPROVAL_SUMMARY_PREFIX)
+    assert PUBLISH_TOOL_NAME in final.approval_summary
+    # The trusted provenance pair the worker branches on before it captures a
+    # patch. A fallback record that stamped anything else would be inert.
+    assert final.approval_gate_kind == "permission"
+    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_route is None
+    assert gate.publication_title == "Ship changes"
+    assert gate.publication_body == "The proposed change."
+    assert runner.status == SessionStatus.AWAITING_APPROVAL
+    # No gate layer denied this call, so no layer asked the CLI to stop the turn.
+    # That absence is the ONLY honest signal that a layer missed the call: the
+    # real SDK streams the ToolUseBlock BEFORE it dispatches the PreToolUse hook,
+    # so "the observer wrote the record first" is true on the normal path too and
+    # cannot be what the warning below keys on.
+    assert gate.pending_halt is False
+
+    # Operator-visible, because this path means a gate layer that was supposed to
+    # decide did not: silently papering over that is how the next regression goes
+    # unnoticed for a whole release.
+    assert any(
+        "publication" in record.getMessage().lower()
+        and "fallback" in record.getMessage().lower()
+        for record in caplog.records
+    ), caplog.text
+
+
+def test_hook_recorded_publish_is_not_recorded_twice_by_the_stream(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # revert: record unconditionally in _observe_publication_calls -> the normal
+    # (working) path grows a second record, and the WARNING fires on every publish
+    # so it stops meaning "a gate layer missed this call".
+    gate = _managed_publish_gate()
+    runner, _session = _runner_over(
+        _publish_then_clean_done("Hook recorded", "hook body"),
+        gate=gate,
+        # The fake tier does not run PreToolUse hooks, so the callback seam is how
+        # a session-level test drives a hook-shaped block (see _recording_deny).
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+        lines = _run_lines(runner)
+
+    events = parse_ndjson("".join(lines))
+    final = events[-1]
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert final.approval_gate_kind == "permission"
+    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    # Exactly one record, and it is the gate layer's own -- the observer added
+    # nothing on top of it.
+    assert gate.publication_title == "Hook recorded"
+    assert gate.publication_body == "hook body"
+    assert final.approval_summary == gate.pending_summary
+    assert gate.observe_publication({"title": "another", "body": "x"}) is False
+    assert gate.publication_title == "Hook recorded"
+    # A gate layer DID deny this call and asked the CLI to stop, which is exactly
+    # what distinguishes this path from the fallback one -- and why no warning
+    # about a missed layer may fire here.
+    assert gate.pending_halt is True
+    assert not any(
+        "fallback" in record.getMessage().lower() for record in caplog.records
+    ), caplog.text
+
+
+def test_malformed_publish_proposal_fails_the_turn_closed() -> None:
+    # revert: swallow the ValueError and let the turn finalize as it was -> a
+    # blank-titled publish call ends DONE with no approval record, which is the
+    # same silent hole #2294 closed, reached through the validation path instead.
+    # Failing closed is the only safe direction: the runner cannot record the
+    # approval, so it must not let the turn look like it succeeded.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    gate = _managed_publish_gate()
+    runner, _session = _runner_over(_publish_then_clean_done(title="   "), gate=gate)
+
+    events = parse_ndjson("".join(_run_lines(runner)))
+
+    classifications = [e.classification for e in events if e.type == "error"]
+    assert PUBLICATION_UNRECORDED_CLASSIFICATION in classifications
+    unrecorded = next(
+        e
+        for e in events
+        if e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+    )
+    assert "title" in (unrecorded.message or "").lower()
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE
+    assert final.status != SessionStatus.AWAITING_APPROVAL
+    # A fail-closed turn carries NO approval fields: there is nothing a human
+    # could resolve, and a card with an empty title is worse than none.
+    assert final.approval_summary is None
+    assert final.approval_gate_kind is None
+    assert final.approval_granted_tool is None
+    assert gate.pending_summary is None
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_two_publish_calls_in_one_turn_record_exactly_one_approval() -> None:
+    # revert: record every observed call -> one action produces two approval
+    # cards, and a human resolving the second leaves the first pending forever.
+    # The FIRST proposal wins, matching ApprovalGate.block's first-block-wins rule.
+    gate = _managed_publish_gate()
+    script = [
+        _publish_block("First proposal", "one", call_id="p1"),
+        _publish_block("Second proposal", "two", call_id="p2"),
+        AssistantMessage(content=[TextBlock(text="Requested twice.")], model="m"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="Requested twice.",
+        ),
+    ]
+    runner, _session = _runner_over(script, gate=gate)
+
+    events = parse_ndjson("".join(_run_lines(runner)))
+
+    final = events[-1]
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert gate.publication_title == "First proposal"
+    assert gate.publication_body == "one"
+    assert "First proposal" in (final.approval_summary or "")
+    assert "Second proposal" not in (final.approval_summary or "")
+
+
+def test_publish_call_on_a_gate_that_does_not_carry_publish_fails_closed() -> None:
+    # revert: record the publication anyway when the tool is not gated -> a model
+    # that names publish_changes where it is not mounted (no managed workspace)
+    # mints an approval for an action the platform has no checkout to perform,
+    # and an approver would be asked to authorize a publication that cannot exist.
+    # Never AWAITING_APPROVAL, never DONE: fail closed.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    gate = build_approval_gate(operator_tools=["Bash"], policy_routes={})
+    assert gate is not None
+    assert PUBLISH_TOOL_NAME not in gate.required
+    runner, _session = _runner_over(_publish_then_clean_done(), gate=gate)
+
+    events = parse_ndjson("".join(_run_lines(runner)))
+
+    assert any(
+        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+        for e in events
+    ), [e.type for e in events]
+    final = events[-1]
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE
+    assert final.status != SessionStatus.AWAITING_APPROVAL
+    assert final.approval_summary is None
+    assert gate.pending_summary is None
+    assert gate.publication_title is None
+
+
+def test_operator_interrupt_outranks_a_stream_recorded_publication() -> None:
+    # negative control for L: the observer records, it never decides the turn's
+    # status. A human pressing stop is an intentional stop -- reporting it as
+    # awaiting-approval would suspend the thread behind a decision nobody asked
+    # for. revert: set pending_halt in observe_publication, or apply the approval
+    # override ahead of _reclassify -> this fails with awaiting-approval.
+    gate = _managed_publish_gate()
+    runner, session = _runner_over(_publish_then_clean_done(), gate=gate)
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        gen = runner.run_turn(Event(type="message", text="go", user="U", ts="1"))
+        lines.append(await gen.__anext__())  # first frame; the turn is live
+        await runner.interrupt("user stop")  # the operator's own stop
+        async for line in gen:
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    # Not vacuous: the fallback really did record this publication, so the ONLY
+    # thing keeping the turn out of awaiting-approval is the operator's stop.
+    assert gate.pending_summary is not None
+    assert gate.publication_title == "Ship changes"
+    assert gate.pending_halt is False
+    assert session.interrupts >= 1
+    assert events[-1].type == "final"
+    assert events[-1].status == SessionStatus.IDLE_AWAITING_INPUT
+
+
+def test_malformed_publish_followed_by_a_valid_one_pauses_on_the_valid_record() -> None:
+    # revert (the mutation this kills): make state.publication_unrecorded sticky,
+    # i.e. skip every later publish call once one failed to record -> this fails
+    # with classified-failure, and a model that did exactly what the deny message
+    # told it to ("Correct it and retry") loses the corrected request. The
+    # fail-closed rule keys on the OUTCOME at classification time -- did the gate
+    # end the turn holding a publication record? -- not on whether some earlier
+    # attempt was malformed.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    gate = _managed_publish_gate()
+    script = [
+        _publish_block("   ", "first attempt", call_id="p1"),
+        _publish_block("Ship changes", "the corrected proposal", call_id="p2"),
+        AssistantMessage(content=[TextBlock(text="Requested publication.")], model="m"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="Requested publication.",
+        ),
+    ]
+    runner, _session = _runner_over(script, gate=gate)
+
+    events = parse_ndjson("".join(_run_lines(runner)))
+
+    assert not any(
+        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+        for e in events
+    ), "a recorded publication must not also report itself unrecorded"
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert final.status != SessionStatus.CLASSIFIED_FAILURE
+    assert final.approval_gate_kind == "permission"
+    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    # Exactly one record, and it is the VALID proposal -- not the malformed one,
+    # which never wrote anything.
+    assert gate.publication_title == "Ship changes"
+    assert gate.publication_body == "the corrected proposal"
+    assert final.approval_summary == gate.pending_summary
+    assert "Ship changes" in (final.approval_summary or "")
+    assert runner.status == SessionStatus.AWAITING_APPROVAL
+
+
+def test_hook_recorded_publish_survives_a_later_malformed_stream_observation() -> None:
+    # revert: validate the publication proposal BEFORE the first-record-wins guard
+    # in _record_pending -> this fails, because the malformed second call would
+    # raise on a turn that already holds a good record and fail the turn closed,
+    # discarding an approval a human could have acted on. A record that already
+    # stands is never re-derived from a later attempt.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    gate = _managed_publish_gate()
+    script = [
+        _publish_block("Ship changes", "the proposal", call_id="p1"),
+        _publish_block("", "second attempt", call_id="p2"),
+        AssistantMessage(content=[TextBlock(text="Requested publication.")], model="m"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="Requested publication.",
+        ),
+    ]
+    runner, _session = _runner_over(
+        script,
+        gate=gate,
+        # The gate layer records the FIRST call, exactly as the PreToolUse hook
+        # does in production (the fake tier does not run hooks; see _recording_deny).
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    events = parse_ndjson("".join(_run_lines(runner)))
+
+    assert not any(
+        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+        for e in events
+    ), "a later malformed attempt must not poison the record the hook already wrote"
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert final.status != SessionStatus.CLASSIFIED_FAILURE
+    assert final.approval_gate_kind == "permission"
+    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    # The hook's own record, untouched by the second observation.
+    assert gate.publication_title == "Ship changes"
+    assert gate.publication_body == "the proposal"
+    assert final.approval_summary == gate.pending_summary
+    assert "Ship changes" in (final.approval_summary or "")
+
+
+def test_another_gated_tools_approval_is_kept_when_a_publish_call_cannot_take_the_slot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # revert: fail the turn closed whenever the gate does not end holding a
+    # PUBLICATION record -> this fails with classified-failure, and the Bash
+    # approval a human could have acted on is destroyed by a publish call that
+    # merely arrived second. Exactly one record per turn is the gate's own
+    # first-block-wins rule (ApprovalGate._record_pending); a publish call losing
+    # that race is not evidence that anything went wrong, so the turn parks on
+    # the approval that DOES stand and the unclaimed publish intent is reported
+    # as a log line, not by discarding the card.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    gate = build_approval_gate(
+        operator_tools=["Bash"], policy_routes={}, managed_workspace=True
+    )
+    assert gate is not None
+    assert gate.required == frozenset({"Bash", PUBLISH_TOOL_NAME})
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="b1", name="Bash", input={"command": "git status"})],
+            model="m",
+        ),
+        _publish_block("Ship changes", "the proposal", call_id="p1"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="asked for both",
+        ),
+    ]
+    runner, _session = _runner_over(
+        script,
+        gate=gate,
+        can_use_tool=_recording_deny(gate, interrupt=False),
+        truncate_on_interrupt=False,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+        events = parse_ndjson("".join(_run_lines(runner)))
+
+    assert not any(
+        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+        for e in events
+    ), "a turn that ends holding an approval has not lost the human's decision"
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert final.status != SessionStatus.CLASSIFIED_FAILURE
+    assert final.approval_gate_kind == "permission"
+    assert final.approval_granted_tool == "Bash"
+    assert "git status" in (final.approval_summary or "")
+    # A gate layer denied the Bash call and asked the CLI to stop.
+    assert gate.pending_halt is True
+    # The publish intent did not make it onto the card, so it must be visible to
+    # an operator rather than silently dropped.
+    assert any(
+        "publication" in record.getMessage().lower()
+        and "not carried" in record.getMessage().lower()
+        for record in caplog.records
+    ), caplog.text
+
+
+def test_policy_approval_and_publish_in_one_turn_park_on_the_policy_request(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # revert: fail closed because the FINAL carries a policy approval rather than
+    # the publication record -> this fails with classified-failure, and a model
+    # that legitimately paged a human (request_approval) loses that card because
+    # it also asked to publish. _merge_gate_block's precedence (a policy summary
+    # already standing is never overwritten by a permission block) is pre-existing
+    # and unchanged here; what must not happen is the turn being failed for it.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    gate = _managed_publish_gate()
+    script = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="a1",
+                    name=APPROVAL_TOOL_NAME,
+                    input={"summary": "Approve the discount before I continue"},
+                )
+            ],
+            model="m",
+        ),
+        _publish_block("Ship changes", "the proposal", call_id="p1"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="asked for both",
+        ),
+    ]
+    # approval_gate wires the fake to the SAME route-resolution decision table the
+    # real in-process request_approval tool runs (#561), so the policy flags
+    # _merge_gate_block reconciles are set exactly as they are in production.
+    runner, _session = _runner_over(script, gate=gate, approval_gate=gate)
+
+    with caplog.at_level(logging.WARNING, logger="curie_runner.session"):
+        events = parse_ndjson("".join(_run_lines(runner)))
+
+    assert not any(
+        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+        for e in events
+    ), "the turn ends on a real approval; nothing was lost to fail closed for"
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.AWAITING_APPROVAL
+    assert final.status != SessionStatus.CLASSIFIED_FAILURE
+    # A policy gate authorizes a business decision, never a tool (#544, A/C), so
+    # it must not acquire a grant target from the publish call riding along.
+    assert final.approval_gate_kind == "policy"
+    assert final.approval_granted_tool is None
+    assert "discount" in (final.approval_summary or "")
+    assert any(
+        "publication" in record.getMessage().lower()
+        and "not carried" in record.getMessage().lower()
+        for record in caplog.records
+    ), caplog.text
+
+
+def test_publish_call_with_no_terminal_result_still_fails_closed() -> None:
+    # revert: drop the _publication_unrecorded_lines call from the ITERATOR-END
+    # Final site in _drive_turn (keeping only the ResultMessage one) -> this fails
+    # with status done. A turn whose generator simply ends without a terminal
+    # result still emits a final, and an unrecordable publication must fail it
+    # closed there too -- otherwise the silent hole #2294 closed reopens for every
+    # turn the CLI ends without a ResultMessage.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    gate = _managed_publish_gate()
+    # No ResultMessage at all: receive_turn is exhausted after this message, which
+    # is the second Final emission site in _drive_turn.
+    runner, _session = _runner_over([_publish_block("   ", "no title")], gate=gate)
+
+    events = parse_ndjson("".join(_run_lines(runner)))
+
+    unrecorded = [
+        e
+        for e in events
+        if e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+    ]
+    assert len(unrecorded) == 1
+    assert "title" in (unrecorded[0].message or "").lower()
+    final = events[-1]
+    assert final.type == "final"
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE
+    assert final.status != SessionStatus.DONE
+    assert final.approval_summary is None
+    assert final.approval_granted_tool is None
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_operator_interrupt_outranks_an_unrecordable_publication() -> None:
+    # revert: drop the interrupt/timeout guard from _publication_unrecorded_lines
+    # -> this fails with classified-failure. A human pressing stop gets
+    # idle-awaiting-input, not a failure about a request their own stop
+    # prevented from ever being recorded; reporting it as a run failure would
+    # trip F1's escalation path on an intentional stop.
+    from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
+
+    gate = _managed_publish_gate()
+    runner, session = _runner_over(
+        [
+            _publish_block("   ", "no title"),
+            AssistantMessage(content=[TextBlock(text="never delivered")], model="m"),
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="s",
+                result="never delivered",
+            ),
+        ],
+        gate=gate,
+    )
+
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        gen = runner.run_turn(Event(type="message", text="go", user="U", ts="1"))
+        lines.append(await gen.__anext__())  # first frame; the turn is live
+        await runner.interrupt("user stop")  # the operator's own stop
+        async for line in gen:
+            lines.append(line)
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+
+    # Not vacuous: the unrecordable call really was observed, so the ONLY thing
+    # keeping this out of classified-failure is the operator's stop.
+    assert session.interrupts >= 1
+    assert gate.pending_summary is None
+    assert not any(
+        e.type == "error" and e.classification == PUBLICATION_UNRECORDED_CLASSIFICATION
+        for e in events
+    )
+    assert events[-1].type == "final"
+    assert events[-1].status == SessionStatus.IDLE_AWAITING_INPUT

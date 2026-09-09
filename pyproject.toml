@@ -183,6 +183,9 @@ testpaths = [
     "tools/sdk-lock-gate/tests",
     "tools/fix-pin-ci/tests",
     "tools/close-on-next/tests",
+    "tools/p0-closes-ci/tests",
+    "tools/ci-release-target-parity/tests",
+    "tools/restore-drill/tests",
 ]
 
 [tool.ruff]
@@ -199,6 +202,7 @@ select = ["E", "F", "I", "UP", "B"]
 # would collapse. The implementation under tools/doclint/src stays fully linted,
 # I001 included; only the frozen tests are exempt from import-block formatting.
 "tools/doclint/tests/**" = ["I001"]
+"tools/restore-drill/tests/**" = ["E402"]
 
 [tool.mypy]
 python_version = "3.13"

@@ -34,6 +34,12 @@
       "version": "1.0"
     },
     {
+      "result": "ChannelTokenOutput",
+      "kind": "CliOutput",
+      "schema": "channel-token.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ChannelsOutput",
       "kind": "CliOutput",
       "schema": "surfaces.schema.json",
@@ -67,7 +73,7 @@
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
-      "version": "1.1"
+      "version": "1.4"
     },
     {
       "result": "ClusterUpOutput",

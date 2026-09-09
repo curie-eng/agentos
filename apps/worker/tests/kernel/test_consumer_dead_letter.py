@@ -49,7 +49,7 @@ from curie_worker.consumer import Consumer
 from curie_worker.dead_letter_alert import install_dead_letter_alerting
 from pydantic import ValidationError
 
-from .conftest import _pending_rows
+from .conftest import _pending_rows, _updates_for
 
 DONE = SessionStatus.DONE
 
@@ -193,8 +193,26 @@ def test_permanently_failing_entry_is_dead_lettered_at_the_cap_and_group_progres
                 # completion, and the group's PEL is now empty -- forward progress,
                 # no stall.
                 assert h.runner.opened == ["healthy turn"]
-                assert h.sink.last_text == "answer"
+                assert _updates_for(h, "tdl-healthy")[-1] == "answer"
                 assert calls["healthy"] == 1
+
+                # AC1 (#2433): the person on the POISON thread was told on every
+                # failed delivery, and the placeholder still carries that line
+                # after the dead-letter rather than sitting on the dispatcher's
+                # original text forever. The notice is an EDIT of the same
+                # placeholder, so no additional channel notification is produced
+                # however many times the entry is retried -- which is what makes
+                # a faster retry cadence safe for the person.
+                #
+                # F1 (a distinct terminal notice once the cap is spent) is the
+                # named limit of this copy, not a reason to skip the assertion:
+                # "if no answer appears here shortly, please send it again" is
+                # true both before the cap and at it.
+                poison_updates = _updates_for(h, "tdl-poison")
+                assert poison_updates == [h.config.turn_not_started_text] * 3, (
+                    "the poison thread was left silent, or told a different "
+                    f"number of times than it was delivered: {poison_updates}"
+                )
                 summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
                 assert summary["pending"] == 0
             finally:

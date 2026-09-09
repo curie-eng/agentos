@@ -8,6 +8,7 @@ bytes so a runner can pull a bundle by version.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 
 from .. import bundles, crud, deploy
 from ..auth import require_api_key
@@ -111,7 +112,7 @@ async def upload_bundle(
         )
 
     try:
-        extension, content_type = deploy.validate_archive(data)
+        extension, content_type = await run_in_threadpool(deploy.validate_archive, data)
     except bundles.UnsupportedArchive as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except deploy.BundleInvalid as exc:
@@ -119,6 +120,36 @@ async def upload_bundle(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"detail": "bundle failed validation", "errors": exc.errors},
         ) from exc
+
+    # The declared/bound approval-route join, CONDITIONAL on this version already
+    # being live (#2436). `DeploymentCreate` carries no bundle and
+    # `revalidate_stored_bundle` no-ops on a null `bundle_ref`, so a version can
+    # be deployed bundleless and only THEN receive its bundle -- and the worker's
+    # resolve query joins `deployments.status = 'active'` to
+    # `agent_versions.bundle_ref` (`curie_worker.binding`), so that attachment
+    # puts a gated bundle live with no deployment gate ever having run. It is the
+    # same "a bundle becomes the thing that boots" moment, arriving from the
+    # other side.
+    #
+    # Unconditional here would refuse the documented onboarding order instead:
+    # the CLI's `prepare_deploy` uploads the bundle BEFORE `curie <tier>
+    # approvals` binds the route, and a bundle that is never deployed strands
+    # nobody. The incoming bytes are read directly rather than through the store,
+    # because the object is not stored yet at this point. Placed after
+    # `validate_archive` so a malformed bundle still reports its own validation
+    # errors first, and before `store_bundle` so a refusal writes no object and
+    # leaves `bundle_ref` null -- `crud.attach_bundle` commits immediately, so a
+    # check placed after it would already be live.
+    if await crud.version_has_active_deployment(session, version_id):
+        agent = await crud.get_agent(session, agent_id)
+        if agent is None:  # pragma: no cover -- the version lookup above proves it
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+        try:
+            await deploy.check_routes_from_bytes(
+                data, agent.approval_routes, version_id, get_settings()
+            )
+        except deploy.ApprovalRoutesUnbound as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
     return await deploy.store_bundle(
         store, session, agent_id, version, data, extension, content_type

@@ -23,7 +23,7 @@ The seam is the Valkey Stream wire contract between the dispatcher (producer) an
 worker (consumer): a named stream carrying a frozen one-field payload. As of #284 /
 ADR-0027 the stream verbs are drawn behind a thin **broker port** at the two non-sacred
 seams — a `StreamPublisher` `Protocol` on the producer (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`:
-`xadd` + the `SET NX EX` dedupe-claim) and a `StreamBroker` `Protocol` on the consumer
+`xadd` + the `SET NX EX` dedupe-claim + `delete` / `release_event`) and a `StreamBroker` `Protocol` on the consumer
 transport (`apps/worker/src/curie_worker/broker.py::StreamBroker`:
 `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`/`xinfo_consumers`/`xclaim`/`xpending_range`/`xrange`/`xadd`).
 The routing, consumer-group concurrency, dedupe, and reclaim rules stay opinionated
@@ -68,7 +68,17 @@ A second broker must honor the stream key, the payload encoding, and the Stream 
   (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._dead_letter`), then acked off
   the group. The target stream is `WorkerConfig.dead_letter_stream`
   (`apps/worker/src/curie_worker/config.py::WorkerConfig`), defaulting to
-  `"<stream>:dead"`.
+  `"<stream>:dead"`. This writer produces rows with the original stream fields
+  and `dl_original_id`, `dl_delivery_count`, `dl_reason`, and
+  `dl_dead_lettered_at`. The second writer,
+  `Markers.dead_letter_completion`
+  (`apps/worker/src/curie_worker/markers.py::Markers.dead_letter_completion`),
+  writes terminal completion-outbox rows to the same stream with `event_id`,
+  serialized `completion`, `dl_reason`, `dl_delivery_count`, `dl_source`, and
+  `dl_dead_lettered_at`; these rows have no `dl_original_id` and are not
+  replayable as inbound stream entries. Both writers use the bounded,
+  best-effort graveyard; collision escaping applies to the stream-consumer
+  row family.
 - **Consumer liveness and prompt reclaim** (#1532) — `XINFO CONSUMERS` idle is
   only a cheap candidate filter: it rises while a worker drains a turn or waits
   at its local concurrency limit. Before either lane reads, the narrow
@@ -87,6 +97,15 @@ A second broker must honor the stream key, the payload encoding, and the Stream 
   replicas from racing through the delivery budget. A restarted generation
   also recovers rows under its own stable consumer name through the same
   pre-claim cap check before it reads new entries.
+- **Lease expiry** (#2433): a pending row whose delivery state exists and whose
+  delivery lease has expired is transferred regardless of whether its PEL consumer
+  is alive, because a handler that raised released its lease and no prompt path
+  looks at a peer that is not dead. The scan is `xpending_range` with an `IDLE`
+  filter at `CURIE_LEASE_EXPIRED_IDLE_MS` (default one delivery lease TTL) and the
+  claim is `xclaim` at that same min-idle, which makes the claim an atomic
+  compare-and-claim on the row's idle clock. An entry with no delivery state
+  carries no evidence a lease was ever granted and remains on the 900-second
+  `XAUTOCLAIM` fallback.
 - **Compatibility and the prompt cap rule** — an unknown/pre-marker peer keeps
   the unchanged 900-second `XAUTOCLAIM` backstop. For a proven-dead capable
   peer, the prompt path first reads `XPENDING` metadata and skips local
@@ -124,12 +143,14 @@ Drawn only at the **non-sacred** seams; the sacred concurrency kernel
 `apps/worker/src/curie_worker/threadlock.py` / `apps/worker/src/curie_worker/markers.py`)
 is not touched:
 
-- **Producer** — `StreamPublisher` (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`): `xadd` and the
-  `SET NX EX` dedupe-claim. `enqueue`/`claim_event` type against it.
+- **Producer** — `StreamPublisher` (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`): `xadd`, the
+  `SET NX EX` dedupe-claim, and `delete` (the `release_event` path). `enqueue`/`claim_event`/`release_event` type against it.
 - **Consumer transport** — `StreamBroker` (`apps/worker/src/curie_worker/broker.py::StreamBroker`):
   `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`, plus — since the bounded-delivery
   dead-letter path (#505, ADR-0039) — `xpending_range`/`xrange`/`xadd`, plus — since
-  dead-consumer prompt reclaim (#1532) — `xinfo_consumers`/`xclaim`. The non-sacred `StreamConsumer`
+  dead-consumer prompt reclaim (#1532): `xinfo_consumers`/`xclaim`, which the
+  lease-expiry pass (#2433) reuses as an `IDLE`-filtered `xpending_range` plus an
+  `xclaim` at the same min-idle. The non-sacred `StreamConsumer`
   base (`apps/worker/src/curie_worker/stream_consumer.py`) holds a `StreamBroker`; the sacred `consumer.py` subclass
   inherits it unchanged (its `XAUTOCLAIM` reclaim now targets the port by inheritance).
 - **Consumer liveness store** — `ConsumerLivenessStore`
@@ -158,7 +179,8 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   operator thread-reset feature (#713, #812) needs Valkey Set semantics, which
   `StreamBroker` deliberately does not cover, so the sacred consumer keeps a second,
   concretely-typed `redis.asyncio.Redis` handle onto the same connection
-  (`self._valkey`) and calls `SPOP`/`SADD`/`SREM` on it in
+  (`self._valkey`) and claims a member with `EVAL` Lua (`SPOP`+`SADD` atomic,
+  `_THREAD_RESET_CLAIM_LUA`) plus `SREM` on it in
   `apps/worker/src/curie_worker/consumer.py::Consumer._drain_thread_reset_requests`.
   The API half is the same shape: `SADD`/`SISMEMBER` in
   `apps/api/src/curie_api/threadreset.py::ThreadResetRequests`. A second broker that
@@ -185,13 +207,17 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   `apps/api/src/curie_api/resumequeue.py::ResumeQueue.read_dead_letter` (`xrevrange`),
   whose rows the #532 backstop
   (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler.reopen_dead_lettered_resumes`)
-  consumes. Both readers also depend on the worker's `dl_*` metadata field schema
-  (`dl_original_id`, `dl_delivery_count`, `dl_reason`, `dl_dead_lettered_at`, written by
-  `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._dead_letter`), and
-  the API re-derives the graveyard name as `<stream>:dead` rather than reading the
-  worker's config. So a second broker must account for a third producer (the API) and for
-  two API-side graveyard readers, none of which go through a port today, plus an
-  undeclared cross-service field schema on the dead-letter stream.
+  consumes. `GraveyardWatcher` and `ResumeQueue.read_dead_letter` may each see
+  both graveyard row families. The watcher alerts on every row but always
+  projects the stream-consumer metadata fields `dl_original_id`,
+  `dl_delivery_count`, `dl_reason`, and `dl_dead_lettered_at`, using `?` when a
+  field is absent; it does not report completion `event_id` or `dl_source`.
+  The resume reconciler only acts on stream-consumer rows with a `payload` and
+  the expected resume metadata, so it skips completion-outbox rows. The API
+  re-derives the graveyard name as `<stream>:dead` rather than reading the
+  worker's config. The PEL writer already uses `StreamBroker.xadd`; a second
+  broker must additionally account for the off-port completion-outbox writer
+  and these two API-side readers.
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its
@@ -209,4 +235,4 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 - **Epic(s):** #85 — vision: make the broker itself swappable behind the stream contract
 - **Epic(s):** #7 — payload promotion into `packages/aci-protocol` (overlaps the channel seam, landed)
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — opinionated core (`curie:runs` stream), not one of the six swap jobs
-- **ADR(s):** [ADR-0027](../../adr/0027-thin-broker-port-defer-second-broker.md) — the broker port at the non-sacred seams; [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — adopt-not-build (Valkey adopted; second broker deferred); [ADR-0039](../../adr/0039-bounded-delivery-and-a-dead-letter-graveyard.md) — the delivery cap and dead-letter graveyard that added `xpending_range`/`xrange`/`xadd` to the port
+- **ADR(s):** [ADR-0027](../../adr/0027-thin-broker-port-defer-second-broker.md) — the broker port at the non-sacred seams; [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — adopt-not-build (Valkey adopted; second broker deferred); [ADR-0039](../../adr/0039-bounded-delivery-and-a-dead-letter-graveyard.md) — the delivery cap and dead-letter graveyard that added `xpending_range`/`xrange`/`xadd` to the port; [ADR-0131](../../adr/0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) — an adjacent fenced-owner store for delivery liveness and the execution budget, not a `StreamBroker` verb

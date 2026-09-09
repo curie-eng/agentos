@@ -142,6 +142,14 @@ pub struct Facts {
     /// What the `helm list` probe established. `NotInstalled` is the `Default`
     /// only because it is the state a fixture that says nothing means.
     pub release: ReleaseProbe,
+    /// Helm list `status` for the named release, when the listing included one.
+    /// Presence of a release record is not deployment health (#2349): a
+    /// `failed` latest revision must not render as `ok`.
+    pub release_status: Option<String>,
+    /// Ready replica count across Deployments and StatefulSets in the
+    /// namespace. `None` means the workload list was not observed; `Some(0)`
+    /// is an empty serving set, which is not an `ok` release (#2349).
+    pub ready_workloads: Option<usize>,
     /// The CIDRs `security.networkPolicy.allowedEgress` records, in recorded
     /// order. Empty means either nothing recorded or nothing this reader can
     /// reproduce -- the two are never distinguished, because a partial list is
@@ -168,6 +176,8 @@ pub struct Facts {
     /// mechanism the chart knows about is in place -- which is NOT proof it is
     /// unreachable, since a load balancer or tunnel in front is invisible here.
     pub api_exposure: Option<String>,
+    pub mail_channels: Vec<crate::mail_channel::Report>,
+    pub completion_outbox: Option<crate::completion_outbox::Report>,
 }
 
 fn ok(id: &'static str, title: &'static str, detail: impl Into<String>) -> Check {
@@ -217,6 +227,77 @@ const DEFAULT_TARGET: &str = "curie";
 /// later wording tweak cannot silently break the verdict with every test green.
 const HELM_ABSENT_DETAIL: &str = "helm is not installed, so nothing about a cluster release \
                                   could be read";
+
+/// Ready replica count across a `kubectl get deployments,statefulsets -o json`
+/// item list. Missing `readyReplicas` counts as zero, so an empty namespace
+/// and a listed workload that is not ready are the same observation: nothing
+/// is serving.
+fn ready_workload_replicas(items: &[serde_json::Value]) -> usize {
+    items
+        .iter()
+        .map(|item| {
+            item.pointer("/status/readyReplicas")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize
+        })
+        .sum()
+}
+
+/// Why an Installed helm record is not serving. Only Helm's `failed` status
+/// word and an observed empty ready set; unobserved workloads and other
+/// status strings are not a serving failure.
+fn serving_problem(f: &Facts) -> Option<&'static str> {
+    if f.release_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+    {
+        return Some("latest revision is failed");
+    }
+    if f.ready_workloads == Some(0) {
+        return Some("zero ready workloads");
+    }
+    None
+}
+
+/// Helm list `status` for one named release. Missing or unreadable listings
+/// yield `None`; doctor is failure-tolerant here. The sibling parser in
+/// `ops::helm_release_status` is strict because API-key discovery must not
+/// guess.
+fn release_list_status(stdout: &str, release: &str) -> Option<String> {
+    let listed = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok()?;
+    listed
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(release))?
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(str::to_string)
+}
+
+async fn observe_ready_workloads(namespace: &str, release: &str) -> Option<usize> {
+    let selector = format!("app.kubernetes.io/instance={release}");
+    let (ok, out, _) = capture(
+        "kubectl",
+        &[
+            "get",
+            "deployments,statefulsets",
+            "-n",
+            namespace,
+            "-l",
+            &selector,
+            "-o",
+            "json",
+        ],
+    )
+    .await;
+    if !ok {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
+    Some(ready_workload_replicas(parsed.get("items")?.as_array()?))
+}
 
 /// Classify a `helm list` run. Pure, so every outcome is a unit test rather than
 /// a cluster fixture -- and it takes the exit status and stdout ONLY. helm's
@@ -523,7 +604,7 @@ fn release_fake_model(values: &serde_json::Value) -> bool {
 /// `classify_existing_secret_field` in `cli/src/github_app.rs`, which mirrors
 /// the same Go rule for `api.githubAppExistingSecret`. They must agree, so a
 /// change to one belongs in both.
-fn helm_truthy(value: Option<&serde_json::Value>) -> bool {
+pub(crate) fn helm_truthy(value: Option<&serde_json::Value>) -> bool {
     match value {
         None | Some(serde_json::Value::Null) => false,
         Some(serde_json::Value::Bool(b)) => *b,
@@ -649,8 +730,18 @@ fn webhook_recovery(f: &Facts, namespace: &str, release: &str) -> String {
     command
 }
 
-/// Judge the gathered facts. Pure.
+/// Judge caller-supplied facts without adding an observation the caller did
+/// not make. The real doctor path uses [`evaluate_with_worker_claims`] after
+/// its release-scoped observer completes.
 pub fn evaluate(f: &Facts) -> Vec<Check> {
+    evaluate_with_worker_claims(f, None)
+}
+
+/// Judge the gathered facts, including the optional claim observation. Pure.
+fn evaluate_with_worker_claims(
+    f: &Facts,
+    worker_claims: Option<&crate::worker_claims::ClaimsState>,
+) -> Vec<Check> {
     let mut out = Vec::new();
 
     out.push(match (&f.model_credential, &f.model_credential_source) {
@@ -775,6 +866,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             ("clone-credential", "Clone credential"),
             ("webhook", "Webhook exposure"),
             ("repo-binding", "Repo binding"),
+            ("completion-outbox", "Completion delivery"),
         ] {
             out.push(skipped(id, title, "needs a cluster"));
         }
@@ -834,31 +926,35 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
         }
         ReleaseProbe::NotInstalled => {
             out.push(ok("cluster", "Cluster", format!("{context} (reached)")));
-            // "no DEPLOYED release" is what plain `helm list` actually shows:
-            // it filters out pending and failed ones. `helm list -a` was the
-            // alternative and is worse -- it also lists releases kept with
-            // --keep-history, so a deleted release would read as present, and
-            // over-claiming presence is the wrong direction for a check whose
-            // fix is "install it".
+            // Default `helm list` includes deployed and failed releases. A
+            // failed record is classified Installed with `release_status`,
+            // not this arm. This wording is for a name helm did not list.
             out.push(missing(
                 "release",
                 "Curie release",
-                format!(
-                    "helm reports no deployed release named {release} in this namespace \
-                     (a pending or failed release is not listed)"
-                ),
+                format!("helm reports no release named {release} in this namespace"),
                 missing_release_recovery(namespace, release, f.model_credential_provider),
             ));
             Some("needs a release")
         }
         ReleaseProbe::Installed { chart } => {
             out.push(ok("cluster", "Cluster", format!("{context} (reached)")));
-            out.push(ok(
-                "release",
-                "Curie release",
-                format!("{release} ({chart})"),
-            ));
-            None
+            if let Some(reason) = serving_problem(f) {
+                out.push(missing(
+                    "release",
+                    "Curie release",
+                    format!("{release} ({chart}): {reason}"),
+                    targeted("status", namespace, release),
+                ));
+                Some("release is not serving")
+            } else {
+                out.push(ok(
+                    "release",
+                    "Curie release",
+                    format!("{release} ({chart})"),
+                ));
+                None
+            }
         }
     };
 
@@ -871,11 +967,92 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             ("clone-credential", "Clone credential"),
             ("webhook", "Webhook exposure"),
             ("repo-binding", "Repo binding"),
+            ("completion-outbox", "Completion delivery"),
         ] {
             out.push(skipped(id, title, reason));
         }
         return out;
     }
+
+    if let Some(worker_claims) = worker_claims {
+        out.push(match worker_claims {
+            crate::worker_claims::ClaimsState::ClaimsEnabled => {
+                ok("worker-claims", "Worker claims", "claims enabled")
+            }
+            crate::worker_claims::ClaimsState::Quiescing { revision, .. } => {
+                let detail = worker_claims
+                    .wait_reason()
+                    .expect("a quiescing claim state has a wait reason");
+                missing(
+                    "worker-claims",
+                    "Worker claims",
+                    detail,
+                    format!(
+                        "wait for upgrade revision {revision} to finish, then re-run `curie doctor \
+                         --namespace {namespace} --release {release}` and `{}`",
+                        targeted("status", namespace, release)
+                    ),
+                )
+            }
+            crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => missing(
+                "worker-claims",
+                "Worker claims",
+                worker_claims
+                    .wait_reason()
+                    .expect("a metadata-free quiescing state has a wait reason"),
+                format!(
+                    "wait for the current upgrade to finish, then re-run `curie doctor \
+                     --namespace {namespace} --release {release}` and `{}`",
+                    targeted("status", namespace, release)
+                ),
+            ),
+            crate::worker_claims::ClaimsState::Unknown => skipped(
+                "worker-claims",
+                "Worker claims",
+                "worker claim state unknown",
+            ),
+        });
+    }
+
+    if f.mail_channels.is_empty() {
+        out.push(skipped(
+            "mail-channel",
+            "Mail channel token",
+            "mail adapter not deployed",
+        ));
+    }
+    for report in &f.mail_channels {
+        out.push(Check {
+            id: "mail-channel",
+            title: "Mail channel token",
+            state: if report.healthy() {
+                State::Ok
+            } else {
+                State::Missing
+            },
+            detail: report.detail.clone(),
+            fix: report.fix.clone(),
+        });
+    }
+
+    out.push(match &f.completion_outbox {
+        None => skipped(
+            "completion-outbox",
+            "Completion delivery",
+            "completion outbox not observed",
+        ),
+        Some(report) if report.healthy() => ok(
+            "completion-outbox",
+            "Completion delivery",
+            report.detail.clone(),
+        ),
+        Some(report) => missing(
+            "completion-outbox",
+            "Completion delivery",
+            report.detail.clone(),
+            "inspect worker completion delivery; do not clear the outbox to make this check pass",
+        ),
+    });
 
     // Socket mode needs BOTH tokens, and this check used to read only the bot
     // token while claiming both were recorded -- so a half-configured release
@@ -1035,6 +1212,13 @@ pub fn summary(checks: &[Check]) -> String {
     if release_detail == Some(HELM_ABSENT_DETAIL) {
         return "Ready to run locally. helm is not installed, so nothing about a \
                 cluster release could be read."
+            .to_string();
+    }
+    if release_detail.is_some_and(|detail| {
+        detail.contains("latest revision is failed") || detail.contains("zero ready workloads")
+    }) {
+        return "The cluster release is not serving -- see the Curie release line \
+                above."
             .to_string();
     }
     if !has("release") {
@@ -2785,6 +2969,7 @@ mod tests {
     const KUBECTL_STUB: &str = r#"#!/bin/sh
 case "$*" in
   "config current-context") printf '%s\n' 'doctor-stub-context' ;;
+  *"get deployments,statefulsets"*"app.kubernetes.io/instance="*) printf '%s\n' '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}' ;;
   *) printf 'unexpected kubectl invocation: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#;
@@ -2892,8 +3077,11 @@ esac
     /// Deleting either half of that assignment, or switching the read back to
     /// `fetch_release_values` (the operator-supplied values, where a chart
     /// default nobody set is invisible -- the #1950 defect), must fail this
-    /// test. The shell-model test above cannot catch any of that: it returns
-    /// early at the kubectl context probe, before a single helm read.
+    /// test. The shell-model test above cannot catch any of that: the helm
+    /// version and helm list probes are issued concurrently with the kubectl
+    /// context probe and their answers are discarded on that test's early
+    /// return, so only the computed and operator-supplied values reads are
+    /// skipped.
     #[tokio::test]
     async fn gather_reads_the_release_default_model_from_computed_helm_values() {
         let _lock = crate::PROCESS_ENV_LOCK.lock().await;
@@ -2927,6 +3115,35 @@ esac
             Some(ReleaseModelKey::Runner),
             "the key must travel with the id: the chart reads one of two, and \
              a fix naming the other one is a command that changes nothing"
+        );
+    }
+
+    /// gather copies helm list `status` and the deploy/sts ready count, which
+    /// evaluate uses for #2349. Overwriting the stub listing after install is
+    /// the secondary path: the default listing has no status field.
+    #[tokio::test]
+    async fn gather_records_failed_helm_status_and_ready_replicas() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _cluster = StubbedCluster::install("{}");
+        std::env::set_var(
+            "CURIE_TEST_DOCTOR_HELM_LIST",
+            r#"[{"name":"rel","chart":"curie-0.8.5","status":"failed"}]"#,
+        );
+
+        let f = gather("ns", "rel", None).await;
+
+        assert_eq!(
+            f.release,
+            ReleaseProbe::Installed {
+                chart: "curie-0.8.5".to_string()
+            }
+        );
+        assert_eq!(f.release_status.as_deref(), Some("failed"));
+        assert_eq!(f.ready_workloads, Some(1));
+        assert_eq!(
+            find(&evaluate(&f), "release").state,
+            State::Missing,
+            "failed status beats a non-zero ready count"
         );
     }
 
@@ -3717,6 +3934,154 @@ esac
         }
     }
 
+    /// #2349: helm list includes failed releases (the comment that it filters
+    /// them out is wrong). Presence of a chart name is not deployment health.
+    #[test]
+    fn a_failed_helm_revision_is_not_an_ok_release() {
+        let mut f = probed(ReleaseProbe::Installed {
+            chart: "curie-0.8.5".into(),
+        });
+        f.release_status = Some("failed".into());
+        let checks = evaluate(&f);
+        let release = find(&checks, "release");
+        assert_eq!(
+            release.state,
+            State::Missing,
+            "a failed latest revision must not render as ok: {}",
+            release.detail
+        );
+        assert!(
+            release.detail.contains("failed"),
+            "the row must name the failed revision: {}",
+            release.detail
+        );
+        let fix = release.fix.as_deref().expect("must offer a command");
+        assert!(
+            fix.contains("cluster status")
+                && fix.contains("--namespace acme")
+                && fix.contains("--release acme"),
+            "the fix must inspect the named release: {fix}"
+        );
+        for id in ["slack", "clone-credential", "webhook", "repo-binding"] {
+            assert_eq!(
+                find(&checks, id).state,
+                State::NotApplicable,
+                "{id} must not offer setup against a release that is not serving"
+            );
+        }
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert!(
+            !out.summary.contains("No cluster release yet"),
+            "a failed revision is present, not absent: {}",
+            out.summary
+        );
+        assert!(
+            out.release_not_serving(),
+            "the report must be classified as not serving so the verb can exit 1"
+        );
+        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(false));
+    }
+
+    /// #2349: a Helm record whose namespace has no ready Deployments or
+    /// StatefulSets is not a healthy install, even when helm says deployed.
+    #[test]
+    fn zero_ready_workloads_is_not_an_ok_release() {
+        let mut f = probed(ReleaseProbe::Installed {
+            chart: "curie-0.8.5".into(),
+        });
+        f.release_status = Some("deployed".into());
+        f.ready_workloads = Some(0);
+        let checks = evaluate(&f);
+        let release = find(&checks, "release");
+        assert_eq!(release.state, State::Missing, "{}", release.detail);
+        assert!(
+            release.detail.contains("zero ready workloads"),
+            "the row must name the empty serving set: {}",
+            release.detail
+        );
+        assert_eq!(
+            find(&checks, "slack").state,
+            State::NotApplicable,
+            "do not send the operator to configure Slack against an empty namespace"
+        );
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert!(out.release_not_serving());
+    }
+
+    /// A deployed release with ready workloads stays ok. Missing Slack remains
+    /// a setup gap, not a serving failure, so doctor still exits 0 for that.
+    #[test]
+    fn a_deployed_release_with_ready_workloads_stays_ok() {
+        let mut f = probed(ReleaseProbe::Installed {
+            chart: "curie-0.8.5".into(),
+        });
+        f.release_status = Some("deployed".into());
+        f.ready_workloads = Some(4);
+        f.slack_app_token = false;
+        f.slack_bot_token = false;
+        let checks = evaluate(&f);
+        let release = find(&checks, "release");
+        assert_eq!(release.state, State::Ok, "{}", release.detail);
+        assert_eq!(find(&checks, "slack").state, State::Missing);
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert!(!out.release_not_serving());
+    }
+
+    /// Unobserved workload readiness must not invent a zero. Fixtures and a
+    /// kubectl that did not answer stay on the previous Installed=ok path.
+    #[test]
+    fn unobserved_workloads_do_not_fail_a_deployed_release() {
+        let mut f = probed(ReleaseProbe::Installed {
+            chart: "curie-0.8.5".into(),
+        });
+        f.release_status = Some("deployed".into());
+        f.ready_workloads = None;
+        assert_eq!(find(&evaluate(&f), "release").state, State::Ok);
+    }
+
+    /// Only Helm's `failed` status word trips the serving check. An arbitrary
+    /// listing field is not echoed and is not treated as a failed revision, so
+    /// a planted token cannot reach the payload.
+    #[test]
+    fn a_non_enum_helm_status_is_not_echoed_and_is_not_treated_as_failed() {
+        let mut f = probed(ReleaseProbe::Installed {
+            chart: "curie-0.8.5".into(),
+        });
+        f.release_status = Some("failed; Authorization: Bearer PLACEHOLDER".into());
+        let checks = evaluate(&f);
+        let rendered = format!("{checks:?}");
+        assert!(
+            !rendered.contains("Authorization") && !rendered.contains("PLACEHOLDER"),
+            "helm list status is an arbitrary field: {rendered}"
+        );
+        assert_eq!(
+            find(&checks, "release").state,
+            State::Ok,
+            "only the helm status word failed is a serving failure"
+        );
+    }
+
+    /// Empty deploy/sts list JSON is zero ready, not an unknown observation.
+    #[test]
+    fn ready_workload_replicas_treats_an_empty_list_as_zero() {
+        assert_eq!(ready_workload_replicas(&[]), 0);
+        let items = serde_json::json!([
+            {"kind": "Deployment", "status": {"readyReplicas": 1}},
+            {"kind": "StatefulSet", "status": {"readyReplicas": 2}},
+            {"kind": "Deployment", "status": {}}
+        ]);
+        assert_eq!(ready_workload_replicas(items.as_array().expect("array")), 3);
+    }
+
     /// The user-visible half of the same defect: four different causes must not
     /// produce the same two lines. Pairwise distinctness is the assertion the
     /// issue's report ("byte-identical") maps onto directly.
@@ -4081,6 +4446,49 @@ esac
     /// #1663 established that a floating pin is Ok-with-a-fix and must never
     /// make a working install read as unready.
     #[test]
+    fn an_owed_completion_outbox_is_missing_and_an_empty_one_is_ok() {
+        let empty = crate::completion_outbox::Report {
+            count: 0,
+            oldest_age_s: 0.0,
+            inflight: 0,
+            retry: 0,
+            terminal: 0,
+            state: crate::completion_outbox::State::Empty,
+            degraded: false,
+            detail: "completion outbox: state empty; count 0".into(),
+        };
+        let owed = crate::completion_outbox::Report {
+            count: 4,
+            oldest_age_s: 3600.0,
+            inflight: 0,
+            retry: 4,
+            terminal: 0,
+            state: crate::completion_outbox::State::Retry,
+            degraded: true,
+            detail: "completion outbox: state retry; count 4".into(),
+        };
+        let ok_checks = evaluate(&Facts {
+            completion_outbox: Some(empty),
+            ..wired()
+        });
+        let ok_check = find(&ok_checks, "completion-outbox");
+        assert_eq!(ok_check.state, State::Ok);
+        let missing_checks = evaluate(&Facts {
+            completion_outbox: Some(owed),
+            agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
+            ..wired()
+        });
+        let missing = find(&missing_checks, "completion-outbox");
+        assert_eq!(missing.state, State::Missing);
+        assert!(missing.detail.contains("retry"));
+        assert!(missing
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("do not clear the outbox"));
+    }
+
+    #[test]
     fn ready_is_false_when_any_check_is_missing() {
         let clean = Facts {
             agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
@@ -4269,8 +4677,34 @@ fn is_plain_https(entry: &serde_json::Value) -> bool {
 /// Gather the facts. Every probe is read-only and failure-tolerant: a missing
 /// tool or an unreachable cluster is a fact to report, never an error to raise.
 pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -> Facts {
+    gather_with_worker_claims(namespace, release, api).await.0
+}
+
+/// Gather the existing public facts plus the release-scoped claim observation
+/// used only by the assembled doctor report. Keeping the observation beside
+/// the facts avoids widening `Facts`, which is a public fixture surface.
+async fn gather_with_worker_claims(
+    namespace: &str,
+    release: &str,
+    api: Option<(&str, &str)>,
+) -> (Facts, Option<crate::worker_claims::ClaimsState>) {
+    // Four independent probes, issued as ONE stage: none reads another's
+    // output, and every one of them is a subprocess plus a round trip that
+    // doctor used to pay for in series. The RESULTS are consumed below in
+    // exactly the order they were awaited in before -- docker here, the kube
+    // context at its early return, the two helm answers at
+    // `classify_release_probe` -- so a run where the context is empty simply
+    // drops the helm answers on the floor rather than reordering any decision.
+    let helm_list_args = ["list", "-n", namespace, "-o", "json"];
+    let (docker_ok, context_probe, helm_present, release_listing) = tokio::join!(
+        probe_ok("docker", &["info"]),
+        capture("kubectl", &["config", "current-context"]),
+        probe_ok("helm", &["version", "--short"]),
+        capture("helm", &helm_list_args),
+    );
+
     let mut f = Facts {
-        docker_ok: probe_ok("docker", &["info"]).await,
+        docker_ok,
         bundle_name: bundle_name(),
         // What this run was pointed at, so every fix -- the model-pin `--set`
         // and the four cluster commands alike -- names the release this run
@@ -4337,18 +4771,19 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         }
     }
 
-    let (ok, ctx, _) = capture("kubectl", &["config", "current-context"]).await;
+    let (ok, ctx, _) = context_probe;
     if !ok || ctx.trim().is_empty() {
-        return f;
+        return (f, None);
     }
     f.kube_context = Some(ctx.trim().to_string());
 
-    // The probe runs here rather than through `ops::fetch_release_chart`, which
-    // collapses every nonzero exit to `Ok(None)` -- the collapse that made a
-    // missing helm, a cluster that could not answer and an empty namespace
-    // report identically. `fetch_release_chart` is left alone; installation.rs
-    // still calls it.
-    let helm_present = probe_ok("helm", &["version", "--short"]).await;
+    // Both helm answers were issued alongside the context probe above and are
+    // consumed here. `helm version --short` runs rather than
+    // `ops::fetch_release_chart`, which collapses every nonzero exit to
+    // `Ok(None)` -- the collapse that made a missing helm, a cluster that could
+    // not answer and an empty namespace report identically.
+    // `fetch_release_chart` is left alone; installation.rs still calls it.
+    //
     // helm's stderr is bound to `_` and never read, and that is the security
     // property rather than an oversight: it is an arbitrary external line that
     // can carry an `Authorization` header, an exec-plugin's argv, or a
@@ -4357,10 +4792,11 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     // a check's `detail` or `fix` -- the chart, context and NodePort values a
     // check does render are bounded, structured fields, not diagnostic text
     // (#1348).
-    let (listed, stdout, _) = capture("helm", &["list", "-n", namespace, "-o", "json"]).await;
+    let (listed, stdout, _) = release_listing;
     f.release = classify_release_probe(helm_present, listed, &stdout, release);
+    f.release_status = release_list_status(&stdout, release);
     if !matches!(f.release, ReleaseProbe::Installed { .. }) {
-        return f;
+        return (f, None);
     }
 
     let common = crate::ops::CommonOpts {
@@ -4368,25 +4804,38 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         release: release.to_string(),
         dry_run: false,
     };
-    // Two SEPARATE reads, deliberately, issued CONCURRENTLY.
+    // Four SEPARATE reads, deliberately issued CONCURRENTLY.
     //
     // Separate: `fetch_release_values` reports only what the operator supplied,
     // so an operator who never set a model has nothing to read there and the
     // chart default the sandboxes boot is invisible -- the #1950 defect.
     // `--all` returns the computed values. The two stay apart because switching
     // slack_configured, api.ingress.* or clone_credential onto computed values
-    // would silently change three unrelated checks.
+    // would silently change three unrelated checks. The deploy/sts listing is
+    // the serving-set observation (#2349) and does not consume either values
+    // read. Worker selection is the #2374 claim probe and likewise independent.
     //
-    // Concurrent: neither consumes the other's output and both depend only on
-    // `common`, so awaiting them in turn made every cluster run pay two helm
-    // spawns and two API-server round trips back to back for nothing. Each
-    // result keeps its own failure-tolerant handling below.
-    let (computed, values) = tokio::join!(
+    // Concurrent: none consumes another's output and all depend only on the
+    // confirmed release, so awaiting them in turn would add avoidable cluster
+    // round trips. Each result keeps its own failure-tolerant handling below.
+    let (computed, values, ready_workloads, worker_claim_probe) = tokio::join!(
         crate::ops::fetch_release_computed_values(&common),
         crate::ops::fetch_release_values(&common),
+        observe_ready_workloads(namespace, release),
+        crate::worker_claims::select_cluster(namespace, release),
     );
+    f.ready_workloads = ready_workloads;
 
+    // Failed values reads must not claim that the mail adapter is disabled.
+    f.mail_channels = vec![crate::mail_channel::unavailable(namespace, release)];
+    let mut mail_enabled = false;
     if let Ok(Some(computed)) = computed {
+        f.mail_channels.clear();
+        mail_enabled = helm_truthy(
+            computed
+                .get("mailAdapter")
+                .and_then(|value| value.get("deploy")),
+        );
         // The key travels with the id: the chart reads one of two, and a fix
         // naming the other one is a command that changes nothing.
         if let Some((model, key)) = runner_model_from_values(&computed) {
@@ -4398,6 +4847,7 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         f.model_release_fake = release_fake_model(&computed);
     }
 
+    let mut api_values_needing_nodeport = None;
     if let Ok(Some(values)) = values {
         // Presence only, both of them: socket mode needs the pair, and reading
         // one while reporting both is what made a half-wired release read as Ok.
@@ -4410,15 +4860,55 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         // decision itself still lives in exactly one place; deciding it here
         // too, to skip the read, is how a helper stays right while the report
         // goes wrong.
-        f.api_exposure = match api_exposure_from_values(&values, None) {
-            Some(exposure) => Some(exposure),
-            None => api_exposure_from_values(&values, api_nodeport(namespace, release).await),
-        };
+        f.api_exposure = api_exposure_from_values(&values, None);
         f.clone_credential = clone_credential_from_values(&values);
         (f.sandbox_egress_cidrs, f.sandbox_egress_is_reproducible) =
             sandbox_egress_from_values(&values);
+        if f.api_exposure.is_none() {
+            api_values_needing_nodeport = Some(values);
+        }
     }
-    f
+
+    // These reads consume the preceding stage: mail observation needs the
+    // computed deploy gate, NodePort discovery needs the supplied ingress
+    // values, and worker exec needs the selected pod. Run them together so no
+    // independent subprocess waits behind another.
+    let needs_api_nodeport = api_values_needing_nodeport.is_some();
+    let selected_worker = worker_claim_probe.selected_pod().map(str::to_string);
+    let (mail_channels, nodeport, worker_claims, completion_outbox) = tokio::join!(
+        async {
+            if !mail_enabled {
+                return None;
+            }
+            let mut reports = crate::mail_channel::observe(namespace, release).await;
+            if reports.is_empty() {
+                reports.push(crate::mail_channel::unavailable(namespace, release));
+            }
+            Some(reports)
+        },
+        async {
+            if needs_api_nodeport {
+                api_nodeport(namespace, release).await
+            } else {
+                None
+            }
+        },
+        worker_claim_probe.observe(),
+        async {
+            match selected_worker.as_deref() {
+                Some(pod) => Some(crate::completion_outbox::observe_exec(namespace, pod).await),
+                None => None,
+            }
+        },
+    );
+    if let Some(reports) = mail_channels {
+        f.mail_channels = reports;
+    }
+    f.completion_outbox = completion_outbox;
+    if let Some(values) = api_values_needing_nodeport.as_ref() {
+        f.api_exposure = api_exposure_from_values(values, nodeport);
+    }
+    (f, Some(worker_claims.state))
 }
 
 /// The kubectl read behind `api_nodeport`, extracted pure so the Service NAME
@@ -4494,6 +4984,20 @@ pub struct DoctorOutput {
     pub summary: String,
 }
 
+impl DoctorOutput {
+    /// True when the Curie release row reports a Helm record that is not
+    /// serving: latest revision `failed`, or zero ready workloads (#2349).
+    /// Distinct from a missing install, which is a setup gap and still exits 0.
+    pub fn release_not_serving(&self) -> bool {
+        self.checks.iter().any(|c| {
+            c.id == "release"
+                && c.state == State::Missing
+                && (c.detail.contains("latest revision is failed")
+                    || c.detail.contains("zero ready workloads"))
+        })
+    }
+}
+
 impl crate::ui::CliOutput for DoctorOutput {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -4535,25 +5039,35 @@ impl crate::ui::CliOutput for DoctorOutput {
 /// sibling cluster verbs use. Discovery errors are discarded: gather is
 /// failure-tolerant, and an unreachable API narrows the report to
 /// `agents: None` rather than failing the whole run (#1367).
+///
+/// The two legs are independent -- the URL comes off the release's Services and
+/// the key off its chart Secret -- so they are issued concurrently rather than
+/// the key waiting on the URL. One behavioral consequence, deliberate: when the
+/// URL turns out not to be discoverable, the key discovery has still RUN and
+/// its result is discarded. It is a read-only Secret lookup either way, and the
+/// report is identical; what changes is that doctor no longer pays for the two
+/// round trips back to back.
 pub async fn resolve_api(
     namespace: &str,
     release: &str,
     api_url: Option<&str>,
     api_key: Option<&str>,
 ) -> Option<(String, String)> {
-    let url = match nonempty(api_url) {
-        Some(url) => url.to_string(),
-        None => crate::ops::discover_api_url(namespace, release)
-            .await
-            .ok()?,
-    };
-    let key = match nonempty(api_key) {
-        Some(key) => key.to_string(),
-        None => crate::ops::discover_api_key(namespace, release)
-            .await
-            .ok()?,
-    };
-    Some((url, key))
+    let (url, key) = tokio::join!(
+        async {
+            match nonempty(api_url) {
+                Some(url) => Some(url.to_string()),
+                None => crate::ops::discover_api_url(namespace, release).await.ok(),
+            }
+        },
+        async {
+            match nonempty(api_key) {
+                Some(key) => Some(key.to_string()),
+                None => crate::ops::discover_api_key(namespace, release).await.ok(),
+            }
+        },
+    );
+    Some((url?, key?))
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -4570,7 +5084,8 @@ pub async fn doctor(
     let api = resolved
         .as_ref()
         .map(|(url, key)| (url.as_str(), key.as_str()));
-    let checks = evaluate(&gather(namespace, release, api).await);
+    let (facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    let checks = evaluate_with_worker_claims(&facts, worker_claims.as_ref());
     let summary = summary(&checks);
     DoctorOutput { checks, summary }
 }

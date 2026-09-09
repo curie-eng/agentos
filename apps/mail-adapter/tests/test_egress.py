@@ -699,3 +699,107 @@ def test_an_unexpected_exception_does_not_poison_the_event_id(
 
     assert status == 200
     assert len(mail.replies) == 1
+
+
+def test_deleted_provider_thread_is_terminal_once_across_restart(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # AgentMail Get Thread documents 404 NotFoundError:
+    # https://docs.agentmail.to/api-reference/inboxes/threads/get
+    # Issue #2376 observed this after deleting an admitted thread.
+    seed(mail, adapter)
+    post_event(egress_url, update("answer one"))
+    mail.deleted_threads.add("thr-1")
+    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+        assert post_event(egress_url, completed("ev-deleted"))[0] == 410
+        assert post_event(egress_url, completed("ev-deleted"))[0] == 410
+        with restarted_adapter(adapter, serve_egress) as (_, replacement_url):
+            assert post_event(replacement_url, completed("ev-deleted"))[0] == 410
+    assert mail.thread_calls == 1
+    assert mail.replies == []
+    messages = [
+        r.getMessage() for r in caplog.records if "thread deleted at provider" in r.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "thr-1" not in messages[0]
+    assert "ev-deleted" not in messages[0]
+
+
+def test_a_404_without_a_provider_body_is_not_terminal(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+) -> None:
+    """An edge 404 is "could not read", not "deleted".
+
+    Get Thread answering 404 with an HTML error page is a gateway, proxy or
+    stale route between the adapter and AgentMail -- not the provider saying the
+    thread is gone. Classifying it as deletion writes a permanent receipt and no
+    later attempt ever consults the provider again, so one transient edge answer
+    silently destroys the reply on an otherwise healthy release.
+
+    The mutation this pins: drop the body check in `thread_carries` and the
+    first completion below answers 410, the receipt is written, `thread_calls`
+    stops at 1, and the recovery never sends.
+    """
+    seed(mail, adapter)
+    post_event(egress_url, update("answer one"))
+    mail.fail_next_thread = 404
+    mail.injected_raw_body = "<html><head><title>404 Not Found</title></head></html>"
+
+    assert post_event(egress_url, completed("ev-1"))[0] == 502
+    assert mail.replies == []
+
+    # No tombstone was written, so the retry asks the provider again and the
+    # completion still settles normally.
+    mail.injected_raw_body = None
+    assert post_event(egress_url, completed("ev-1"))[0] == 200
+    assert mail.thread_calls == 2
+    assert len(mail.replies) == 1
+
+
+def test_deleted_unadmitted_thread_does_not_create_a_terminal_receipt(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+) -> None:
+    seed(mail, adapter)
+    mail.deleted_threads.add("thr-unknown")
+    event = completed("ev-forged", conversation_id="thr-unknown", reply_ref="msg-1")
+    assert post_event(egress_url, event)[0] == 502
+    assert post_event(egress_url, event)[0] == 502
+    assert mail.thread_calls == 2
+    assert mail.replies == []
+
+
+def test_version_one_state_migrates_without_losing_admitted_or_delivered_replies(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
+) -> None:
+    import sqlite3
+
+    seed(mail, adapter)
+    assert post_event(egress_url, completed("ev-done"))[0] == 200
+    seed(mail, adapter, "msg-2", thread_id="thr-2")
+    adapter.close()
+    # Reconstruct the released v1 database shape, preserving real admitted rows.
+    with sqlite3.connect(adapter.config.state_path) as connection:
+        connection.execute("ALTER TABLE completion_events DROP COLUMN deleted")
+        connection.execute("PRAGMA user_version=1")
+    replacement = MailAdapter(adapter.config)
+    try:
+        url = serve_egress(replacement) + "/"
+        assert post_event(url, completed("ev-done"))[0] == 200
+        mail.deleted_threads.add("thr-2")
+        event = completed("ev-deleted", conversation_id="thr-2", reply_ref="msg-2")
+        assert post_event(url, event)[0] == 410
+        assert post_event(url, event)[0] == 410
+        assert len(mail.replies) == 1
+    finally:
+        replacement.close()

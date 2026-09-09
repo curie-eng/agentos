@@ -25,6 +25,15 @@ fn chart() -> &'static str {
 }
 
 fn write_exec(dir: &Path, name: &str, body: &str) {
+    let body = if matches!(name, "helm" | "kubectl") {
+        format!(
+            "#!/bin/sh\n{}\n{}",
+            include_str!("data/converged-installation-read.sh"),
+            body.strip_prefix("#!/bin/sh\n").unwrap_or(body)
+        )
+    } else {
+        body.to_string()
+    };
     let path = dir.join(name);
     fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
     let mut permissions = fs::metadata(&path)
@@ -117,6 +126,9 @@ exit 64
 printf '%s\n' "$*" >> "$CURIE_TEST_KUBECTL_LOG"
 
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
+    if [ "$3" = "target-namespace" ]; then
+        printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"target-namespace","labels":{"curietech.ai/created-by":"target-release","curietech.ai/created-in":"target-namespace"},"uid":"uid-target-namespace","resourceVersion":"17"}}'
+    fi
     exit 0
 fi
 

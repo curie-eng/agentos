@@ -56,6 +56,42 @@ pub fn is_eval_isolate_thread(thread_key: &str) -> bool {
     thread_key.starts_with(EVAL_ISOLATE_THREAD_PREFIX)
 }
 
+/// RFC 3986 unreserved set, matching Python `urllib.parse.quote(s, safe="")`.
+fn percent_encode_unreserved(s: &str) -> String {
+    let mut out = String::new();
+    for byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The worker's internal sandbox key for a turn: percent-encoded
+/// `kind:channel:conversation_id`. Frozen with the Python `_thread_key_for`
+/// helper in `tests/vectors/thread-reset-set.json`. A THREAD_RESET_SET member
+/// that is only the conversation_id cannot release the sandbox (#2259).
+pub fn thread_key_for(kind: &str, channel: &str, conversation_id: &str) -> String {
+    [
+        percent_encode_unreserved(kind),
+        percent_encode_unreserved(channel),
+        percent_encode_unreserved(conversation_id),
+    ]
+    .join(":")
+}
+
+/// [`thread_key_for`] from a minted `QueuedTurn`.
+pub fn thread_key_for_turn(turn: &QueuedTurn) -> String {
+    thread_key_for(
+        &turn.reply_handle.kind,
+        &turn.reply_handle.channel,
+        &turn.conversation_id,
+    )
+}
+
 /// Mint the QueuedTurn `run_eval_turns` enqueues: a synthetic turn whose
 /// `conversation_id` carries the isolate prefix so the worker omits ambient
 /// agent memory (#1909). The only production mint for local/cluster eval
@@ -187,9 +223,10 @@ pub async fn xadd(
 /// Queue `thread_key` for a forced sandbox release on the worker's next drain
 /// (`THREAD_RESET_SET`, the same SET `reset-thread` uses). Idempotent.
 ///
-/// `curie local eval` / `curie cluster eval` call this after every case so
+/// `curie local eval` / `curie cluster eval` call this after every text-graded
+/// case with the worker's scoped thread key (`thread_key_for_turn`), so
 /// eval-owned `curie-thread-*` sandboxes do not pin quota until
-/// `routeTtlSeconds` (#1534).
+/// `routeTtlSeconds` (#1534, #2259).
 pub async fn queue_thread_reset(conn: &mut MultiplexedConnection, thread_key: &str) -> Result<()> {
     let _: i32 = redis::cmd("SADD")
         .arg(THREAD_RESET_SET)
@@ -685,11 +722,21 @@ mod tests {
 
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
+    struct ThreadKeyExample {
+        kind: String,
+        channel: String,
+        conversation_id: String,
+        thread_key: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct ThreadResetVector {
         #[serde(rename = "comment")]
         _comment: String,
         thread_reset_set: String,
         thread_reset_inflight_set: String,
+        thread_key_examples: Vec<ThreadKeyExample>,
     }
 
     #[test]
@@ -707,6 +754,34 @@ mod tests {
         assert_eq!(
             parsed.thread_reset_inflight_set,
             "curie:thread-reset-inflight"
+        );
+        assert!(
+            !parsed.thread_key_examples.is_empty(),
+            "the vector must freeze at least one scoped thread-key example"
+        );
+        for example in parsed.thread_key_examples {
+            assert_eq!(
+                thread_key_for(&example.kind, &example.channel, &example.conversation_id),
+                example.thread_key,
+                "CLI thread_key_for drifted from tests/vectors/thread-reset-set.json"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_isolate_turn_thread_key_encodes_the_colon() {
+        let turn = eval_case_turn(
+            "slack",
+            "C-SIM-abc",
+            "U1",
+            "ping",
+            "1720000000.000100",
+            "1720000000.000200",
+            None,
+        );
+        assert_eq!(
+            thread_key_for_turn(&turn),
+            "slack:C-SIM-abc:eval%3A1720000000.000100"
         );
     }
 }

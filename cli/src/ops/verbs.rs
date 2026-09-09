@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 
 #[allow(unused_imports)]
-use super::{command::*, providers::*, up::*};
+use super::{command::*, convergence, providers::*, up::*};
 
 pub struct DownOpts {
     pub common: CommonOpts,
@@ -21,6 +21,10 @@ pub struct RollbackOpts {
     /// without this flag, since helm never finished applying such a revision.
     pub allow_failed_revision: bool,
     pub yes: bool,
+    /// Test-only negative control for #2296: skip the schema compatibility
+    /// gate so the status filter's unsafe target is handed to Helm.
+    /// The clap path never sets this.
+    pub disable_schema_gate: bool,
 }
 
 /// The version declared by the chart at `chart`, read from its own `Chart.yaml`.
@@ -53,13 +57,15 @@ pub async fn chart_version(chart: &str) -> Result<String> {
 /// (live for a real run, [`chart_fullname`] under `--dry-run`), so this builder
 /// still makes no cluster call of its own.
 pub fn status_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
-    vec![
+    let mut commands = vec![
         helm_status_cmd(o),
         pods_cmd(o),
         svc_cmd(o, fullname, "ui"),
         svc_cmd(o, fullname, "langfuse-web"),
         kubeconfig_host_cmd(),
-    ]
+    ];
+    commands.extend(convergence::dry_run_commands(o));
+    commands
 }
 
 fn helm_status_cmd(o: &CommonOpts) -> OpsCommand {
@@ -386,7 +392,7 @@ fn is_help_pointer(line: &str) -> bool {
 /// Safety property: a stderr that is ONLY help text has no diagnosis to
 /// recover, so the cut falls back to the base rule's answer rather than to an
 /// empty string. This can improve the surfaced reason, never blank it.
-pub(super) fn failure_reason(stderr: &str) -> &str {
+pub(crate) fn failure_reason(stderr: &str) -> &str {
     let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
     let base = lines.iter().rev().find(|l| !l.is_empty()).copied();
     // Everything from the last usage header on is the tool's own help text.
@@ -554,7 +560,7 @@ pub(super) fn ns_common(opts: &CommonOpts, ns: &str, dry_run: bool) -> CommonOpt
 
 /// `kubectl get namespace <ns>`: the pre-existence probe `up` runs before the
 /// install so it stamps ownership only on namespaces it creates.
-fn namespace_get_cmd(namespace: &str) -> OpsCommand {
+pub(crate) fn namespace_get_cmd(namespace: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![plain("get"), plain("namespace"), plain(namespace)],
@@ -564,7 +570,7 @@ fn namespace_get_cmd(namespace: &str) -> OpsCommand {
 /// Whether `namespace` already exists on the cluster. A nonzero `kubectl get`
 /// (typically NotFound) reads as absent, so `up` treats it as fresh and stamps
 /// it; any other transport error surfaces later on the install itself.
-pub(super) async fn namespace_exists(namespace: &str) -> Result<bool> {
+pub(crate) async fn namespace_exists(namespace: &str) -> Result<bool> {
     let (ok, _out, _err) = run_capture(&namespace_get_cmd(namespace)).await?;
     Ok(ok)
 }
@@ -598,8 +604,12 @@ pub struct ClusterStatus {
     pub ready: usize,
     pub total: usize,
     pub unhealthy: Vec<String>,
+    /// Diagnoses that could not be MADE, kept apart from `unhealthy` so they
+    /// never reach the exit code.
+    pub warnings: Vec<String>,
     pub pods_listed: bool,
     pub urls: Vec<ServiceUrl>,
+    pub delivery: crate::completion_outbox::Report,
     pub upgrade: super::upgrade::UpgradeStatusView,
 }
 
@@ -608,7 +618,10 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
         match self {
             ClusterStatusOutput::DryRun(plan) => plan.to_json(),
             ClusterStatusOutput::Status(s) => {
-                let healthy = s.total > 0 && s.ready == s.total && s.unhealthy.is_empty();
+                let healthy = s.total > 0
+                    && s.ready == s.total
+                    && s.unhealthy.is_empty()
+                    && !s.delivery.degraded;
                 serde_json::json!({
                     "namespace": s.namespace,
                     "revision": s.revision,
@@ -620,7 +633,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                         "unhealthy": s.unhealthy,
                         "rows": s.pods.iter().map(PodRow::to_json).collect::<Vec<_>>(),
                     },
+                    "warnings": s.warnings,
                     "urls": s.urls.iter().map(ServiceUrl::to_json).collect::<Vec<_>>(),
+                    "delivery": serde_json::to_value(&s.delivery).expect("delivery serializes"),
                     "healthy": healthy,
                     "upgrade": s.upgrade.to_json(),
                 })
@@ -643,6 +658,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 if !s.pods_listed {
                     ui.warn(&format!("could not list pods in namespace {}", s.namespace));
                 }
+                for warning in &s.warnings {
+                    ui.warn(warning);
+                }
                 for url in &s.urls {
                     url.render(ui);
                 }
@@ -652,7 +670,11 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     s.upgrade.phase.as_deref().unwrap_or("idle"),
                     s.upgrade.known_good_version.as_deref().unwrap_or("none")
                 ));
-                if s.total > 0 && s.ready == s.total && s.unhealthy.is_empty() {
+                if s.total > 0
+                    && s.ready == s.total
+                    && s.unhealthy.is_empty()
+                    && !s.delivery.degraded
+                {
                     ui.success(&format!("healthy ({}/{} pods ready)", s.ready, s.total));
                 } else if s.total == 0 {
                     ui.warn("no pods running");
@@ -668,6 +690,35 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
     }
 }
 
+
+pub(crate) enum MailVerdict {
+    Fine,
+    Unknown,
+    Unhealthy,
+}
+
+pub(crate) fn mail_verdict(report: &crate::mail_channel::Report) -> MailVerdict {
+    if !report.known() {
+        MailVerdict::Unknown
+    } else if !report.healthy() {
+        MailVerdict::Unhealthy
+    } else {
+        MailVerdict::Fine
+    }
+}
+
+const VALUES_READ_FOR_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+pub(crate) fn mail_probe_is_gated_off(computed: Option<&serde_json::Value>) -> bool {
+    computed.is_some_and(|values| {
+        !crate::doctor::helm_truthy(
+            values
+                .get("mailAdapter")
+                .and_then(|value| value.get("deploy")),
+        )
+    })
+}
+
 pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     if opts.dry_run {
         // A dry run makes no cluster call, so the release's fullname cannot be
@@ -675,17 +726,37 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         // `dry_run_fullname` computes it and emits the caveat that says so.
         let fullname = dry_run_fullname(&opts.release);
         return Ok(ClusterStatusOutput::DryRun(crate::ui::DryRunPlan {
-            lines: status_commands(&opts, &fullname)
-                .iter()
-                .map(|cmd| cmd.display())
+            lines: std::iter::once(convergence::DRY_RUN_NOTE.to_owned())
+                .chain(
+                    status_commands(&opts, &fullname)
+                        .iter()
+                        .map(OpsCommand::display),
+                )
                 .collect(),
         }));
     }
     require_on_path("helm")?;
     require_on_path("kubectl")?;
 
-    // (a) Helm release state -> a bright header line.
-    let (helm_ok, helm_out, helm_err) = run_capture(&helm_status_cmd(&opts)).await?;
+    let helm_status = helm_status_cmd(&opts);
+    let pods = pods_cmd(&opts);
+    let (helm, pods_read, observed, fullname, host, computed, worker_claim_probe) = tokio::join!(
+        run_capture(&helm_status),
+        run_capture(&pods),
+        convergence::observe(&opts),
+        release_fullname(&opts.namespace, &opts.release),
+        discover_host(),
+        tokio::time::timeout(
+            VALUES_READ_FOR_GATE_TIMEOUT,
+            fetch_release_computed_values(&opts),
+        ),
+        crate::worker_claims::select_cluster(&opts.namespace, &opts.release),
+    );
+    let computed = computed.unwrap_or_else(|_| {
+        Err(crate::exit::CliError::failure("timed out reading computed Helm values").into())
+    });
+
+    let (helm_ok, helm_out, helm_err) = helm?;
     let field = |name: &str, default: &str| -> String {
         helm_out
             .lines()
@@ -707,9 +778,9 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         )
     });
 
-    // (b) Pod health.
-    let (ok, out, _) = run_capture(&pods_cmd(&opts)).await?;
-    let (pods, ready, total, unhealthy) = if ok {
+    let (ok, out, _) = pods_read?;
+    let mut warnings: Vec<String> = Vec::new();
+    let (mut pods, ready, total, mut unhealthy) = if ok {
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&out)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
@@ -719,19 +790,89 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         (Vec::new(), 0, 0, Vec::new())
     };
 
-    // (c) URL discovery. Resolve the release's rendered fullname once, here on
-    // the live branch -- `--dry-run` returned above without touching kubectl.
-    // The host lookup does not depend on the fullname, so the two run
-    // concurrently rather than paying for each other's round-trip; the service
-    // reads below need both and fan out after.
-    let (fullname, host) = tokio::join!(
-        release_fullname(&opts.namespace, &opts.release),
-        discover_host(),
+    if !mail_probe_is_gated_off(computed.as_ref().ok().and_then(Option::as_ref)) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&out) {
+            if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
+                for report in
+                    crate::mail_channel::observe_pods(&opts.namespace, &opts.release, items).await
+                {
+                    match mail_verdict(&report) {
+                        MailVerdict::Unknown => {
+                            warnings.push(format!("{}: {}", report.pod, report.detail));
+                        }
+                        MailVerdict::Unhealthy => {
+                            unhealthy.push(format!("{}: {}", report.pod, report.detail));
+                        }
+                        MailVerdict::Fine => {}
+                    }
+                    if let Some(row) = pods.iter_mut().find(|row| row.name == report.pod) {
+                        row.status = format!("{}; {}", row.status, report.detail);
+                        row.mail_channel = Some(report);
+                    }
+                }
+            }
+        }
+    }
+
+    match observed {
+        Ok(observation) => unhealthy.extend(observation.issues),
+        Err(error) => unhealthy.push(format!("convergence could not be verified: {error}")),
+    }
+    if !ok {
+        unhealthy.push("could not list release pods".to_string());
+    }
+
+    let (ui_url, langfuse_url, worker_claims, delivery) = tokio::join!(
+        resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
+        resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false),
+        worker_claim_probe.observe(),
+        async {
+            match serde_json::from_str::<serde_json::Value>(&out) {
+                Ok(value) => {
+                    let items = value
+                        .get("items")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    crate::completion_outbox::observe_pods(&opts.namespace, &opts.release, &items)
+                        .await
+                }
+                Err(_) => None,
+            }
+        },
     );
-    let urls = vec![
-        resolve_service_url(&opts, &fullname, "ui", "UI", &host, true).await,
-        resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false).await,
-    ];
+    let urls = vec![ui_url, langfuse_url];
+
+    match &worker_claims.state {
+        crate::worker_claims::ClaimsState::ClaimsEnabled => {
+            if let Some(row) = worker_claims
+                .worker_pod
+                .as_deref()
+                .and_then(|pod| pods.iter_mut().find(|row| row.name == pod))
+            {
+                row.status.push_str("; claims enabled");
+            }
+        }
+        crate::worker_claims::ClaimsState::Quiescing { .. }
+        | crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => {
+            unhealthy.push(worker_claims.state.status_diagnosis());
+        }
+        crate::worker_claims::ClaimsState::Unknown => {
+            warnings.push(worker_claims.state.status_diagnosis());
+        }
+    }
+
+    let delivery = match delivery {
+        Some(report) => {
+            if report.known() && report.degraded {
+                unhealthy.push(report.detail.clone());
+            } else if !report.known() {
+                warnings.push(report.detail.clone());
+            }
+            report
+        }
+        None => crate::completion_outbox::Report::unknown(),
+    };
 
     let chart_version = helm_ok.then(|| field("CHART:", "").trim().to_string());
     let upgrade = super::upgrade::load_upgrade_status(
@@ -741,7 +882,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     )
     .await;
 
-    Ok(ClusterStatusOutput::Status(Box::new(ClusterStatus {
+    let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
         release_state,
@@ -751,10 +892,26 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         ready,
         total,
         unhealthy,
+        warnings,
         pods_listed: ok,
         urls,
+        delivery,
         upgrade,
-    })))
+    }));
+    let json = crate::ui::CliOutput::to_json(&output);
+    if json["healthy"] != true {
+        return Err(crate::ui::ui().failed_report(
+            &output,
+            crate::exit::CliError::failure(format!(
+                "target release has not converged: {}",
+                json["pods"]["unhealthy"].as_array().map(|reasons| reasons.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default()
+            ))
+                .with_fix("inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`")
+                .into(),
+        ));
+    }
+    Ok(output)
+
 }
 
 /// Output of `cluster down`: the dry-run plan, an operator abort, or the removed
@@ -892,7 +1049,20 @@ pub struct HelmRevision {
     pub revision: u32,
     pub status: String,
     pub chart: String,
+    pub app_version: String,
     pub description: String,
+}
+
+impl HelmRevision {
+    /// Application version this Helm revision installed: `app_version` when
+    /// helm supplied it, otherwise the trailing version on `chart`.
+    pub fn application_version(&self) -> Option<String> {
+        let app = self.app_version.trim();
+        if !app.is_empty() {
+            return Some(crate::schema_window::normalize_app_version(app));
+        }
+        crate::schema_window::version_from_chart(&self.chart)
+    }
 }
 
 /// The revision statuses it is safe to roll back TO. Everything else
@@ -901,7 +1071,7 @@ pub struct HelmRevision {
 /// rolling back to it re-applies a manifest that was never known good.
 const ROLLBACK_ELIGIBLE_STATUSES: [&str; 2] = ["deployed", "superseded"];
 
-fn is_eligible_rollback_status(status: &str) -> bool {
+pub(crate) fn is_eligible_rollback_status(status: &str) -> bool {
     ROLLBACK_ELIGIBLE_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
 }
 
@@ -1139,6 +1309,7 @@ pub fn parse_helm_history(json: &str) -> Result<Vec<HelmRevision>> {
             revision,
             status,
             chart: field("chart"),
+            app_version: field("app_version"),
             description: field("description"),
         });
     }
@@ -1174,6 +1345,27 @@ pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
             plain("json"),
             plain("--max"),
             plain("256"),
+        ],
+    )
+}
+
+/// Read the live Alembic revision from the running API pod before Helm mutates.
+pub fn live_schema_revision_cmd(o: &CommonOpts) -> OpsCommand {
+    let deploy = chart_fullname(&o.release).resource("api");
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("exec"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain(format!("deploy/{deploy}")),
+            plain("-c"),
+            plain("api"),
+            plain("--"),
+            plain("alembic"),
+            plain("-c"),
+            plain("alembic.ini"),
+            plain("current"),
         ],
     )
 }
@@ -1357,6 +1549,60 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         None => select_rollback_revision(&history)?.require_eligible()?,
     };
 
+    if !opts.disable_schema_gate {
+        require_on_path("kubectl")?;
+        let target_row = history
+            .iter()
+            .find(|row| row.revision == choice.to_revision);
+        let target_app = target_row.and_then(HelmRevision::application_version);
+        let history_apps: Vec<String> = history
+            .iter()
+            .filter_map(HelmRevision::application_version)
+            .collect();
+        let probe = live_schema_revision_cmd(&opts.common);
+        ui.plumbing(&format!("+ {}", probe.display()));
+        let (ok, probe_out, probe_err) = run_capture(&probe).await?;
+        if !ok {
+            let detail = crate::schema_window::redact_probe_text(
+                probe_err
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("kubectl exec exited nonzero with no message"),
+            );
+            return Err(crate::exit::CliError::failure(format!(
+                "refusing rollback: could not read the live database revision from the API pod: {detail}"
+            ))
+            .with_fix(format!(
+                "confirm the API is running with `curie cluster status --release {} --namespace {}` and retry",
+                opts.common.release, opts.common.namespace
+            ))
+            .into());
+        }
+        let live =
+            crate::schema_window::parse_alembic_current_output(&probe_out).ok_or_else(|| {
+                crate::exit::CliError::failure(
+                    "refusing rollback: the API pod did not report a live database revision",
+                )
+                .with_fix("confirm the API is running with `curie cluster status` and retry")
+            })?;
+        let Some(target_app) = target_app else {
+            return Err(crate::exit::CliError::failure(format!(
+                "refusing rollback to Helm revision {}: no application version on that revision",
+                choice.to_revision
+            ))
+            .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
+            .into());
+        };
+        if let Err(refusal) =
+            crate::schema_window::check_target_schema(&target_app, &live, &history_apps)
+        {
+            return Err(crate::exit::CliError::failure(refusal.message)
+                .with_fix(refusal.fix)
+                .into());
+        }
+    }
+
     // Disclosed BEFORE the prompt, and on stderr like `cluster down` does it:
     // the operator confirms knowing both the target and what was passed over,
     // which is the difference this verb exists to make. It cannot go through
@@ -1445,6 +1691,7 @@ pub struct PodRow {
     pub name: String,
     pub ready: String,
     pub status: String,
+    pub mail_channel: Option<crate::mail_channel::Report>,
 }
 
 impl PodRow {
@@ -1514,7 +1761,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
         let display_status = if terminating {
             "Terminating"
         } else if !reason.is_empty() {
-            reason
+            convergence::reason(reason)
         } else {
             phase
         };
@@ -1522,6 +1769,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
             name: name.clone(),
             ready: ready_col,
             status: display_status.to_string(),
+            mail_channel: None,
         });
         if phase == "Succeeded" || reason == "Completed" || terminating {
             continue;
@@ -2235,7 +2483,7 @@ pub enum SlackApiBase {
 /// `nameOverride`/`fullnameOverride` move it again. Guessing the name is the
 /// defect `release_secret_name` already avoids by selecting on labels, and this
 /// selects the same way for the same reason.
-fn worker_deployment_selector(release: &str) -> String {
+pub fn worker_deployment_selector(release: &str) -> String {
     component_selector(release, "worker")
 }
 

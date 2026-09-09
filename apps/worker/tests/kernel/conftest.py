@@ -582,6 +582,49 @@ class _ProcessEventSpy:
         return sum(1 for eid, _ in self.calls if eid == event_id)
 
 
+def _failing_process_event(h: Any) -> list[str]:
+    """Replace ``process_event`` with a raiser; returns the attempt log.
+
+    The incident's shape exactly: the handler raised, the consumer logged and
+    left the entry pending. Each appended id is one delivery that reached the
+    kernel, which is what "the retry actually happened" means here.
+
+    Shared by ``test_turn_not_started.py`` and ``test_delivery_ownership.py``,
+    which both drive this same arrangement against the real ``Consumer``.
+    """
+    attempts: list[str] = []
+
+    async def failing(qevent: QueuedTurn, *, lease: Any = None) -> None:
+        attempts.append(qevent.event_id)
+        raise RuntimeError("simulated handler failure")
+
+    h.kernel.process_event = failing  # type: ignore[method-assign,assignment]
+    return attempts
+
+
+def _updates_for(h: Any, thread: str) -> list[str]:
+    """Every reply.update text delivered to ONE thread, in order.
+
+    ``sink.last_text`` and ``sink.updates`` are fleet-wide: two threads in one
+    channel share both the address and the placeholder ref, and since #2433 a
+    failed delivery edits its own placeholder with the not-started notice, so
+    the last edit the sink saw belongs to whichever thread failed most
+    recently rather than to the healthy one. A per-thread read therefore goes
+    through the neutral event log, where the target carries the conversation
+    id.
+
+    Shared by ``test_turn_not_started.py`` and ``test_consumer_dead_letter.py``,
+    which both assert on one thread's replies amid a fleet-wide sink.
+    """
+    return [
+        event.text or ""
+        for event, _route, _best in h.sink.events
+        if isinstance(event, ReplyUpdate)
+        and event.message is None
+        and event.target.conversation_id == thread
+    ]
+
+
 async def _pending_rows(h: Any) -> dict[str, int]:
     """Every pending entry id -> its current ``times_delivered``."""
     rows = await h.async_redis.xpending_range(

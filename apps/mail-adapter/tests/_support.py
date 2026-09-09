@@ -20,6 +20,7 @@ about production. See `MailState.visible` for the behavior and its sources.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
@@ -40,7 +41,10 @@ from curie_mail_adapter.egress import ADAPTER_SECRET_HEADER
 
 INBOX = "sandbox@agentmail.to"
 AGENTMAIL_API_KEY = "amk-tst"
-CHANNEL_TOKEN = "chn-tst"
+# Diagnostic claims use the real platform token shape; signature verification
+# belongs to platform ingress, not the adapter status reader.
+_CHANNEL_TOKEN_PAYLOAD = base64.urlsafe_b64encode(b'{"exp":4102444800}').decode().rstrip("=")
+CHANNEL_TOKEN = f"chn.{_CHANNEL_TOKEN_PAYLOAD}.test-signature"
 EGRESS_SECRET = "egr-tst"
 ALLOWED_SENDER = "human@example.com"
 STRANGER = "stranger@evil.example"
@@ -75,6 +79,7 @@ class MailState:
         self.messages: list[dict[str, Any]] = []  # newest last, as seeded
         self.bodies: dict[str, dict[str, Any]] = {}
         self.threads: dict[str, list[dict[str, Any]]] = {}
+        self.deleted_threads: set[str] = set()
         self.replies: list[tuple[str, str]] = []  # (in_reply_to_message_id, text)
         self.list_calls = 0
         # time.monotonic() per list call, so the retry CADENCE is observable at
@@ -101,6 +106,12 @@ class MailState:
         # adapter must never render into a log, and putting recognisable content
         # in one is the only way a test can prove it never does.
         self.injected_body: dict[str, Any] | None = None
+        # A NON-JSON failure body, as an edge proxy, gateway or load balancer
+        # serves. Distinct from `injected_body`, which is the provider's own
+        # JSON: the adapter's terminal-vs-retryable split on a 404 turns on
+        # exactly that difference, so a test cannot prove it without being able
+        # to serve a body the provider would never have written.
+        self.injected_raw_body: str | None = None
         # N CONSECUTIVE transport failures on List Messages before answering
         # normally, mirroring `IngressState.drop_next`. `fail_next_list` is
         # one-shot and so cannot express a repeated outage, which is the whole
@@ -265,6 +276,15 @@ class _JsonHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_raw(self, status: int, text: str) -> None:
+        """Answer with a body that is not JSON, the way an edge 404 page is."""
+        body = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 class MailHandler(_JsonHandler):
     @property
@@ -285,6 +305,10 @@ class MailHandler(_JsonHandler):
             return False
         if failure == 0:
             self.close_connection = True  # a real transport failure
+            return True
+        raw = self.state.injected_raw_body
+        if raw is not None:
+            self._send_raw(failure, raw)
             return True
         body = self.state.injected_body
         self._send(failure, body if body is not None else {"detail": "injected provider failure"})
@@ -328,6 +352,8 @@ class MailHandler(_JsonHandler):
             failure, state.fail_next_thread = state.fail_next_thread, None
             if self._injected(failure):
                 return
+            if parts[4] in state.deleted_threads:
+                return self._send(404, {"detail": "no such thread"})
             return self._send(200, {"messages": state.threads.get(parts[4], [])})
         self._send(404, {"detail": "not found"})
 

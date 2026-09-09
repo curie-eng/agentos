@@ -119,9 +119,12 @@ or shipped. `POST /channels/token` mints a scoped credential for a binding row;
 `POST /channels/turns` accepts the matching authenticated delivery and derives
 the reply route from that row, not from the request. A non-Slack resolved turn
 uses `HttpReplyAdapter` to deliver neutral JSON reply events to that
-server-controlled endpoint under its per-adapter credential. Slack remains the
-only supported channel adapter; the first-party CLI/no-Slack path is a useful
-composition precedent, not a supported third-party adapter.
+server-controlled endpoint under its per-adapter credential. Discord
+(`adapters/discord`) and email (`apps/mail-adapter`) are first-party adapters
+on that HTTP edge, not a third-party kit: they are platform-owned services that
+speak the shipped wire, not installable adapters with a manifest, registry, or
+conformance suite. The first-party CLI/no-Slack path is a useful composition
+precedent, not a supported third-party adapter.
 
 The deployed-adapter lifecycle remains unbuilt:
 
@@ -171,23 +174,21 @@ service is material:
   resolution sits behind the platform-wide key, and the scoped token minted for
   the sandbox is deliberately rejected everywhere but the state router. A
   scoped adapter credential for that return path remains a prerequisite of a
-  second channel adapter rather than a follow-up to one.
+  third-party adapter rather than a follow-up to the first-party HTTP-edge
+  adapters already shipped.
 - **Packaging, installation, discovery, lifecycle, and conformance remain
   unbuilt.** A binding's configured route is not an adapter registry or an
   install experience, and the generic HTTP edges do not establish a supported
-  provider or deployment contract. There is no manifest-driven way to install
-  an adapter and no conformance suite with which a third party could prove one.
-- **A real second supported adapter is still required to prove the seam.** The
-  current generic ingress and egress are deliberately neutral, but only Slack
-  is supported. Treat this document as evidence of the shipped edges and the
-  intended placement constraint, not as a claim that a third-party adapter
-  service or plugin mechanism exists.
+  third-party provider or deployment contract. There is no manifest-driven way
+  to install an adapter and no conformance suite with which a third party could
+  prove one. Discord and email on the HTTP edge do not close that gap: they are
+  first-party services, not the kit this seam is waiting for.
 
 ## Cross-links
 
 - **Related seam:** [harness-package](../harness-package/INTERFACE.md) — the only entry-point plugin mechanism in the codebase, and the model ADR-0096 generalizes from while reserving it for the narrow in-process exception.
 - **Related seam:** [connector-host](../connector-host/INTERFACE.md) — the declare-and-host split one scope down, and the hosting substrate an operator-run adapter would reuse.
-- **Related seam:** [channel-ingress](../channel-ingress/INTERFACE.md) — the graded (`C`) channel ingress/egress seam; its generic authenticated HTTP edges are shipped, while a second supported adapter is still needed to prove the swap.
+- **Related seam:** [channel-ingress](../channel-ingress/INTERFACE.md) — the graded (`C`) channel ingress/egress seam; its generic authenticated HTTP edges are shipped, and Discord and email already ride them as first-party adapters. That is not the third-party adapter kit this seam is waiting for.
 - **Related seam:** [channel-interaction](../channel-interaction/INTERFACE.md) — the neutral interaction primitives used by the reply edge; they are not a third-party adapter conformance contract.
 - **Epic(s):** #19 — per-turn reply endpoint routing, which the generic egress edge builds on; #158 — multi-tenancy, deliberately out of scope until it settles what a tenant owns
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the standing restraint that no speculative adapter layer is written ahead of a real second implementation; this is not one of the six swap-readiness Jobs, so it is not separately graded

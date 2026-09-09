@@ -11,6 +11,7 @@ use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use curie::api;
 use curie::artifacts;
+use curie::channel_token as crate_channel_token;
 use curie::commands::{
     self, AgentActionOpts, DeployEnv, DeployOpts, SendType, StartOpts, DEFAULT_PORT,
 };
@@ -1070,6 +1071,22 @@ enum DevAction {
     /// #492's forgotten-context bug, `bash scripts/check-wire-tolerance.sh`).
     /// Offline, no credential.
     WireTolerance,
+    /// Bounded synthetic restore drill for #2427: back up postgres, bundles,
+    /// mail SQLite, and Valkey from a disposable compose install, restore onto
+    /// a distinct target, and refuse an omitted or corrupt component
+    /// (`bash cli/scripts/restore-drill.sh`). Not a production backup product
+    /// and not an RPO/RTO claim.
+    RestoreDrill {
+        /// Validate an existing backup directory without starting a stack.
+        #[arg(long)]
+        check_backup: Option<PathBuf>,
+        /// JSON object of separately supplied key names. Required with --check-backup.
+        #[arg(long)]
+        supplied_config: Option<PathBuf>,
+        /// Omit this required component and expect the completeness guard to refuse.
+        #[arg(long)]
+        negative: Option<String>,
+    },
     /// Set the release version across cli/Cargo.toml + Chart.yaml
     /// version/appVersion (and refresh the CLI lockfile) so a release cut can't
     /// leave the three out of sync. Does not commit or tag.
@@ -2638,6 +2655,34 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Mint or inspect the mail adapter's channel token
+    /// (`POST /channels/token`).
+    ///
+    /// Writes the Secret the adapter actually reads (chart Secret or
+    /// `mailAdapter.channelTokenExistingSecret`), rolls the adapter, prints
+    /// `exp`, and never prints the token. `--show-exp` is read-only.
+    ChannelToken {
+        /// Agent name or id that owns the binding.
+        agent: String,
+        /// Channel kind to mint for (e.g. email). Required unless --show-exp.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Channel address to mint for (e.g. the inbox). Required unless --show-exp.
+        #[arg(long)]
+        address: Option<String>,
+        /// Token lifetime: 7d, 24h, 60m, or seconds. Default 7d; at most 7 days.
+        #[arg(long, default_value = crate_channel_token::DEFAULT_TTL)]
+        ttl: String,
+        /// Print the installed token's exp and whether the platform still
+        /// accepts it. Read-only: no mint, no write.
+        #[arg(long)]
+        show_exp: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Set an agent's budget via the platform API (`PUT /agents/{id}/budget`).
     Budget {
         /// Agent name or id.
@@ -3025,6 +3070,27 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::WireTolerance => {
                 commands::dev_script("scripts/check-wire-tolerance.sh", &[]).await
+            }
+            DevAction::RestoreDrill {
+                check_backup,
+                supplied_config,
+                negative,
+            } => {
+                let mut args = Vec::new();
+                if let Some(path) = check_backup {
+                    args.push("--check-backup".to_string());
+                    args.push(path.display().to_string());
+                }
+                if let Some(path) = supplied_config {
+                    args.push("--supplied-config".to_string());
+                    args.push(path.display().to_string());
+                }
+                if let Some(component) = negative {
+                    args.push("--negative".to_string());
+                    args.push(component);
+                }
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/restore-drill.sh", &arg_refs).await
             }
             DevAction::BumpVersion { version, dry_run } => {
                 commands::bump_version(&version, dry_run).await
@@ -3703,6 +3769,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(
                     ops::up(
                         UpOpts {
+                            retained_mail_values: None,
                             common: CommonOpts {
                                 namespace,
                                 release,
@@ -3775,6 +3842,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     revision,
                     allow_failed_revision,
                     yes,
+                    disable_schema_gate: false,
                 })
                 .await?,
             ),
@@ -4603,6 +4671,36 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
+            ClusterAction::ChannelToken {
+                agent,
+                kind,
+                address,
+                ttl,
+                show_exp,
+                conn,
+                dry_run,
+            } => {
+                let namespace = conn.namespace.clone();
+                let release = conn.release.clone();
+                let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    crate_channel_token::channel_token(crate_channel_token::ChannelTokenOpts {
+                        common: CommonOpts {
+                            namespace,
+                            release,
+                            dry_run,
+                        },
+                        api_url,
+                        api_key,
+                        agent,
+                        kind,
+                        address,
+                        ttl,
+                        show_exp,
+                    })
+                    .await?,
+                )
+            }
             ClusterAction::Budget {
                 agent,
                 limit,
@@ -4898,15 +4996,33 @@ async fn run(command: Option<Command>) -> Result<()> {
             // Discover independently. `zip` required both flags, so a bare
             // `curie doctor` never reached the platform API (#1367). Errors
             // are discarded inside `doctor`: gather is failure-tolerant.
-            emit(
-                curie::doctor::doctor(
-                    &target.namespace,
-                    &target.release,
-                    api_url.as_deref(),
-                    api_key.as_deref(),
-                )
-                .await,
+            let out = curie::doctor::doctor(
+                &target.namespace,
+                &target.release,
+                api_url.as_deref(),
+                api_key.as_deref(),
             )
+            .await;
+            if out.release_not_serving() {
+                let release = out
+                    .checks
+                    .iter()
+                    .find(|check| check.id == "release")
+                    .expect("release_not_serving requires a release check");
+                let fix = release.fix.clone().unwrap_or_else(|| {
+                    format!(
+                        "curie cluster status --namespace {} --release {}",
+                        target.namespace, target.release
+                    )
+                });
+                return Err(ui::ui().failed_report(
+                    &out,
+                    curie::exit::CliError::failure(release.detail.clone())
+                        .with_fix(fix)
+                        .into(),
+                ));
+            }
+            emit(out)
         }
         Some(Command::Diff { file, chart }) => {
             let cfg = curie::installation::Installation::load(&file)?;
@@ -5561,6 +5677,40 @@ mod tests {
             cli.command,
             Some(Command::Dev {
                 action: DevAction::ChartRuntimeE2e { force: true }
+            })
+        ));
+        let cli = Cli::try_parse_from(["curie", "dev", "restore-drill"])
+            .expect("dev restore-drill should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::RestoreDrill {
+                    check_backup: None,
+                    supplied_config: None,
+                    negative: None,
+                }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "restore-drill",
+            "--check-backup",
+            "/tmp/backup",
+            "--supplied-config",
+            "/tmp/supplied.json",
+            "--negative",
+            "bundles",
+        ])
+        .expect("dev restore-drill flags should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::RestoreDrill {
+                    check_backup: Some(_),
+                    supplied_config: Some(_),
+                    negative: Some(_),
+                }
             })
         ));
     }

@@ -1,23 +1,41 @@
+import { lazy, Suspense } from "react";
 import { C } from "./tokens";
 import { useStore } from "./state/store";
 import { Sidebar } from "./components/Sidebar";
 import { Topbar, DevBanner } from "./components/Topbar";
 import { ModalHost } from "./components/ModalHost";
 import { Confetti } from "./components/Confetti";
-import { Toast } from "./primitives";
-
-import { Observability } from "./views/Observability";
+import { Notice, Toast } from "./primitives";
 
 import { WiredOverview } from "./views/wired/WiredOverview";
-import { WiredAgents } from "./views/wired/WiredAgents";
-import { WiredAgentDetail } from "./views/wired/WiredAgentDetail";
-import { WiredConnections, WiredSettings } from "./views/wired/WiredStubs";
-import { WiredEvals } from "./views/wired/WiredEvals";
-import { WiredVersions } from "./views/wired/WiredVersions";
+
+const Observability = lazy(() =>
+  import("./views/Observability").then((m) => ({ default: m.Observability })),
+);
+const WiredAgents = lazy(() =>
+  import("./views/wired/WiredAgents").then((m) => ({ default: m.WiredAgents })),
+);
+const WiredAgentDetail = lazy(() =>
+  import("./views/wired/WiredAgentDetail").then((m) => ({ default: m.WiredAgentDetail })),
+);
+const WiredConnections = lazy(() =>
+  import("./views/wired/WiredStubs").then((m) => ({ default: m.WiredConnections })),
+);
+const WiredSettings = lazy(() =>
+  import("./views/wired/WiredStubs").then((m) => ({ default: m.WiredSettings })),
+);
+const WiredEvals = lazy(() =>
+  import("./views/wired/WiredEvals").then((m) => ({ default: m.WiredEvals })),
+);
+const WiredVersions = lazy(() =>
+  import("./views/wired/WiredVersions").then((m) => ({ default: m.WiredVersions })),
+);
 
 // The console is always backed by the live API. Each nav renders its
 // backend-driven view; views that are not wired yet render an honest
-// "Coming Soon" stub rather than demo data.
+// "Coming Soon" stub rather than demo data. Overview stays eager so the
+// landing path does not wait on a view chunk; every other view is a
+// separate async chunk behind the single Suspense boundary below.
 function Main() {
   const { state } = useStore();
   if (state.agentDetail) return <WiredAgentDetail />;
@@ -51,7 +69,9 @@ export function App() {
           <Topbar />
           {envDev ? <DevBanner /> : null}
           <div style={{ flex: 1, padding: "28px 36px", maxWidth: 1280, width: "100%", margin: "0 auto" }}>
-            <Main />
+            <Suspense fallback={<Notice>Loading…</Notice>}>
+              <Main />
+            </Suspense>
           </div>
         </div>
       </div>

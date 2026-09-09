@@ -193,9 +193,34 @@ class SubstrateConfig:
     # mid-claim and lets a second worker open a concurrent turn. Overridable via
     # CURIE_CLAIM_TIMEOUT_SECONDS; keep any override under the lock TTL too.
     claim_timeout_seconds: float = 90.0
+    # The INITIAL bind/serviceFQDN poll interval, not the only one. A fixed 50ms
+    # tick is cheap for a warm-pool bind that lands in a few hundred
+    # milliseconds, and expensive for a cold boot that does not: an ~11s cold
+    # create issues roughly 200 apiserver GETs per claim on Kubernetes, and on
+    # the Docker substrate every tick is two docker forks plus a healthz call.
+    # The interval therefore backs off after the fast window below.
     poll_interval_seconds: float = 0.05
+    # Cap on any single sleep, so a claim that binds late is still noticed
+    # promptly and the loop's overshoot past claim_timeout_seconds stays bounded
+    # by one cap rather than growing with the backoff.
+    poll_interval_max_seconds: float = 0.5
+    # How many sleeps stay at poll_interval_seconds before backoff starts. Six
+    # keeps every poll in the first 300ms byte-identical to the old fixed loop,
+    # so a warm-pool claim that binds within 250ms today still binds on the same
+    # poll: the request-volume win is taken entirely out of the cold-boot tail.
+    poll_fast_polls: int = 6
+    # Growth factor once the fast window is spent. Doubling reaches the cap in
+    # four steps, so the tail costs tens of calls instead of hundreds.
+    poll_backoff_factor: float = 2.0
     key_prefix: str = "curie:sandbox"
     claim_prefix: str = "curie-thread"
+    # How long ``release(..., wait_gone=True)`` waits for the deleted claim AND
+    # its sandbox/pod to disappear. Kubernetes delete of a SandboxClaim returns
+    # while the object (and its pod) still exist; ResourceQuota charges the pod,
+    # so a claim-only wait is not enough (#2259). Operator reset-thread keeps
+    # the default False and is still bounded by the kernel's 5s release cap;
+    # the eval plane waits because a following cluster message has only 45s.
+    release_gone_timeout_seconds: float = 30.0
 
     def claim_name_for(self, thread_key: str, nonce: str) -> str:
         """A DNS-safe, per-generation claim name for a thread.

@@ -116,14 +116,20 @@ in code now:
   to raise to). The reconciler is a backstop, not an unconditional exactly-once guarantee: a
   worker retry loop can keep a turn live past the grace after an inline mark failure, for
   which a worker-side in-flight lease is the named follow-up.
-- **The permission gate (landed, #245).** Per-agent config
+- **The permission gate (landed, #245, #1852).** Per-agent config
   (`agents.approval_required_tools`, forwarded as `CURIE_APPROVAL_REQUIRED_TOOLS` by the
-  worker binding) marks tools approval-required; the runner intercepts those calls
-  proactively through an SDK `can_use_tool` callback (`build_can_use_tool`,
-  `runner/src/curie_runner/approval.py`) -- the call is denied before execution, and the
-  turn ends `awaiting-approval` on the same override the policy gate uses, so both trigger
-  types share one record/suspend/resume lifecycle. An agent with no configured gates keeps
-  the historical `bypassPermissions` posture verbatim (zero behavior change).
+  worker binding) marks tools approval-required. The runner intercepts those calls
+  first through an SDK `PreToolUse` hook (`build_approval_hook`,
+  `runner/src/curie_runner/approval.py::build_approval_hook`) -- the call is denied
+  before execution, and the turn ends `awaiting-approval` on the same override the
+  policy gate uses, so both trigger types share one record/suspend/resume lifecycle.
+  The SDK `can_use_tool` callback (`build_can_use_tool`,
+  `runner/src/curie_runner/approval.py::build_can_use_tool`) is the backstop for a
+  tool the hook abstains on, or if no hook is registered. The one-shot grant is
+  spent at hook decision time; a concurrent bundle `PreToolUse` matcher can still
+  veto the approved call and burn that grant (the CLI dispatches matchers on one
+  event concurrently). An agent with no configured gates keeps the historical
+  `bypassPermissions` posture verbatim (zero behavior change).
 - **The one-shot post-approval allowance (landed, #430, ADR-0035; provenance converged, #544,
   ADR-0046).** A prior gap: after an
   approval was granted and the session resumed, the resume turn re-called the gated tool
@@ -136,8 +142,9 @@ in code now:
   (`binding.approval_grant_tool`) decides grant eligibility from the **durable
   `gate_kind`/`granted_tool` columns** rather than sniffing the summary (ADR-0046 supersedes
   ADR-0035's summary-prefix discriminator): for a `gate_kind='permission'` row it injects
-  `CURIE_APPROVAL_GRANT_TOOL=<granted_tool>` (`GRANT_TOOL_ENV`, the exact tool name
-  `can_use_tool` denied, a trusted runner-authored value); for a `gate_kind='policy'` row it
+  `CURIE_APPROVAL_GRANT_TOOL=<granted_tool>` (`GRANT_TOOL_ENV`, the exact tool name a
+  runner gate layer denied or, for `publish_changes` only, the runner's own stream observer
+  recorded (#2294); a trusted runner-authored value either way); for a `gate_kind='policy'` row it
   injects the same `CURIE_APPROVAL_GRANT_TOOL` from the `granted_tool` column **when that
   column is non-null** — the runner sets it only for a manifest gate the operator opted into
   grantability via `grantableViaPolicy` (#558, ADR-0056), with the granted tool sourced from
@@ -261,6 +268,16 @@ in code now:
   decision, and the authorizer snapshot -- who resolved, how the platform authenticated
   them, and why they counted (or were refused). Rows written before ADR-0106 retain
   `principal_kind=NULL` and `authenticated=false` rather than being retroactively trusted.
+- **The declared/bound join is also checked at configuration time (landed, #2436).**
+  `check_approval_route_bindings` and its sibling helpers
+  (`apps/api/src/curie_api/deploy.py`) refuse, before a version becomes live, whenever the
+  bundle declares a route with no entry in `approval_routes`: at `POST /deployments`, at
+  both git push paths (dev deploy and prod promote), at a bundle attached to a version an
+  active deployment already references, and at an `approval_routes` write that would drop
+  a route an active deployment still declares. It deliberately checks only presence, not
+  validity, of a binding -- a binding that fails schema validation is still treated as
+  bound -- and ADR-0046's request-time escalation above is retained unchanged as the
+  backstop for that residual.
 
 ### Arming a gate: bare MCP shorthand is normalized; unresolvable names fail closed
 
@@ -531,7 +548,9 @@ dispatcher-attested `chat` token, a live subject-bound Console session, or a sig
 subject-bound `operator` token. The platform key alone resolves nothing. A
 notification transport credential likewise confers no resolution capability: the
 notification contains no interaction, and this contract exposes no second-channel resolver.
-The runtime `canUseTool` gate (#245) will block the *tool call*, but
+The runtime `PreToolUse` hook (`build_approval_hook`, #1852) is the first interceptor
+of a gated tool call, with the SDK `canUseTool` callback (`build_can_use_tool`, #245)
+as backstop, but
 the authorization decision (who may resolve a pending approval) stays on the server that
 owns the durable `Approval` record. Policy gate points ship versioned in the bundle; route
 bindings (where the verified card resolves, where a text-only notification goes, and who may

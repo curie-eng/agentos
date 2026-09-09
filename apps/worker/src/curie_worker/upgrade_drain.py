@@ -20,10 +20,10 @@ does not complete.
 This module closes the gap ahead of the roll rather than behind it, with the two
 outcomes the issue asks for and nothing in between:
 
-1. **Drain.** Set a fleet-wide quiesce flag so no replica takes new work, then
-   wait for every delivery that currently holds a live ownership lease to reach
-   its terminal outcome. When they all do, the upgrade proceeds and each of
-   those turns completed exactly once.
+1. **Drain.** Set an installation-scoped quiesce marker so no replica in that
+   installation takes new work, then wait for every delivery that currently
+   holds a live ownership lease to reach its terminal outcome. When they all
+   do, the upgrade proceeds and each of those turns completed exactly once.
 2. **Refuse.** If unsafe work is still in flight when the wait expires, the gate
    fails, `helm upgrade` fails with it, and NOTHING is rolled. The turn keeps
    running on the workers that are already there.
@@ -44,8 +44,8 @@ liveness reads for one page go out in a single pipeline. ``markers.py`` states
 the rule this follows: the maintenance path must not ``SCAN`` a production
 Valkey, and this runs against exactly the release an operator is upgrading.
 
-**A refusal must not wedge the fleet.** The quiesce flag is always written with
-a TTL, and :func:`main` clears it explicitly when the drain is refused. A
+**A refusal must not wedge the fleet.** The quiesce marker is always written
+with a TTL, and :func:`main` clears it explicitly when the drain is refused. A
 postponed upgrade leaves the cluster exactly as it found it -- still serving,
 still claiming -- which is what makes "refuse" an acceptable normal-path answer
 rather than an outage.
@@ -55,10 +55,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Literal, TypedDict
 
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
@@ -77,6 +80,76 @@ _PEL_SCAN_PAGE = 256
 # operator reading a refusal needs to know WHICH lane is still busy, and a bare
 # entry id is ambiguous across the runs and eval groups.
 _DELIVERY_SEP = "/"
+
+# One atomic write owns every marker applicable to this hook invocation. KEYS
+# contains the installation scoped key first and, only during the first mixed
+# version upgrade, the legacy key second. ARGV is revision, candidate JSON, and
+# TTL milliseconds. A same revision retry refreshes the TTL while retaining the
+# first marker byte for byte, including its original ``since`` value. A lower
+# numeric revision changes nothing.
+_WRITE_OWNED_MARKER_LUA = """
+local function marker_revision(raw)
+  local ok, marker = pcall(cjson.decode, raw)
+  if not ok or type(marker) ~= 'table' then return nil end
+  local revision = marker['revision']
+  if type(revision) ~= 'number' then return nil end
+  if revision < 0 or revision ~= math.floor(revision) then return nil end
+  return revision
+end
+
+local requested = tonumber(ARGV[1])
+local marker = ARGV[2]
+local retained = nil
+
+for _, key in ipairs(KEYS) do
+  local raw = redis.call('GET', key)
+  if raw then
+    local current = marker_revision(raw)
+    if current and current > requested then return 0 end
+    if current and current == requested and not retained then retained = raw end
+  end
+end
+
+if retained then marker = retained end
+for _, key in ipairs(KEYS) do
+  redis.call('SET', key, marker, 'PX', tonumber(ARGV[3]))
+end
+return 1
+"""
+
+# Compare every applicable key before deleting any of them. A delayed release
+# must never clear one half of a newer mixed version marker. The bare ``1`` is
+# recognized only as the unversioned standalone predecessor (revision zero), so
+# a local release can still recover a marker written by the previous version.
+_CLEAR_OWNED_MARKER_LUA = """
+local function marker_revision(raw, requested)
+  if raw == '1' and requested == 0 then return 0 end
+  local ok, marker = pcall(cjson.decode, raw)
+  if not ok or type(marker) ~= 'table' then return nil end
+  local revision = marker['revision']
+  if type(revision) ~= 'number' then return nil end
+  if revision < 0 or revision ~= math.floor(revision) then return nil end
+  return revision
+end
+
+local requested = tonumber(ARGV[1])
+for _, key in ipairs(KEYS) do
+  local raw = redis.call('GET', key)
+  if raw then
+    local current = marker_revision(raw, requested)
+    if current == nil or current ~= requested then return 0 end
+  end
+end
+return redis.call('DEL', unpack(KEYS))
+"""
+
+
+class ClaimStatus(TypedDict):
+    """Safe status shape emitted to the operator-side observer."""
+
+    state: Literal["claims_enabled", "quiescing", "unknown"]
+    since: str | None
+    revision: int | None
 
 
 @dataclass(frozen=True)
@@ -108,6 +181,20 @@ class UpgradeDrainGate:
 
     # -- the quiesce flag -----------------------------------------------------
 
+    def _revision(self) -> int:
+        # Ordinary worker processes do not receive a hook revision. Revision
+        # zero is reserved for explicit standalone legacy mode and can never
+        # supersede a positive Helm revision.
+        return self._config.upgrade_revision or 0
+
+    def _marker_keys(self) -> tuple[str, ...]:
+        authoritative = self._config.upgrade_quiesce_key()
+        if self._config.installation_id and self._config.upgrade_legacy_quiesce:
+            # Scoped first so a same revision retry repairs a legacy key that an
+            # old hook rewrote while retaining the authoritative marker's time.
+            return (authoritative, self._config.upgrade_legacy_quiesce_key())
+        return (authoritative,)
+
     async def request_quiesce(self, *, ttl_s: float | None = None) -> None:
         """Ask every replica to stop taking new work.
 
@@ -116,17 +203,77 @@ class UpgradeDrainGate:
         stopped answering and looks perfectly healthy while doing it.
         """
         ttl = self._config.upgrade_quiesce_ttl_s if ttl_s is None else ttl_s
-        await self._redis.set(
-            self._config.upgrade_quiesce_key(), "1", ex=max(1, int(ttl))
+        revision = self._revision()
+        marker = json.dumps(
+            {
+                "since": datetime.now(UTC).isoformat(),
+                "revision": revision,
+            },
+            separators=(",", ":"),
+        )
+        keys = self._marker_keys()
+        await self._redis.eval(
+            _WRITE_OWNED_MARKER_LUA,
+            len(keys),
+            *keys,
+            str(revision),
+            marker,
+            max(1, int(ttl * 1000)),
         )
 
     async def clear_quiesce(self) -> None:
-        """Let the fleet claim again. Idempotent."""
-        await self._redis.delete(self._config.upgrade_quiesce_key())
+        """Clear only markers owned by this revision. Idempotent."""
+
+        keys = self._marker_keys()
+        await self._redis.eval(
+            _CLEAR_OWNED_MARKER_LUA,
+            len(keys),
+            *keys,
+            str(self._revision()),
+        )
 
     async def is_quiescing(self) -> bool:
         """Is a drain in progress? The read every consumer makes before a claim."""
         return bool(await self._redis.exists(self._config.upgrade_quiesce_key()))
+
+    async def claim_status(self) -> ClaimStatus:
+        """Read the safe claim state without exposing marker identity or bytes."""
+
+        try:
+            raw = await self._redis.get(self._config.upgrade_quiesce_key())
+        except Exception:
+            # Status is diagnostic. An unreadable authority is unknown, never
+            # permission to claim and never an exception containing a key or
+            # credential copied onto stdout.
+            logger.warning("worker claim state is unknown: marker read failed")
+            return {"state": "unknown", "since": None, "revision": None}
+        if raw is None:
+            return {"state": "claims_enabled", "since": None, "revision": None}
+        try:
+            marker = json.loads(raw)
+            if not isinstance(marker, dict):
+                raise ValueError("marker is not an object")
+            since = marker.get("since")
+            revision = marker.get("revision")
+            if not isinstance(since, str):
+                raise ValueError("marker since is not a string")
+            parsed_since = datetime.fromisoformat(since)
+            if (
+                parsed_since.tzinfo is None
+                or parsed_since.utcoffset() != timedelta(0)
+            ):
+                raise ValueError("marker since is not UTC")
+            if (
+                not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 0
+            ):
+                raise ValueError("marker revision is not an integer")
+        except (OverflowError, TypeError, ValueError):
+            # Existence is pause authority. Bad metadata is intentionally not
+            # echoed because its contents are untrusted diagnostic input.
+            return {"state": "quiescing", "since": None, "revision": None}
+        return {"state": "quiescing", "since": since, "revision": revision}
 
     # -- what is still in flight ----------------------------------------------
 
@@ -245,13 +392,15 @@ class UpgradeDrainGate:
 
 
 def _client(config: WorkerConfig) -> Redis:
-    return Redis(
-        host=config.valkey_host,
-        port=config.valkey_port,
-        password=config.valkey_password or None,
-        db=config.valkey_db,
-        decode_responses=True,
-    )
+    return Redis(**config.valkey_client_kwargs())
+
+
+async def _read_claim_status(config: WorkerConfig) -> ClaimStatus:
+    redis = _client(config)
+    try:
+        return await UpgradeDrainGate(redis, config).claim_status()
+    finally:
+        await redis.aclose()
 
 
 async def run_gate(config: WorkerConfig, *, mode: str) -> int:
@@ -265,7 +414,10 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
     try:
         if mode == "release":
             await UpgradeDrainGate(redis, config).clear_quiesce()
-            logger.info("upgrade quiesce cleared; the fleet is claiming again")
+            logger.info(
+                "upgrade quiesce release processing completed; run with --mode status "
+                "to confirm the current claim state"
+            )
             return 0
         gate = UpgradeDrainGate(redis, config)
         outcome = await gate.await_drained()
@@ -294,6 +446,15 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
         await redis.aclose()
 
 
+def _observed_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="curie-worker-upgrade-drain",
@@ -301,13 +462,53 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("drain", "release"),
+        choices=("drain", "release", "status"),
         default="drain",
-        help="drain: pre-upgrade gate. release: post-upgrade quiesce clear.",
+        help=(
+            "drain: pre-upgrade gate. release: post-upgrade quiesce clear. "
+            "status: read worker claim state."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="write the status result as exactly one JSON object",
+    )
+    parser.add_argument(
+        "--installation-id-observed",
+        type=_observed_arg,
+        default=True,
+        metavar="true|false",
+        help="whether Helm observed the live installation identity",
     )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    return asyncio.run(run_gate(WorkerConfig(), mode=args.mode))
+    if args.mode != "status" and not args.installation_id_observed:
+        # This render-time bit is hook-only. Refuse before WorkerConfig builds a
+        # Redis client, so an unobserved upgrade cannot mutate either marker or
+        # pretend a failed lookup was an installation identity.
+        logger.error(
+            "refusing %s: installation ID was not observed during the upgrade "
+            "render; no Valkey client was created and no marker was mutated",
+            args.mode,
+        )
+        return 1
+
+    config = WorkerConfig()
+    if args.mode == "status":
+        status = asyncio.run(_read_claim_status(config))
+        if args.json:
+            sys.stdout.write(json.dumps(status, separators=(",", ":")) + "\n")
+        elif status["state"] == "quiescing" and status["revision"] is not None:
+            logger.info(
+                "worker claims are quiescing since %s for upgrade revision %d",
+                status["since"],
+                status["revision"],
+            )
+        else:
+            logger.info("worker claim state: %s", status["state"])
+        return 0
+    return asyncio.run(run_gate(config, mode=args.mode))
 
 
 if __name__ == "__main__":  # pragma: no cover - process entry point

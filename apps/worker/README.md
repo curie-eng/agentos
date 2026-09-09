@@ -121,7 +121,10 @@ Runtime rules (each has a provoking integration test in `tests/eval/test_stream.
 - **XACK only after the report POST attempt completes** (success, or terminally failed
   after bounded retries and logged). A worker crash before that leaves the entry
   pending. The shared runs/eval liveness path promptly transfers a capable dead
-  consumer's PEL after two lease-absence observations; unknown older consumers
+  consumer's PEL after two lease-absence observations. A live consumer's own
+  stranded row (delivery state present, delivery lease expired) is separately
+  recovered by the lease-expiry pass after about one lease TTL. Unknown older
+  consumers, or an entry with no delivery state at all,
   retain the 15-minute `XAUTOCLAIM` fallback. A restarted generation first
   recovers rows under its own stable consumer name. The entry is re-run, so
   delivery is **at-least-once** with a best-effort
@@ -152,9 +155,11 @@ the Slack thread by editing the placeholder in place, and gets every failure
 mode right.
 
 ```
-XREADGROUP curie:runs        Consumer (consumer group; XAUTOCLAIM reclaims a
-   -> QueuedTurn                  dead consumer's pending entries after an idle
-   -> Kernel.process_event        timeout, then reprocesses them idempotently)
+XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
+   -> QueuedTurn                  reclaimed by proof of death, by lease expiry,
+   -> Kernel.process_event        or as a compatibility backstop by XAUTOCLAIM
+                                  after an idle timeout, then reprocessed
+                                  idempotently)
         -> SlackSink     chat.update placeholder to booting text (best effort)
         -> substrate.lookup/claim/resume   (sandbox substrate)
         -> RunnerClient  POST /v1/event | /v1/steer | /v1/interrupt   (runner)
@@ -202,7 +207,11 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   A renewable worker lease distinguishes process death from ordinary consumer
   idle. After two absent observations, one replacement wins a Valkey arbitration
   lease and transfers the dead consumer's pending entries without racing other
-  replicas through the delivery budget. Unknown older consumers retain the
+  replicas through the delivery budget. A delivery whose handler raised released
+  its lease and left its entry pending under a consumer that is still alive; the
+  lease-expiry pass recovers that row after about one lease TTL
+  (`CURIE_LEASE_EXPIRED_IDLE_MS`) rather than leaving it to the backstop.
+  Unknown older consumers, and any entry with no delivery state, retain the
   15-minute `XAUTOCLAIM` fallback; a restarted generation also recovers pending
   rows left under its own stable consumer name. The markers make reprocessing safe.
 - **Bounded delivery + a dead-letter graveyard** (ADR-0039, an Architecture
@@ -243,9 +252,12 @@ The API-side graveyard watcher now honors the same `CURIE_DEAD_LETTER_STREAM` /
 agree on the graveyard stream name with no manual sync.
 
 The first `XADD` creates the stream; nothing pre-creates it. It is a sink, **not**
-a second processing lane: it has no consumer group, and nothing reads it
-automatically. Replay, if an operator wants it, is `XRANGE` plus a re-`XADD` onto
-the main stream.
+a second worker processing lane: it has no consumer group, and no worker
+replays its rows. The API graveyard watcher observes it read-only, while the
+resume reconciler acts only on matching resume rows. Stream-consumer rows can
+be inspected with `XRANGE` and, if an operator wants to replay one, re-`XADD`ed
+onto the main stream. Completion-outbox rows are terminal completion records,
+not inbound stream entries, and must not be replayed onto the main stream.
 
 **The graveyard is bounded, and its rows are best-effort.**
 
@@ -263,9 +275,9 @@ the main stream.
   system's poison rate, saturating rather than growing once the bound is
   hit.
 
-Each graveyard row carries the original entry's fields verbatim plus namespaced
-failure metadata, so a human or a replay tool can inspect exactly what died and
-why:
+The graveyard has two row families. Stream-consumer rows carry the original
+entry's fields verbatim plus namespaced failure metadata, so a human or replay
+tool can inspect exactly what inbound entry died and why:
 
 | Field | Meaning |
 |---|---|
@@ -274,22 +286,33 @@ why:
 | `dl_reason` | `max-delivery-exceeded`, or `unparseable` |
 | `dl_dead_lettered_at` | UTC ISO-8601 timestamp |
 
-The `dl_` prefix keeps the metadata namespaced, but the unparseable path stores
+Completion-outbox rows are written by `Markers.dead_letter_completion` only for
+the exact `DeletedReplyTargetError` deleted-thread classification. They carry
+`event_id`, the
+serialized `completion`, `dl_reason="thread deleted at provider"`,
+`dl_delivery_count="1"`, `dl_source="completion-outbox"`, and
+`dl_dead_lettered_at`; they have no `dl_original_id` and are not replayable as
+inbound stream entries. Every other completion delivery failure leaves the
+completion owed in the outbox for re-emission.
+
+The `dl_` prefix keeps the stream-consumer metadata namespaced, but the
+unparseable path stores
 an arbitrary, malformed field map verbatim, so an original field could itself be
 named `dl_something` and collide with one of the four keys above.
 `Consumer._dead_letter` escapes any original key already starting with `dl_`
 by doubling the prefix (`dl_reason` in the original becomes `dl_dl_reason` in
 the row) before writing the metadata last. The escape is injective: an escaped key
 always starts with `dl_dl_`, so it can never collide with the metadata, and
-un-escaping strips exactly one leading `dl_`. Nothing reads the graveyard
-today, so this costs nothing yet, but anything that later does (replay
-tooling, a dashboard, alerting) must strip one leading `dl_` to recover an
-original field whose name collided, or it will silently misread it.
+un-escaping strips exactly one leading `dl_`. The API graveyard watcher and
+resume reconciler read these rows; any reader of stream-consumer rows must strip
+one leading `dl_` to recover an original field whose name collided, or it will
+silently misread it. Completion-outbox rows do not use this escaped original-
+field convention.
 
 An entry that is pending while its message has been trimmed off the source
-stream produces a metadata-only row and is still acked. Every dead-letter
-emits a loud error log naming the entry, its delivery count, the reason, and
-the target stream.
+stream produces a metadata-only stream-consumer row and is still acked. Every
+stream-consumer dead-letter emits a loud error log naming the entry, its
+delivery count, the reason, and the target stream.
 
 Two behaviors worth knowing before changing this path. The delivery count is read
 from Valkey's pending-entries list on every pass rather than tracked in worker
@@ -314,7 +337,9 @@ Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
 `CURIE_STREAM` / `CURIE_CONSUMER_GROUP` / `CURIE_CONSUMER_NAME`,
 `CURIE_MAX_ATTEMPTS`, `CURIE_MAX_DELIVERY` / `CURIE_DEAD_LETTER_STREAM` /
 `CURIE_DEAD_LETTER_MAXLEN` (approximate graveyard cap, default `10000`, minimum
-`1`), plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for
+`1`), `CURIE_LEASE_EXPIRED_IDLE_MS` (the lease-expiry reclaim threshold, default
+one delivery lease TTL) and `CURIE_TURN_NOT_STARTED_TEXT` (the placeholder edit
+when a delivery's handler raises), plus `CURIE_NAMESPACE` / `CURIE_WARM_POOL` / `CURIE_RUNNER_PORT` for
 the substrate. Run with `python -m curie_worker`.
 
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey

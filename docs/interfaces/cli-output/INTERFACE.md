@@ -98,7 +98,8 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   and cluster tiers resolve their own `Endpoint` values and return *the same* output
   type, so tier parity is structural rather than two hand-aligned printers. That
   module is a deliberate leaf and never bypasses `CliOutput`.
-- **One output each** in `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
+- **One output each** in `cli/src/channel_token.rs` (`ChannelTokenOutput`),
+  `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
   (`DoctorOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
   (`GuideOutput`), `cli/src/migrate_store.rs` (`MigrateStoreOutput`),
   `cli/src/seal.rs` (`SealOutput`), and `cli/src/secrets.rs` (`SecretsListOutput`).

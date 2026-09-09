@@ -1,6 +1,6 @@
 [package]
 name = "curie"
-version = "0.8.5"
+version = "0.8.7"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 
@@ -79,6 +79,22 @@ jsonschema = { version = "0.51", default-features = false }
 serde_norway = "0.9.42"
 crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 base64 = "0.23.1"
+# GitHub App auth signs a JWT with RS256 (`github_app::sign_app_jwt`), which
+# GitHub requires, so RSA is not optional here. The backend is: `rust_crypto`
+# pulls the pure-Rust `rsa` crate, which carries RUSTSEC-2023-0071 (Marvin
+# timing sidechannel) with `patched = []` upstream since 2023 -- there is no
+# version to bump to, so the advisory is permanent for as long as we use it.
+# `aws_lc_rs` removes `rsa` from the tree outright (#2381) rather than
+# suppressing the finding, and takes the rest of the RustCrypto stack with it
+# (ed25519-dalek, p256, p384, sha2, hmac, rand): a net dependency reduction.
+#
+# The cost is a C/asm crypto library, which is the classic way a portable-CLI
+# story breaks, so that is the property that was actually tested rather than
+# assumed. Both release targets cross-compile under `cargo zigbuild` to the
+# GLIBC_2.28 floor, both assert that floor, and the x86_64 artifact runs on
+# Amazon Linux 2023 -- i.e. the `CLI runs on old glibc` job, not `cargo audit`,
+# is the check that governs this line. Revisit only if that job regresses.
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
 [dev-dependencies]
 # The frozen ACI types are a normal dependency of the lib, but integration test

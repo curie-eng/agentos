@@ -42,12 +42,100 @@ component and rail detail in `charts/curie/README.md`.
     strategy values key**. Pinned by `ci/langfuse-recreate-assertions.sh`.
     Horizontal scale for Langfuse needs an Accepted out-of-band migrator; when
     that lands, this exception is removed rather than extended.
+  - **Probe handlers stay in the template; probe cadences live in values.**
+    The probe *handler* -- `exec` / `httpGet` path / `tcpSocket` port -- is a
+    correctness choice about the image, not an environment knob, so it is
+    hardcoded in `templates/` on purpose (`langfuse-worker`'s `tcpSocket`
+    liveness is load-bearing, #2330; see the liveness invariant below). The
+    *cadence* keys -- `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`,
+    `failureThreshold` -- are sizing, so they read from values:
+    `postgres.readinessProbe`/`.livenessProbe`,
+    `langfuse.web.readinessProbe`/`.livenessProbe`,
+    `langfuse.worker.readinessProbe`/`.livenessProbe`, and
+    `api.readinessProbe`/`.livenessProbe`, alongside the pre-existing
+    `agentSandbox.runner.readinessProbe` and `dispatcher.startupProbe`. On top of
+    that: **on every container carrying both probes, the liveness failure cutoff
+    must strictly exceed the readiness one**, where
+    `cutoff = initialDelaySeconds + (failureThreshold - 1) * periodSeconds` and
+    omitted keys take the kubelet defaults (`periodSeconds: 10`,
+    `failureThreshold: 3`, `timeoutSeconds: 1`). A liveness probe that gives up
+    before readiness has stopped tolerating a slow boot restarts a container that
+    is still legitimately booting -- postgres replaying WAL, Langfuse running its
+    Prisma/ClickHouse boot migrations, the API warming up -- and the restart
+    re-enters the same boot path. Every `livenessProbe` must also declare
+    `timeoutSeconds` explicitly; the kubelet's 1s default is invisible in the
+    manifest and each timed-out probe counts as a failure. Both rules are pinned
+    for *every* rendered container, with no allowlist, by
+    `ci/probe-window-assertions.sh`. The remaining hardcoded probe blocks
+    (`ui.yaml`, `clickhouse.yaml`, `valkey.yaml`, `rustfs.yaml`,
+    `otel-collector.yaml`, `mail-adapter.yaml`, `inference.yaml`, and the
+    `curie.heartbeatProbes` helper used by `worker.yaml` and `dispatcher.yaml`)
+    all satisfy the ordering invariant today; lifting their numbers onto values
+    is a follow-up, and the assertion pins their ordering wherever the numbers
+    live.
+- **The instrumented set is exactly the workloads whose container `env` block
+  includes the `curie.env.otel` helper.** That include *is* the boundary -- it
+  is not a count and not a list kept in prose, and this rule exists because a
+  written count of "four workloads" went stale the moment a fifth one landed
+  (#2331). The include renders `OTEL_EXPORTER_OTLP_ENDPOINT`, `_PROTOCOL` and
+  `_HEADERS` from the `otelCollector` block and calls `curie.otel.validate`, so
+  adding it is what puts a workload inside chart-owned, validated telemetry, and
+  omitting it is what leaves one outside. `grep -n 'curie.env.otel'
+  charts/curie/templates/` is the authoritative membership answer at any commit;
+  at the time of writing it selects `api.yaml`, `dispatcher.yaml`, `worker.yaml`,
+  `agent-sandbox.yaml` (the runner) and `mail-adapter.yaml`. Adding a workload
+  means adding the include. Configuring the same three variables through that
+  workload's `extraEnv` instead does **not** satisfy the
+  `security.checkDefaultCredentials` production gate: each workload would then
+  carry its own copy of the destination, so any one of them can drift from the
+  rest while the render still looks correct. Two corollaries. The chart half is
+  only half the boundary -- the workload's own entrypoint must call
+  `bootstrap_service_telemetry` (`packages/telemetry`), or the env arrives at a
+  process that reads none of it and whose logs never pass `RedactingLogFilter`.
+  And a workload with an egress NetworkPolicy needs a collector peer in it as
+  well; today the mail adapter is the only such workload (see the next
+  invariant).
+- **`langfuse-worker`'s liveness probe is `tcpSocket`, not HTTP.** Both
+  `/api/health` and `/api/ready` in the worker image run a Prisma `SELECT 1`
+  plus a Redis ping and differ only in SIGTERM handling, so an HTTP liveness
+  probe would poke the same stores the HTTP readiness probe already pokes.
+  `langfuse-worker` is `replicas: 1` and runs Prisma and ClickHouse migrations
+  at container boot, and init containers do NOT re-run on a liveness restart --
+  so an HTTP liveness probe would restart the only replica straight into those
+  boot migrations against a Postgres or Valkey that may still be recovering,
+  which is exactly the crash-loop class
+  this chart's readiness gates exist to prevent (#2330). Accepted trade-off:
+  `tcpSocket` will not catch a wedged Node event loop -- the kernel still
+  accepts on the listen backlog against a process doing nothing -- so
+  detection of that rides on the **readiness** probe instead, which does
+  exercise the event loop and the stores, and flips `Deployment.Available`.
+  The chart's other first-party liveness probes are likewise process-local
+  rather than store-probing: `api.yaml` uses database aware `/ready` for
+  readiness while its liveness `/health` does no store I/O,
+  `mail-adapter.yaml` documents `/healthz` as a static liveness signal while
+  `/readyz` alone waits on SQLite, `inference.yaml` uses `tcpSocket`, and
+  `worker.yaml`/`dispatcher.yaml` use the heartbeat-file check
+  (`curie.heartbeatProbes`). `langfuse-web` probing `/api/public/health` for
+  *both* readiness and liveness is the exception, not the pattern -- do not
+  copy its liveness shape onto the worker.
 - **Mail-adapter egress is a separate fail-closed rail.** Enabling
   `mailAdapter.deploy` requires at least one
-  `mailAdapter.agentmail.httpsCidrs` entry. Its single egress-only policy allows
-  DNS, this release's API pods, and those CIDRs on TCP 443; with `api.deploy`
-  false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the pod selector
-  with an explicit narrow BYO-API peer. It never selects a runner sandbox and
+  `mailAdapter.agentmail.httpsCidrs` entry. One egress-only policy is the
+  complete list of what that pod may reach, and every destination is a rule
+  inside it rather than a second policy object, so one object still shows
+  everything a pod holding three credentials can talk to -- read the rules in
+  `templates/mail-adapter.yaml` for the current set rather than trusting a count
+  here. As written today they are DNS, this release's API pods, those
+  `agentmail.httpsCidrs` on TCP 443, and -- only while `otelCollector.deploy` is
+  true -- this release's OTel Collector on its gRPC and HTTP ports. With
+  `api.deploy` false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the
+  API pod selector with an explicit narrow BYO-API peer. Because this is the
+  only first-party service with an egress policy at all, it is also the only one
+  whose OTLP export can be dropped by its own rail: with `otelCollector.deploy`
+  false and an external `otelCollector.endpoint`, this policy has no peer for
+  that address, and the fix is an operator-supplied additional egress policy
+  selecting the adapter (NetworkPolicies union), not a broad allow in the chart
+  for an address the chart cannot know. It never selects a runner sandbox and
   never allows the Kubernetes API. The runtime pod mounts no ServiceAccount
   token and has no RBAC. Prefix-0 and prefix-1 routes fail render, including
   split default routes. Do not turn provider DNS into a broad CIDR or add a
@@ -59,15 +147,6 @@ component and rail detail in `charts/curie/README.md`.
   BYO `host`/`port`/`auth`/`existingSecret` fields on the same block. A new
   backing store must follow this exact pattern -- do not add a store with a
   different enable/disable shape.
-  Known exceptions: in `curie.langfuse.env` (`_helpers.tpl`), `POSTGRES_PASSWORD`
-  (`postgresPassword`) still ignores `postgres.existingSecret`, and `SALT`
-  (`langfuseSalt`) / `ENCRYPTION_KEY` (`langfuseEncryptionKey`) still ignore
-  `langfuse.existingSecret` -- #2052 fixed the valkey and clickhouse half of
-  this idiom and enumerated these three as the remainder, not yet tracked by
-  an issue. Until they're fixed the invariant is aspirational for them: an
-  operator on BYO postgres or a BYO `langfuse.existingSecret` gets the
-  chart-generated value instead of theirs. `ENCRYPTION_KEY` is the sharpest --
-  a mismatched key means previously written encrypted columns stop decrypting.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.
@@ -142,8 +221,12 @@ component and rail detail in `charts/curie/README.md`.
   worker's claim timeout (live incident 2026-07-06). The runner-prewarm
   DaemonSet (`agentSandbox.runner.prewarm`) pulls the runner image at
   install/upgrade instead, and every `helm upgrade` rolls it to refresh the
-  cache. Do not flip the runner to `Always` and do not disable the prewarm
-  on `:latest`-tag clusters without accepting stale-image risk.
+  cache. When `bundleFetch.enabled` is true it also pulls
+  `agentSandbox.runner.bundleFetch.fetchImage` and `extractImage` (the sandbox
+  init pair, default `amazon/aws-cli` ~418MB plus busybox) so those are not
+  a first-claim cold pull either. Do not flip the runner to `Always` and do
+  not disable the prewarm on `:latest`-tag clusters without accepting
+  stale-image risk.
 - **`values.schema.json` is deliberately permissive, not a full contract.**
   The chart had no values schema at all before issue #1388; Helm now
   validates the ENTIRE coalesced values tree against `values.schema.json`
@@ -183,7 +266,11 @@ component and rail detail in `charts/curie/README.md`.
     can store `placement: null`, and `--reuse-values` on upgrade replays
     it, deleting the key -- and the `curie.placement.class` helper (see
     the values-keys invariant above) is its template-level backstop
-    (#2008).
+    (#2008). `worker.publication.githubHttpsCidrs` is a third instance:
+    `minItems: 1` catches `[]`, but a coalesced nil deletes the key and a
+    `range` over it used to emit an empty `to:` (allow-all on 443 for the
+    tokenless publication job). The template `fail` in
+    `publication-owner.yaml` is the backstop (#2321).
 
 ## Verify
 
@@ -215,7 +302,7 @@ Cluster verification (a disposable local cluster, `kind` or `k3s`):
 helm install curie-dev charts/curie -n curie-dev --create-namespace \
   -f charts/curie/values-dev.yaml
 kubectl get pods -n curie-dev -w
-helm test curie-dev -n curie-dev                              # re-runs both preflights + the security probe suite
+helm test curie-dev -n curie-dev                              # re-runs the three preflights + the security probe suite
 kubectl logs -n curie-dev job/curie-dev-preflight-avx
 kubectl logs -n curie-dev job/curie-dev-security-probe        # rails 1, 2, 4
 kubectl logs -n curie-dev curie-dev-security-probe-hardening  # rail 3

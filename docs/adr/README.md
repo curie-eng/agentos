@@ -169,6 +169,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0137 | [Coding tools are built in and an initial repository URL selects the workspace](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md) | Draft |
 | 0138 | [Provider-side web search is a default-on bundle capability](0138-provider-side-web-search-is-a-default-on-bundle-capability.md) | Proposed |
 | 0139 | [Bundle owners classify every vanilla MCP tool](0139-bundle-owners-classify-every-vanilla-mcp-tool.md) | Draft |
+| 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Draft |
 | 0142 | [Database compatibility is a release contract; migrations run in one upgrade phase](0142-database-compatibility-windows-and-a-single-upgrade-phase.md) | Accepted |
 | 0143 | [A coding thread owns one fenced pull request lineage](0143-thread-owned-pull-request-lineage.md) | Accepted |
 <!-- END GENERATED: adr-index -->

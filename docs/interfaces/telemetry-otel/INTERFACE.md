@@ -74,8 +74,8 @@ than an open bag of `gen_ai.*` names.
   exception message or stack.
 - The metric catalog in `packages/telemetry/schema/metrics.json` is the committed
   contract for operational counters, histograms, and gauges across turn, queue,
-  thread-lock, sandbox, runner RPC, approval, reply, HTTP, background-loop, and eval
-  work. `record_metric`
+  thread-lock, sandbox, runner RPC, approval, completion-outbox, reply, HTTP,
+  background-loop, and eval work. `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, agent, or
@@ -161,12 +161,16 @@ keys:
   Partial bodies, arguments, provider identifiers, and results never enter telemetry.
 - **Boundary confidence is explicit.** Generation start kinds are `query_observed` or
   `tool_result_inferred`; end kinds are `tool_use_observed`, `result_observed`, or
-  `terminal_inferred`. An `execute_tool` span starts at an SDK tool-use block with
-  `curie.phase.start_kind=tool_use_inferred` and ends on the matching tool result with
-  `curie.phase.end_kind=tool_result_inferred`, or at terminal cleanup with
-  `terminal_inferred`. Matching uses the SDK call id only inside the process. The id is
-  never exported; `curie.tool.call.index` is the bounded numeric correlation value, while
-  `gen_ai.tool.name` and `gen_ai.operation.name=execute_tool` describe the operation.
+  `terminal_inferred`. An `execute_tool` span starts when the adapter observes either a
+  streamed SDK tool-use boundary or an SDK tool-use block, with
+  `curie.phase.start_kind=tool_use_inferred`. A streamed boundary still produces this
+  payload-free observation when no final `AssistantMessage` tool-use block arrives: tool
+  inputs, result bodies, and call IDs are never recorded. The span ends on the matching
+  tool result with `curie.phase.end_kind=tool_result_inferred`, or at terminal cleanup
+  with `terminal_inferred`. Matching uses the SDK call ID only inside the process; the ID
+  is never exported. `curie.tool.call.index` is the bounded numeric correlation value,
+  while `gen_ai.tool.name` and `gen_ai.operation.name=execute_tool` describe the
+  operation.
 - **Terminal state is truthful and bounded.** `curie.phase` marks each interval as
   `provider_wait` or `tool_wait`, and on `agent.run` retains the last active phase.
   The root terminal mapping is closed and ordered:
@@ -247,16 +251,15 @@ model attribute the backend recognizes for the span to ingest as a generation ra
 an untyped span, and the Langfuse read-side integration test seeds both spellings
 (`apps/api/tests/test_langfuse_integration.py`). A second backend inherits the duplicate.
 
-The read side duplicates two of the keys as its own string literals rather than importing
-the closed enum: `_SANDBOX_ATTR` (`apps/api/src/curie_api/langfuse.py::_SANDBOX_ATTR`) and
-`_APPROVAL_DECISION_ATTR`
-(`apps/api/src/curie_api/langfuse.py::_APPROVAL_DECISION_ATTR`), read by
-`hoist_sandbox_id` and `hoist_approval_decision`
-(`apps/api/src/curie_api/langfuse.py::hoist_approval_decision`). The drift gate covers
-only the runner's enum against its committed mirror, so a rename on the producer side
-passes CI while silently breaking these two readers. That is the concrete leak a second
-implementation trips over: the schema is closed for the writer and open-coded for the
-reader.
+The two hoist readers bind those keys through the closed enum:
+`_SANDBOX_ATTR` (`apps/api/src/curie_api/langfuse.py::_SANDBOX_ATTR`) is
+`SpanAttributeKey.CURIE_SANDBOX_ID.value` and `_APPROVAL_DECISION_ATTR`
+(`apps/api/src/curie_api/langfuse.py::_APPROVAL_DECISION_ATTR`) is
+`SpanAttributeKey.APPROVAL_DECISION.value`, read by `hoist_sandbox_id` and
+`hoist_approval_decision`
+(`apps/api/src/curie_api/langfuse.py::hoist_approval_decision`). The remaining leak
+is the three `langfuse.*` writer attributes (`langfuse.trace.name`,
+`langfuse.session.id`, `langfuse.user.id`) and the `/langfuse` URL namespace.
 
 ## Cross-links
 

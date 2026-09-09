@@ -1,0 +1,13 @@
+{
+  "comment": "Single source of truth for the completion-outbox health observer the worker and CLI share (#2422). The worker snapshots Valkey (`apps/worker/src/curie_worker/completion_health.py`) and emits bounded gauges; cluster status and doctor kubectl-exec the same `--json` reader inside a worker pod. The two lanes cannot share code across Python/Rust, so the literals are frozen here. Changing one language without this file fails that language's test. Read by apps/worker/tests/test_completion_outbox_vector.py and the test module in cli/src/completion_outbox.rs. An unknown top-level key is rejected so a new key one lane cannot see cannot pass vacuously.",
+  "default_key_prefix": "curie:worker",
+  "pending_key_suffix": "completions:pending",
+  "completion_key_infix": "completion:",
+  "default_grace_s": 60.0,
+  "dl_source": "completion-outbox",
+  "status_module": "curie_worker.completion_health",
+  "status_args": ["python", "-m", "curie_worker.completion_health", "--json"],
+  "states": ["empty", "inflight", "retry", "unknown"],
+  "metric_names": ["curie.completion.outbox", "curie.completion.outbox.age"],
+  "metric_outcomes": ["inflight", "retry", "terminal"]
+}

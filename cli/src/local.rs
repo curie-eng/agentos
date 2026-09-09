@@ -1300,8 +1300,14 @@ pub async fn status(o: LocalOpts) -> Result<LocalStatusOutput> {
         }));
     }
     require_on_path("docker")?;
-    // `docker compose ps` output is itself the payload table.
-    let (ok, out, err) = run_capture(&cmd).await?;
+    // The service table and claim gate are independent read-only probes. Keep
+    // the additive diagnosis on stderr so LocalStatusOutput remains unchanged.
+    let (status_read, claim_state) = tokio::join!(
+        run_capture(&cmd),
+        crate::worker_claims::observe_local(&o.file),
+    );
+    let (ok, out, err) = status_read?;
+    ui.note(&claim_state.status_diagnosis());
     if !ok {
         for line in err.lines() {
             ui.plumbing(line);

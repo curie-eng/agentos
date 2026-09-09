@@ -8,11 +8,20 @@ per-thread boot window, which once blew past the worker's 90s claim timeout and
 killed the run. This DaemonSet keeps that image pulled and pinned on every node
 so those cold boots bind an already-present image instantly.
 
+The same window runs the bundle-fetch and bundle-extract init containers
+(agentSandbox.runner.bundleFetch.fetchImage / extractImage). Those refs are
+IfNotPresent on the claim path (global.imagePullPolicy) and are not the runner
+image, so a DaemonSet that pins only curie-runner still leaves a fresh or
+image-GCed node to cold-pull ~418MB of amazon/aws-cli on the first claim. When
+bundleFetch.enabled is true this DaemonSet therefore also sleeps one extra
+container per bundle-fetch image, sourced from the same values keys the
+sandbox init pair uses.
+
 It is a long-idle DaemonSet, not a one-shot Job, on purpose:
   - DaemonSet covers every node (single-node clusters get exactly one pod).
   - The kubelet treats the image as in-use, so image GC never evicts it between
     threads.
-  - The container just `sleep infinity`s at near-zero cost -- the pinned image is
+  - Each container just `sleep infinity`s at near-zero cost -- the pinned image is
     the point, not the process.
 
 ROLL-TO-REFRESH: with a mutable `latest` tag the pod spec does not change when
@@ -72,4 +81,29 @@ spec:
           command: ["sleep", "infinity"]
           resources:
             {{- toYaml $runner.prewarm.resources | nindent 12 }}
+        {{- if $runner.bundleFetch.enabled }}
+        # Same values keys as the sandbox init pair in agent-sandbox.yaml -- a
+        # hardcoded ref here would drift from the claim path the first time an
+        # operator overrides fetchImage or extractImage.
+        #
+        # Pull policy is global.imagePullPolicy (IfNotPresent), NOT
+        # prewarm.imagePullPolicy. Cluster CI and the kind/k3s import path set
+        # the latter to Never and only kind-load first-party images; applying
+        # Never here would ErrImageNeverPull amazon/aws-cli and busybox and
+        # the DaemonSet would never become Ready. IfNotPresent still pulls
+        # those registry images on a fresh node (the point of this sidecar)
+        # without re-pulling ~418MB on every helm upgrade roll.
+        - name: prewarm-bundle-fetch
+          image: {{ $runner.bundleFetch.fetchImage | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["sleep", "infinity"]
+          resources:
+            {{- toYaml $runner.prewarm.resources | nindent 12 }}
+        - name: prewarm-bundle-extract
+          image: {{ $runner.bundleFetch.extractImage | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["sleep", "infinity"]
+          resources:
+            {{- toYaml $runner.prewarm.resources | nindent 12 }}
+        {{- end }}
 {{- end }}

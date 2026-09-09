@@ -1,7 +1,7 @@
 ---
 seam: Triggers
 kind: SOFT
-impls: 3 hardcoded (Slack, GH push, commit poll)
+impls: 4 hardcoded (Slack, GH push, commit poll, generic HMAC hook)
 grade: not separately graded
 epics:
   - "#29"
@@ -13,7 +13,7 @@ order: 17
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 3 hardcoded (Slack, GH push, commit poll) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 4 hardcoded (Slack, GH push, commit poll, generic HMAC hook) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -21,7 +21,7 @@ order: 17
 ## The black line
 
 A "trigger" is the thing that wakes an agent: an inbound event that gets turned into a
-run. Today there are **three hardcoded triggers** wired directly into their respective
+run. Today there are **four hardcoded triggers** wired directly into their respective
 ingress handlers, with **no shared `Trigger`/`EventSource` port** between them. There
 is no swappable line here yet — each trigger is bespoke code. The open architectural
 question (Epic #29) is whether "trigger" is even a real seam, or whether new triggers
@@ -32,7 +32,7 @@ assert a port that does not exist.
 ## Current contract
 
 There is no cross-trigger contract to satisfy — a new trigger today means adding
-another hardcoded handler. The three that exist:
+another hardcoded handler. The four that exist:
 
 - **Slack mention** — `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`:
   the `@app.event("app_mention")` listener (wired in
@@ -50,11 +50,17 @@ another hardcoded handler. The three that exist:
   `api.commitPollIntervalSeconds` is set. It exists because the webhook above is
   an INBOUND request, and a self-hosted cluster behind a firewall cannot receive
   one at all -- outbound always works (#1239).
+- **Generic HMAC hook** — `apps/api/src/curie_api/routers/hooks.py::ingest_hook`:
+  `@router.post("/{agent_id}/{hook}")` verifies a Curie HMAC over the raw body,
+  claims the delivery id, and enqueues a `QueuedTurn` with `source=WEBHOOK`. This
+  is a hardcoded platform ingress, not consumption of a bundle-declared
+  `webhook` path.
 
-The three share no abstraction: a Slack Bolt event listener, a FastAPI route with
-GitHub HMAC auth, and an asyncio timer. The last two converge one step earlier than
-the others -- both call `process_push`, deliberately, so the two deploy ingresses
-cannot disagree about what a push means.
+The four share no abstraction: a Slack Bolt event listener, a FastAPI GitHub
+HMAC route, an asyncio timer, and a FastAPI generic HMAC route. The GitHub push
+and commit poll converge one step earlier than the others -- both call
+`process_push`, deliberately, so the two deploy ingresses cannot disagree about
+what a push means.
 
 **Three further wake paths the inventory omitted.** Beyond the external triggers above,
 two platform-internal paths and one operator-driven path also turn an event into a run on
@@ -84,13 +90,15 @@ the same `curie:runs` stream, and a truthful inventory names them:
 `triggers` declarations (`cron` with a `schedule`, `webhook` with a `path`; `TriggerDeclaration` in
 `packages/plugin-format`, `triggers.*` validation codes), so an agent's non-chat wake-ups ship in one
 reviewable artifact and a malformed declaration is rejected at deploy. This is the *declaration*
-surface only — the *runtime* that acts on a declared trigger (a cron scheduler, a per-agent webhook
-ingress) is still the open Epic #29 question above and is not built. Declaring a trigger validates its
-shape; it does not yet wire a live wake-up.
+surface only. A generic HMAC hook ingress is shipped (`ingest_hook` above); bundle-declared
+`cron` / `webhook` *consumption* -- a per-agent scheduler that fires a declared schedule, or a
+mapping from a declared webhook path onto that handler -- is still the open Epic #29
+question and is not built. Declaring a trigger validates its shape; it does not yet
+wire a live wake-up for that declaration.
 
 ## Implementations today
 
-Three external triggers, all hardcoded, in two different processes:
+Four external triggers, all hardcoded, in two different processes:
 
 1. Slack `app_mention` in the dispatcher (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`).
 2. GitHub `push` webhook in the API (`apps/api/src/curie_api/routers/github.py::github_webhook`).
@@ -98,9 +106,10 @@ Three external triggers, all hardcoded, in two different processes:
    opt-in via `api.commitPollIntervalSeconds`. Timer-driven wake is therefore no longer
    entirely unbuilt: this one is real, though it is a single hardcoded platform timer and
    not the per-agent declared `cron` the trigger DECLARATION surface anticipates.
+4. Generic HMAC hook in the API (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`).
 
 Plus three further wake paths that also enqueue a run without going through any of those
-three: the Slack block-action handler
+four: the Slack block-action handler
 (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action`), the approval-resume
 enqueue (`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`), and the CLI's own
 enqueue (`cli/src/message.rs` via `synthetic_turn`/`xadd`/`new_event_id` in

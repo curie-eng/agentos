@@ -1237,3 +1237,53 @@ def test_a_missing_adapter_identity_names_only_the_endpoint_origin() -> None:
         assert _urls_in(message) == ["http://adapter.example"]
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 429, 500, 502, 503])
+@pytest.mark.parametrize("completion", [True, False])
+@pytest.mark.parametrize("terminal_response", [True, False])
+@pytest.mark.parametrize("kind", ["email", "discord"])
+def test_only_gone_completion_is_a_terminal_delivery_failure(
+    status: int, completion: bool, terminal_response: bool, kind: str,
+) -> None:
+    from curie_worker.reply_sink import DeletedReplyTargetError
+
+    async def go() -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.json_response(
+                {"detail": "thread deleted at provider" if terminal_response
+                 else "provider body must not reach error"},
+                status=status,
+            )
+
+        server = await _serve(handler)
+        adapter = HttpReplyAdapter({ADAPTER_A: SECRET_A})
+        try:
+            event = _update(kind)
+            if completion:
+                event = TurnCompleted(
+                    version=REPLY_WIRE_VERSION,
+                    event="turn.completed",
+                    target=event.target,
+                    event_id="ev-gone",
+                    outcome="delivered",
+                )
+            with pytest.raises(RejectedAdapterResponseError) as caught:
+                await adapter.emit(
+                    event,
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{server.port}/ack",
+                        adapter=ADAPTER_A,
+                    ),
+                )
+            assert isinstance(caught.value, DeletedReplyTargetError) == (
+                completion and status == 410 and terminal_response
+            )
+            if not (completion and status == 410 and terminal_response):
+                assert f"answered {status};" in str(caught.value)
+            assert "provider body" not in str(caught.value)
+        finally:
+            await adapter.aclose()
+            await server.close()
+
+    asyncio.run(go())

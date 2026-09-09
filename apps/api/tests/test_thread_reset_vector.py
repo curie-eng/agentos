@@ -10,7 +10,12 @@ from curie_api.threadreset import THREAD_RESET_INFLIGHT_SET, THREAD_RESET_SET
 _VECTOR = (
     Path(__file__).resolve().parents[3] / "tests" / "vectors" / "thread-reset-set.json"
 )
-_EXPECTED_KEYS = {"comment", "thread_reset_set", "thread_reset_inflight_set"}
+_EXPECTED_KEYS = {
+    "comment",
+    "thread_reset_set",
+    "thread_reset_inflight_set",
+    "thread_key_examples",
+}
 
 
 def test_thread_reset_keys_match_the_frozen_vector() -> None:

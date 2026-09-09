@@ -50,8 +50,10 @@ Run these from the repo root unless noted. CI (`.github/workflows/ci.yaml`) runs
 the same commands.
 
 **Python (all packages, from root):**
-Run this local Python CI baseline. Do not use `--profile full` for startup
-because it can start stale application images.
+Run this local Python CI baseline. For concurrent jobs, first apply
+[Concurrent local verification](#concurrent-local-verification) below: this
+block is the default port reference, not a requirement to share its resources.
+Do not use `--profile full` for startup because it can start stale application images.
 Set `base=next` when your worktree targets `next`.
 
 ```bash
@@ -98,9 +100,89 @@ git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
 )
 ```
 
-Fixed host ports already in use are an environment occupancy blocker. Stop the
-existing owner before running this baseline. That does not mean the baseline is
-broken.
+Occupied default ports are a reason to isolate the job, not by themselves a
+failed precondition. Preserve the existing owner and follow the instructions
+below before deciding that local verification is blocked.
+
+### Concurrent local verification
+
+This applies to every local implementation job, including Bonus Drain. Agents
+are authorized to create disposable Compose overrides, endpoint files and test
+launchers inside their own worktree without asking permission. Keep them under
+the gitignored `.projects/` directory. Do not add infrastructure features to the
+product just to run a job. Direct Compose invocation for this disposable setup
+is an exception to the CLI entry point guidance in `CLAUDE.md`.
+
+1. Choose a unique Compose project for this execution, such as
+   `curie-check-<issue>-<run-suffix>`. Inventory running containers, published
+   ports and network ownership first. Use the same project, absolute base
+   Compose path and override files for config, startup, exec, logs and teardown.
+   A project name alone does not change published ports or explicitly named
+   networks.
+2. Generate a private override for every service you will start. Replace each
+   published port list with `ports: !override [...]`, binding to `127.0.0.1`.
+   This requires Compose 2.24.4 or later; see the
+   [Compose merge reference](https://docs.docker.com/reference/compose-file/merge/#replace-value).
+   Plain Compose list merging can retain the original occupied binding. Either
+   choose unused custom ports and retry allocation on a bind collision, or let
+   Docker allocate ports and discover them with `docker compose port` before
+   starting consumers. Do not assume an unused port probe reserves the port.
+   For example, this override replaces only the Postgres and Valkey bindings;
+   extend it to RustFS, Langfuse, ClickHouse, OTel, API, UI and any other enabled
+   service with published ports:
+
+   ```yaml
+   services:
+     postgres:
+       ports: !override ["127.0.0.1:35432:5432"]
+     valkey:
+       ports: !override ["127.0.0.1:36379:6379"]
+   networks:
+     curie_runner:
+       name: "${COMPOSE_PROJECT_NAME}_runner"
+   ```
+
+   These example ports must also be checked for occupancy. Inspect the resolved
+   `docker compose -p "$COMPOSE_PROJECT_NAME" -f compose.dev.yaml -f <override> config`
+   before startup; confirm that no enabled service retains a shared binding and
+   the runner network belongs to this project.
+3. Point every host consumer at the chosen endpoints. Inspect the actual test
+   fixtures and settings: common variables include `DATABASE_URL`,
+   `TEST_DATABASE_URL`, `VALKEY_HOST`, `VALKEY_PORT`, `TEST_VALKEY_PORT`,
+   `S3_ENDPOINT_URL`, `TEST_S3_ENDPOINT_URL`, `LANGFUSE_HOST`, `CURIE_API_URL`,
+   `CURIE_API_TARGET` and `PW_PORT`. Export only settings the consumer reads.
+   Bridge containers keep their internal service addresses. The host network
+   worker needs explicit override entries for its database, Valkey, S3, API
+   and worker OTel endpoints, plus `CURIE_DOCKER_NETWORK` matching the private
+   runner network. Shell exports do not replace literal Compose environment
+   entries. Use private image tags and staging paths when building or running
+   workers; preserve the worker's identical host/container staging mount path.
+4. Run the baseline checks above against these resources, replacing its project,
+   lock path, Compose invocations and health URL consistently. Keep all checks
+   and assertions. Record the resolved endpoints, candidate identity and exact
+   commands in the run evidence, without credential values. Check for hardcoded
+   endpoints before running each test or helper; environment variables do not
+   override literals. In particular, `scripts/check-released-upgrade.py` embeds
+   port 25432, and CLI local lifecycle, connector and ladder paths have shared
+   names or ports. Do not assume `COMPOSE_PROJECT_NAME` makes those paths private.
+5. If a required command cannot target private resources without changing its
+   behavior or assertions, run independent work first and reserve a bounded
+   exclusive verification window for that command. Use the shared baseline
+   lock for default port checks, recheck ownership after acquiring it, and never
+   stop another job's stack. Do not silently replace a required ladder with
+   focused tests, weaken a gate, or count a modified test as the original proof.
+   Only report an occupancy blocker after identifying the exact unredirectable
+   command and why neither isolation nor a bounded exclusive window is possible.
+6. Install cleanup before startup and remove only this execution's containers,
+   networks, volumes and spawned runners. Identify resources by the project
+   label and recorded container IDs, never a global `curie*` name sweep. On a
+   partial startup failure, clean the owned partial stack before reallocating.
+   Verify that owned resources are gone and other jobs remain running.
+
+Existing task contracts still govern scope and required evidence. A running job
+or older worktree does not automatically acquire newer instructions; read this
+section from the updated base when resuming. Do not edit a live claimed Bonus
+Drain task or launch a second copy to apply the guidance.
 
 **Rust CLI:**
 ```bash
@@ -175,8 +257,10 @@ RAM to leave the full stack idling, and this keeps happening: stacks get left
 running across sessions and starve the machine. Before you end a session in
 which you ran `curie local up` / `docker compose ... up`, run `curie local
 down` (or `docker compose -f compose.dev.yaml down`) and confirm with
-`docker ps` that nothing curie-related is still up. Also remove any stray
-`curie-runner*` containers a run may have spawned. The thread that brought the
+`docker ps` that none of this run's containers are still up. Use the same private
+project and overrides used for startup. Also remove stray runner containers this
+run spawned, identified by recorded IDs or ownership labels; preserve other
+jobs' containers. The thread that brought the
 stack up owns tearing it down — a blocked or crashed test agent never cleans up
 after itself, so do not assume someone else will.
 
@@ -202,13 +286,24 @@ Host ports (non-default host ports to avoid local collisions):
 Config lives in `.env.example` (copy to the gitignored `.env` to override; the
 stack runs on the baked defaults without one). Load-bearing facts:
 
-- **ClickHouse:** `compose.dev.yaml` stays on `:24.8` so an SSE4.2-only
+- **ClickHouse:** `compose.dev.yaml` stays on `:24.8.14.39` so an SSE4.2-only
   developer host can still boot the local stack (Langfuse `3.225.5` still
-  applies on 24.8). The Helm chart default is `:25.12`, required by the
-  Langfuse pin's ClickHouse migrations from 39 onward; AVX is a chart-default
-  requirement. `preflights.avxCheck` fails an AVX-less node unless the
-  operator pins a tag in `clickhouse.sse42SafeTags`. Do not move the two
-  chart pins independently (#2210).
+  applies on the 24.8 line). The Helm chart default is `:25.12.11.4`, required
+  by the Langfuse pin's ClickHouse migrations from 39 onward; AVX is a
+  chart-default requirement. `preflights.avxCheck` fails an AVX-less node
+  unless the operator pins a tag in `clickhouse.sse42SafeTags`. Do not move the
+  two chart pins independently (#2210). Both sides name a patch build, not a
+  `24.8` / `25.12` alias -- upstream republishes those (#2319).
+- **Postgres and Valkey are one pin, not two:** `postgres.image` is
+  digest-pinned (`postgres:16.15-alpine@sha256:cf78e766...`, because
+  PostgreSQL's version is two components) and `valkey.image` is
+  `valkey/valkey:8.1.10-alpine`. `charts/curie/values.yaml`, `compose.dev.yaml`,
+  the rust job's Valkey service in `.github/workflows/ci.yaml`, and
+  `charts/curie/ci/postgres-readiness-delay.Dockerfile` must all name the same
+  build; `compose/tests/test_generate_release_compose.py` asserts it.
+  `postgres.podSecurityContext.fsGroup` is `70`, the `postgres` gid inside the
+  pinned image, asserted against the running image by
+  `charts/curie/ci/postgres-fsgroup-assertions.sh` (#2319).
 - **Langfuse OTLP ingest is HTTP-only** (gRPC is silently unsupported). Services
   may emit OTLP over gRPC or HTTP to the OTel Collector (4317/4318); the
   collector always exports to Langfuse over HTTP. Send app traces to the
@@ -507,8 +602,18 @@ required and proved, not carried on the original classification.
 | local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder` |
 | local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
-| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
-| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape | drive the real integration; a replayed fixture or a fake does not close this tier |
+| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
+| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
+
+The path set is runner MCP catalog projection, unscoped PreToolUse,
+in-process platform MCP tools, workspace publication, and
+built-in coding-tool session capability. A behavior-bearing change that
+reaches any of those reaches both live-provider and Slack external-integration.
+Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
+Fake-model kind, skill ladder, and helper-only tests remain useful and are
+not sufficient for those acceptance criteria. Leave the required-tier item
+open when the evidence is missing; do not close it by marking the row n/a.
+This rule does not pull the live e2e ladder onto unrelated pull requests.
 
 ### Evidence per acceptance criterion
 

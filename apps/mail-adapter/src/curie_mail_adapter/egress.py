@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 HEALTH_PATH = "/healthz"
 READY_PATH = "/readyz"
+STATUS_PATH = "/statusz"
 MAX_CONCURRENT_REQUESTS = 16
 REJECT_DRAIN_SECONDS = 1.0
 REQUEST_HEADER_SECONDS = 2.0
@@ -142,8 +143,15 @@ class EgressHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == HEALTH_PATH:
             return self._respond(200, {"status": "ok"})
+        if path == STATUS_PATH:
+            return self._respond(200, self.adapter.status())
         if path == READY_PATH:
-            ready = self.adapter.ready.is_set() and self.adapter.state.healthy()
+            status = self.adapter.status()
+            ready = (
+                self.adapter.ready.is_set()
+                and self.adapter.state.healthy()
+                and status["channel_token"]["state"] in {"ok", "expiring", "disabled"}
+            )
             return self._respond(
                 200 if ready else 503,
                 {"status": "ready" if ready else "starting"},
@@ -202,6 +210,8 @@ class EgressHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.error("dispatching event type=%s failed unexpectedly", event.event)
             return self._respond(500, {"detail": "adapter error"})
+        if status == 410:
+            return self._respond(status, {"detail": "thread deleted at provider"})
         self._respond(status, ReplyAck().model_dump())
 
     def dispatch(self, event: ReplyEvent) -> int:
