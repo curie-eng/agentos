@@ -2,7 +2,7 @@
 
 Date: 2026-09-09
 
-Status: Accepted
+Status: Draft
 
 This ADR is a **backfill**. The four decisions below were made and merged on
 2026-09-08 as [#2471](https://github.com/curie-eng/curie/pull/2471),
@@ -13,12 +13,22 @@ This ADR is a **backfill**. The four decisions below were made and merged on
 was defensible; taken together they changed when `cluster up`, `cluster down`
 and `cluster rollback` are allowed to mutate a cluster at all, which is an
 architectural decision that was not written down. A maintainer directed this
-record on 2026-09-09 and it is the explicit approval
+record on 2026-09-09.
+
+**The status is `Draft`, deliberately, even though every clause here is already
+built on `main`.** That direction was to write the record, not an approval of
+its content, and
+[ADR-0085](0085-acceptance-not-implementation-authorizes-an-adr.md) clause 4 and
+`docs/adr/AGENTS.md` step 3 both say that existing implementation cannot
+retroactively accept a Draft — implementation is audit context, never acceptance
+authority. `Accepted` requires explicit maintainer approval published with the
+status, which this ADR does not carry. Promoting it is a one-line status edit
+under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
+clause 1 once that approval is recorded; the realizing code paths that
 [ADR-0102](0102-accepted-alongside-implementation-with-explicit-approval.md)
-requires; the realizing code paths that ADR also requires are named below. The
-status is `Accepted` rather than `Draft` under
-[ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)'s
-rule that a status is a claim about the tree: every clause here is built.
+also requires are already named below. A Draft that describes shipped code is an
+unusual state, and it is the honest one: the code is on `main` either way, and
+what is missing is the recorded approval, not the evidence.
 
 It also records what was **not** taken. [#2391](https://github.com/curie-eng/curie/pull/2391)
 ("Implement validated transactional upgrade and bounded recovery") proposed a
@@ -83,11 +93,24 @@ that the previous version stayed serving.
 
 ## Decision
 
-**Each lifecycle verb admits before it mutates.** Admission is a refusal that
-happens before any state-changing `helm` or `kubectl` call, fails closed when it
-cannot read what it needs, and names its own remedy. The four gates are
-independent, live at the verb that already exists, and are each verifiable
-against a live cluster on their own.
+**Each lifecycle verb admits before the mutation that gate governs.** Each
+admission is a refusal that fails closed when it cannot read what it needs and
+names its own remedy. The invariant is per-gate, not global, and the boundaries
+differ:
+
+- namespace ownership is established **before Helm runs at all** on `cluster up`;
+- schema admission runs **before the `helm rollback` call**, after the existing
+  status filter;
+- the failed-revision discard runs **after the first Helm install attempt has
+  already aborted** and before the gVisor-off retry — it is recovery from a
+  mutation that happened, not prevention of one;
+- the drain gate runs **inside Helm's own `pre-upgrade` hook**, so Helm has been
+  invoked; its guarantee is that the workload roll does not proceed, not that
+  Helm was never called.
+
+Nothing here establishes a single admission point covering every mutating `helm`
+or `kubectl` call. The four gates are independent, live at the verb that already
+exists, and are each verifiable against a live cluster on their own.
 
 ### 1. Drain pause authority is scoped to one Helm installation and revision
 
@@ -172,8 +195,12 @@ refusal is nonzero, names the compatibility boundary and the newest safe
 fail-forward application version, and prints no database contents or
 credentials. The gate fails closed on every unreadable path: a nonzero
 `kubectl exec`, unparseable `alembic current` output, a target Helm revision
-with no `app_version`, an application version absent from the catalog, and a
-live revision absent from the catalog's revision chain.
+from which no application version can be resolved, an application version absent
+from the catalog, and a live revision absent from the catalog's revision chain.
+"No application version" means neither source resolves: an empty `app_version`
+falls back to the trailing version on the revision's `chart` field (`curie-0.8.4`
+yields `0.8.4`), so a revision Helm recorded without `app_version` is still
+gated rather than waved through.
 
 The status filter is unchanged. Schema compatibility is an *additional* gate,
 not a replacement — status answers "did Helm finish applying this", the window
@@ -422,10 +449,15 @@ open consequence 4.
    incident this gate exists for is a rollback that *did* proceed and left the
    Deployment past its progress deadline. A warning on a path an operator reaches
    during an outage is not read.
-6. **Cap serving at `schema_head` at API startup instead of gating at the CLI.**
-   Rejected here as out of scope: it is the v0.9.0 answer recorded in ADR-0142,
-   and it requires removing Alembic from API startup, which v0.8.x images do not
-   do. This decision defends against the v0.8.x behaviour that actually ships.
+6. **Fix this at API startup instead of gating at the CLI.** Rejected here as
+   out of scope. The v0.9.0 answer recorded in ADR-0142 is to take Alembic out
+   of API startup entirely, run migrations in one controlled phase, and have API
+   pods wait for a servable revision — with expand/contract sequencing so an N-1
+   image keeps serving after an expand. Note that ADR-0142 explicitly *rejects*
+   capping serving at `schema_head`, because an already-released N-1 image cannot
+   declare a future expand it has not seen; this decision's CLI-side window check
+   is not that cap and does not imply it. v0.8.x images do still migrate at
+   startup, and this decision defends against the behaviour that actually ships.
 7. **Always `helm uninstall` before the gVisor-off retry.** Rejected: a history
    with a known-good revision is a real install, and uninstalling it would turn a
    recoverable retry into a data-bearing teardown.
