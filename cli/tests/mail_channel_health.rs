@@ -169,7 +169,7 @@ fn expired_mail_token_is_visible_on_status_and_doctor_and_valid_token_recovers()
                 assert_eq!(check["state"], if state == "ok" { "ok" } else { "missing" });
                 assert!(check["detail"].as_str().unwrap().contains(state));
                 if state != "ok" {
-                    assert!(check["fix"].as_str().unwrap().contains("/channels/token"));
+                    assert!(check["fix"].as_str().unwrap().contains("channel-token"));
                 }
             }
         }

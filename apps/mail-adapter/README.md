@@ -171,11 +171,11 @@ read the adapter through Kubernetes pod proxy access, so diagnostics remain
 reachable after readiness removes the pod from Service endpoints. Unavailable
 diagnostics report unknown instead of healthy.
 
-For recovery, mint a replacement via `POST /channels/token` using the platform
-`X-API-Key` and the bound email address, install `response.token` in the Secret
-key supplying `CURIE_CHANNEL_TOKEN`, then restart the mail-adapter Deployment.
-The doctor output includes the curl and rollout commands. No platform signing
-key is given to the adapter.
+For recovery, run `curie cluster channel-token <agent> --kind email --address <inbox>`.
+That mints a replacement via `POST /channels/token`, writes it into the Secret
+key supplying `CURIE_CHANNEL_TOKEN`, rolls the mail-adapter Deployment, and
+prints `exp` without printing the token. `curie doctor` reports the same `exp`
+and names that verb as the fix. No platform signing key is given to the adapter.
 
 ## Operations notes
 

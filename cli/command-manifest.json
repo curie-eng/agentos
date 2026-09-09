@@ -4242,6 +4242,113 @@
           "name": "surfaces"
         },
         {
+          "about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id that owns the binding",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Channel kind to mint for (e.g. email). Required unless --show-exp",
+              "id": "kind",
+              "long": "kind",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Channel address to mint for (e.g. the inbox). Required unless --show-exp",
+              "id": "address",
+              "long": "address",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "7d"
+              ],
+              "global": false,
+              "help": "Token lifetime: 7d, 24h, 60m, or seconds. Default 7d; at most 7 days",
+              "id": "ttl",
+              "long": "ttl",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the installed token's exp and whether the platform still accepts it. Read-only: no mint, no write",
+              "id": "show_exp",
+              "long": "show-exp",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`).\n\nWrites the Secret the adapter actually reads (chart Secret or `mailAdapter.channelTokenExistingSecret`), rolls the adapter, prints `exp`, and never prints the token. `--show-exp` is read-only.",
+          "name": "channel-token"
+        },
+        {
           "about": "Set an agent's budget via the platform API (`PUT /agents/{id}/budget`)",
           "args": [
             {

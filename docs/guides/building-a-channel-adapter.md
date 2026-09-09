@@ -82,6 +82,8 @@ curl -X POST "$CURIE_API_URL/channels/token" \
   -d '{"kind":"email","address":"agent@example.com","ttl_s":3600}'
 ```
 
+For the first-party mail adapter, `curie cluster channel-token <agent> --kind email --address <inbox>` mints, writes the Secret the adapter reads, and rolls it, so recovery is that one command rather than a curl plus a kubectl patch.
+
 Response is `{"token": "..."}`. `ttl_s` defaults to 3600 and is capped at
 604800. The mint returns 404 if the pair is not bound, and 409 if a non-`slack`
 binding has no reply route yet, so a half-configured route is caught at bind
