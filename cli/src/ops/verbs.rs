@@ -1535,12 +1535,16 @@ fn helm_rollback_cmd_to(o: &CommonOpts, revision: String) -> OpsCommand {
 }
 
 /// The commands `curie cluster rollback` runs (and prints under `--dry-run`):
-/// the history read that decides the target, then the rollback itself. A `None`
-/// revision is one the caller has not resolved yet, and stands in the argv as
-/// [`SELECTED_REVISION`].
+/// the history read that decides the target, the live-schema probe, then the
+/// rollback itself. A `None` revision is one the caller has not resolved yet,
+/// and stands in the argv as [`SELECTED_REVISION`].
 pub fn rollback_commands(o: &CommonOpts, revision: Option<u32>) -> Vec<OpsCommand> {
     let target = revision.map_or_else(|| SELECTED_REVISION.to_string(), |r| r.to_string());
-    vec![helm_history_cmd(o), helm_rollback_cmd_to(o, target)]
+    vec![
+        helm_history_cmd(o),
+        live_schema_revision_cmd(o),
+        helm_rollback_cmd_to(o, target),
+    ]
 }
 
 /// One printed plan line. `display()` everywhere, except that it shell-quotes
