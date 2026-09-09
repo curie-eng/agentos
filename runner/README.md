@@ -65,7 +65,13 @@ readinessProbe hits `/healthz`).
   the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
   (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional
   comma-separated tool names removed from the session and refused even under
-  bypassPermissions; unset keeps every tool available).
+  bypassPermissions; unset keeps every tool available). This stops the named
+  tools, not the underlying capability (#2429): denying
+  `mcp__curie-state__append`/`set`/`delete` does not revoke
+  `CURIE_STATE_TOKEN`, which stays in the sandbox environment, so a
+  still-permitted shell tool (e.g. `Bash`) can reach the same HTTP state API
+  directly. Naming `Bash` alongside the state tools closes that path today;
+  removing the token itself needs a code change, not a config knob.
 
 ## Build and smoke
 
