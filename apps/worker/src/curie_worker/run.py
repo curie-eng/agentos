@@ -34,6 +34,7 @@ from .bundle_store import BundleStore
 from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
 from .consumer import Consumer
+from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
@@ -377,6 +378,13 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
             ttl_ms=config.lock_ttl_ms,
             acquire_timeout_s=config.lock_acquire_timeout_s,
             poll_interval_s=config.lock_poll_interval_s,
+            owner=config.consumer_name,
+            owner_liveness=ThreadLockOwnerLiveness(
+                ConsumerLivenessStore(async_redis),
+                stream=config.stream,
+                group=config.consumer_group,
+            ),
+            dead_owner_proof_s=config.consumer_heartbeat_ttl_ms / 1000.0,
         ),
         markers=Markers(async_redis, config),
         config=config,
