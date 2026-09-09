@@ -202,7 +202,7 @@ OBSERVABILITY_POLL_INTERVAL_SECONDS=2
 # installs, upgrades, uninstalls, or deletes cluster state in this mode.
 PRODUCT_OBSERVABILITY="${CURIE_E2E_PRODUCT_OBSERVABILITY:-0}"
 MCP_RECEIPT_FIXTURE="$REPO_ROOT/cli/scripts/fixtures/mcp-receipt"
-MCP_RECEIPT_CONNECTOR="mcp-receipt"
+MCP_RECEIPT_CONNECTOR="receipt"
 MCP_RECEIPT_ALIAS=""
 MCP_RECEIPT_IMAGE=""
 LAST_ORDINARY_TRACE_ID=""
@@ -2139,7 +2139,52 @@ YAML
 # already carries the approval gate for the declared write connector.
 prepare_connector_bundle() {
     local dir="$1"
+    local plugin="$dir/.claude-plugin/plugin.json"
+    local hosted_names
     cp "$CONNECTOR_FIXTURE" "$dir/connectors.yaml"
+    # The fixture is a subset of the example's connectors. The scratch
+    # plugin.json still carries gates for connectors the fixture does not
+    # host; leaving those in place makes the owned copy fail
+    # approval_policy.gate_not_namespaced at skill up (#2423). This stage
+    # owns both files on the scratch copy.
+    hosted_names="$(mktemp)"
+    awk '
+        $0 == "connectors:" { inside = 1; next }
+        inside && /^  [a-zA-Z0-9-]+:/ { print substr($1, 1, length($1) - 1) }
+        inside && /^[^[:space:]#]/ { inside = 0 }
+    ' "$dir/connectors.yaml" > "$hosted_names"
+    if ! python3 - "$plugin" "$hosted_names" <<'PY'
+import json, sys
+from pathlib import Path
+
+plugin_path = Path(sys.argv[1])
+hosted = {line.strip() for line in Path(sys.argv[2]).read_text().splitlines() if line.strip()}
+if not plugin_path.is_file():
+    raise SystemExit(0)
+data = json.loads(plugin_path.read_text())
+policy = data.get("approvalPolicy")
+if not isinstance(policy, dict):
+    raise SystemExit(0)
+gates = policy.get("gates")
+if not isinstance(gates, list):
+    raise SystemExit(0)
+kept = []
+for gate in gates:
+    name = gate.get("gate") if isinstance(gate, dict) else None
+    if isinstance(name, str) and name.startswith("mcp__"):
+        parts = name.split("__")
+        if len(parts) >= 3 and parts[1] not in hosted:
+            continue
+    kept.append(gate)
+policy["gates"] = kept
+plugin_path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+    then
+        rm -f "$hosted_names"
+        echo "error: connector fixture setup could not align approval gates in $plugin." >&2
+        exit 1
+    fi
+    rm -f "$hosted_names"
     echo "connector fixture applied to $dir (connectors.yaml)"
 }
 
@@ -2148,19 +2193,34 @@ prepare_connector_bundle() {
 # file can be evidence because the sandbox is destroyed with the turn.
 prepare_mcp_receipt_bundle() {
     local dir="$1"
-    local destination="$dir/connectors/mcp-receipt"
+    local destination="$dir/connectors/$MCP_RECEIPT_CONNECTOR"
+    # This stage owns $destination and the `$MCP_RECEIPT_CONNECTOR` block in
+    # connectors.yaml. A rerun or a second stage that finds either already
+    # present must refuse: appending a duplicate or copying over an existing
+    # tree is the collision that made the default live lane boot an invalid
+    # bundle (#2423).
+    if [[ -e "$destination" ]]; then
+        echo "error: MCP receipt setup refusing to recreate $destination: already exists." >&2
+        echo "fix: give this setup stage its own scratch copy, or remove the owned directory before rerunning." >&2
+        exit 1
+    fi
+    if [[ -f "$dir/connectors.yaml" ]] && grep -qE "^  ${MCP_RECEIPT_CONNECTOR}:" "$dir/connectors.yaml"; then
+        echo "error: MCP receipt setup refusing to recreate connector '$MCP_RECEIPT_CONNECTOR' in $dir/connectors.yaml: already exists." >&2
+        echo "fix: give this setup stage its own scratch copy, or remove the owned connector before rerunning." >&2
+        exit 1
+    fi
     mkdir -p "$destination"
     cp "$MCP_RECEIPT_FIXTURE/Dockerfile" "$MCP_RECEIPT_FIXTURE/server.py" "$destination/"
     if [[ ! -f "$dir/connectors.yaml" ]]; then
         printf '%s\n' 'connectors:' > "$dir/connectors.yaml"
     fi
-    cat >> "$dir/connectors.yaml" <<'YAML'
-  mcp-receipt:
+    cat >> "$dir/connectors.yaml" <<YAML
+  ${MCP_RECEIPT_CONNECTOR}:
     build:
-      context: connectors/mcp-receipt
+      context: connectors/${MCP_RECEIPT_CONNECTOR}
       platforms: [linux/amd64, linux/arm64]
 YAML
-    echo "MCP receipt fixture applied to $dir (fixtures/mcp-receipt)"
+    echo "MCP receipt fixture applied to $dir (fixtures/mcp-receipt as $MCP_RECEIPT_CONNECTOR)"
 }
 
 # One build before the first rung, so every rung consumes the same lock and the
