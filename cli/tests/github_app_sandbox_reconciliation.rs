@@ -11,6 +11,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -435,6 +437,16 @@ if tool == "kubectl":
             if scenario in ("create-then-drift", "history-failure-after-create", "restore-create-then-drift"):
                 (root / "create-succeeded").touch()
         raise SystemExit(0)
+    if "get" in args and "secret" in args:
+        import base64
+        pem = (root / "app.pem").read_bytes()
+        print(json.dumps({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "acme-github-app"},
+            "data": {"app-pem": base64.b64encode(pem).decode()},
+        }))
+        raise SystemExit(0)
     print("unsupported fake kubectl invocation: " + joined, file=sys.stderr)
     raise SystemExit(1)
 
@@ -443,6 +455,7 @@ raise SystemExit(1)
 
 struct FakeCluster {
     dir: tempfile::TempDir,
+    github: support::MockServer,
 }
 
 impl FakeCluster {
@@ -457,6 +470,19 @@ impl FakeCluster {
             permissions.set_mode(0o755);
             fs::set_permissions(&path, permissions).expect("chmod shim");
         }
+        let pem = Command::new("openssl")
+            .args(["genrsa", "2048"])
+            .output()
+            .unwrap_or_else(|error| panic!("openssl genrsa: {error}"));
+        assert!(
+            pem.status.success(),
+            "openssl genrsa failed: {}",
+            String::from_utf8_lossy(&pem.stderr)
+        );
+        fs::write(dir.path().join("app.pem"), pem.stdout).expect("write app pem");
+        let github = support::serve(|_req: &support::Request| {
+            support::Response::json(200, r#"{"id":1234567,"name":"acme-bot"}"#)
+        });
         fs::write(dir.path().join("pre.yaml"), PRE_MANIFEST).expect("write pre manifest");
         fs::write(dir.path().join("dropped.yaml"), DROPPED_MANIFEST)
             .expect("write dropped manifest");
@@ -481,7 +507,7 @@ impl FakeCluster {
                 fs::write(dir.path().join(format!("live__{name}")), "").expect("seed live object");
             }
         }
-        Self { dir }
+        Self { dir, github }
     }
 
     fn state(&self) -> &Path {
@@ -536,7 +562,8 @@ impl FakeCluster {
             .env("PATH", self.child_path())
             .env("FAKE_CLUSTER_STATE", self.state())
             .env("FAKE_CLUSTER_SCENARIO", scenario)
-            .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel());
+            .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel())
+            .env("CURIE_GITHUB_API_URL", &self.github.base_url);
         if scenario == "helm-upgrade-hang" {
             command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "150");
         }
