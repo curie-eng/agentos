@@ -549,9 +549,16 @@ Two platform-side steps come first, in this order:
 
    The `adapter` value must equal `mailAdapter.adapterSlug`, because the worker looks
    its egress credential up under that key.
-2. **Mint the channel token.** `POST /channels/token` with the platform key returns a
-   scoped `chn` token for that one binding. It refuses with 409 for a non-`slack`
-   binding that has no reply route, which is why the binding comes first.
+2. **Mint the channel token.** `curie cluster channel-token <agent> --kind email --address <inbox>`
+   mints through `POST /channels/token` with the platform key, writes the token
+   into the Secret the adapter actually reads (the chart Secret, or
+   `mailAdapter.channelTokenExistingSecret` when that is set), rolls the adapter,
+   and prints `exp`. It never prints the token and never writes it through Helm
+   values, so `helm get values` cannot undo the rotation. `--show-exp` reports
+   the installed token's `exp` and whether the platform still accepts it, the
+   same observation `curie doctor` uses. The mint refuses with 409 for a
+   non-`slack` binding that has no reply route, which is why the binding comes
+   first.
 
 Then turn the adapter on. Keep all three credentials out of `--set`, Helm
 values, and release history by having a secret manager materialize an

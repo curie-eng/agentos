@@ -78,7 +78,7 @@ fn expiry(exp: Option<i64>) -> String {
 
 fn recovery(namespace: &str, release: &str) -> String {
     format!(
-        r#"curl -fsS -X POST "$CURIE_API_URL/channels/token" -H "X-API-Key: $CURIE_API_KEY" -H "Content-Type: application/json" --data '{{"kind":"email","address":"<inbox>","ttl_s":86400}}'; install response.token in the Secret key supplying CURIE_CHANNEL_TOKEN (mailAdapter.channelTokenExistingSecret/channelTokenExistingSecretKey, default key mailChannelToken), then kubectl -n {namespace} rollout restart deployment -l app.kubernetes.io/instance={release},app.kubernetes.io/component=mail-adapter"#
+        r#"curie cluster channel-token <agent> --kind email --address <inbox> --namespace {namespace} --release {release}"#
     )
 }
 

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/channel-token/v1.json",
+  "title": "curie cluster channel-token --json",
+  "description": "The agent-facing payload of `curie cluster channel-token`. The mint path reports exp and the Secret that was written, never the token. `--show-exp` reports the installed token's exp and whether the platform still accepts it. Dry-run is the shared plan object.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "address": {
+          "type": "string"
+        },
+        "exp": {
+          "type": "integer"
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "secret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "key"
+          ]
+        }
+      },
+      "required": [
+        "agent",
+        "kind",
+        "address",
+        "exp",
+        "expires_at",
+        "secret"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "exp": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "accepted": {
+          "type": "boolean"
+        },
+        "state": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exp",
+        "expires_at",
+        "accepted",
+        "state",
+        "detail"
+      ]
+    }
+  ]
+}

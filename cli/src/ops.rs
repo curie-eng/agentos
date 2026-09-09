@@ -48,13 +48,25 @@ pub struct OpsCommand {
 /// `-f <path>` pair (see [`OpsCommand::materialize_secret_files`]); the file is
 /// removed as soon as the command finishes. This keeps the secret off `ps -ef`
 /// and out of `/proc/<pid>/cmdline`.
+///
+/// `SecretPatchFile` is the kubectl equivalent: a merge-patch document whose
+/// body carries secret material (a channel token). It materializes to
+/// `--patch-file <path>` the same way, and display shows only the Secret data
+/// keys, never the values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CmdArg {
     Plain(String),
     HelmSetExpression(String),
-    SecretSet { key: String, value: String },
+    SecretSet {
+        key: String,
+        value: String,
+    },
     SecretValuesFile(Vec<(String, String)>),
     PrivateJsonValuesFile(PrivateHelmValues),
+    SecretPatchFile {
+        keys: Vec<String>,
+        document: serde_json::Value,
+    },
 }
 
 impl CmdArg {
@@ -68,7 +80,9 @@ impl CmdArg {
             CmdArg::Plain(s) => vec![s.clone()],
             CmdArg::HelmSetExpression(expression) => vec![expression.clone()],
             CmdArg::SecretSet { key, value } => vec![format!("{key}={value}")],
-            CmdArg::SecretValuesFile(_) | CmdArg::PrivateJsonValuesFile(_) => {
+            CmdArg::SecretValuesFile(_)
+            | CmdArg::PrivateJsonValuesFile(_)
+            | CmdArg::SecretPatchFile { .. } => {
                 debug_assert!(
                     false,
                     "SecretValuesFile must be materialized before argv(); \
@@ -106,6 +120,10 @@ impl CmdArg {
                     format!("<secret values file: {}>", masked.join(", ")),
                 ]
             }
+            CmdArg::SecretPatchFile { keys, .. } => vec![
+                "--patch-file".to_string(),
+                format!("<secret patch: {}>", keys.join(", ")),
+            ],
         }
     }
 }
@@ -185,6 +203,12 @@ impl OpsCommand {
                 CmdArg::PrivateJsonValuesFile(values) => {
                     let guard = SecretValuesFileGuard::write_document(&values.0)?;
                     new_args.push(plain("-f"));
+                    new_args.push(plain(guard.path.to_string_lossy().into_owned()));
+                    guards.push(guard);
+                }
+                CmdArg::SecretPatchFile { document, .. } => {
+                    let guard = SecretValuesFileGuard::write_document(document)?;
+                    new_args.push(plain("--patch-file"));
                     new_args.push(plain(guard.path.to_string_lossy().into_owned()));
                     guards.push(guard);
                 }
@@ -446,6 +470,10 @@ pub(crate) fn secret_set(key: &str, value: &str) -> CmdArg {
         key: key.to_string(),
         value: value.to_string(),
     }
+}
+
+pub(crate) fn secret_patch_file(keys: Vec<String>, document: serde_json::Value) -> CmdArg {
+    CmdArg::SecretPatchFile { keys, document }
 }
 
 /// Mask a secret for display. Values of eight characters or fewer are fully

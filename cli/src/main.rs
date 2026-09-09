@@ -11,6 +11,7 @@ use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use curie::api;
 use curie::artifacts;
+use curie::channel_token as crate_channel_token;
 use curie::commands::{
     self, AgentActionOpts, DeployEnv, DeployOpts, SendType, StartOpts, DEFAULT_PORT,
 };
@@ -2589,6 +2590,34 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Mint or inspect the mail adapter's channel token
+    /// (`POST /channels/token`).
+    ///
+    /// Writes the Secret the adapter actually reads (chart Secret or
+    /// `mailAdapter.channelTokenExistingSecret`), rolls the adapter, prints
+    /// `exp`, and never prints the token. `--show-exp` is read-only.
+    ChannelToken {
+        /// Agent name or id that owns the binding.
+        agent: String,
+        /// Channel kind to mint for (e.g. email). Required unless --show-exp.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Channel address to mint for (e.g. the inbox). Required unless --show-exp.
+        #[arg(long)]
+        address: Option<String>,
+        /// Token lifetime: 7d, 24h, 60m, or seconds. Default 7d; at most 7 days.
+        #[arg(long, default_value = crate_channel_token::DEFAULT_TTL)]
+        ttl: String,
+        /// Print the installed token's exp and whether the platform still
+        /// accepts it. Read-only: no mint, no write.
+        #[arg(long)]
+        show_exp: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Set an agent's budget via the platform API (`PUT /agents/{id}/budget`).
     Budget {
         /// Agent name or id.
@@ -4524,6 +4553,36 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         change,
                     )
+                    .await?,
+                )
+            }
+            ClusterAction::ChannelToken {
+                agent,
+                kind,
+                address,
+                ttl,
+                show_exp,
+                conn,
+                dry_run,
+            } => {
+                let namespace = conn.namespace.clone();
+                let release = conn.release.clone();
+                let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+                emit(
+                    crate_channel_token::channel_token(crate_channel_token::ChannelTokenOpts {
+                        common: CommonOpts {
+                            namespace,
+                            release,
+                            dry_run,
+                        },
+                        api_url,
+                        api_key,
+                        agent,
+                        kind,
+                        address,
+                        ttl,
+                        show_exp,
+                    })
                     .await?,
                 )
             }

@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 46 outputs behind one trait
+impls: 47 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 46 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 47 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -65,7 +65,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-46 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+47 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -98,7 +98,8 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   and cluster tiers resolve their own `Endpoint` values and return *the same* output
   type, so tier parity is structural rather than two hand-aligned printers. That
   module is a deliberate leaf and never bypasses `CliOutput`.
-- **One output each** in `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
+- **One output each** in `cli/src/channel_token.rs` (`ChannelTokenOutput`),
+  `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
   (`DoctorOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
   (`GuideOutput`), `cli/src/migrate_store.rs` (`MigrateStoreOutput`),
   `cli/src/seal.rs` (`SealOutput`), and `cli/src/secrets.rs` (`SecretsListOutput`).
@@ -120,9 +121,9 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   syntactic call-site inventory, not a type-level proof that *every* verb returns
   a `CliOutput`.
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 46 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 47 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
-  CliOutput`, and per-family output validation — all 46 are validated against real
+  CliOutput`, and per-family output validation — all 47 are validated against real
   `to_json()` output across 76 tests in `cli/tests/json_contract.rs`. Those tests
   drive each output type's `to_json()` once per output variant rather than calling
   the pure builder functions behind it, so a variant whose `to_json()` arm drifts

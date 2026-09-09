@@ -8,6 +8,7 @@ pub mod api;
 pub mod artifacts;
 pub mod bundle;
 pub mod channel;
+pub mod channel_token;
 pub mod chat;
 pub mod cluster_secrets;
 pub mod commands;
