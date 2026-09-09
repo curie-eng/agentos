@@ -204,6 +204,13 @@ class SubstrateConfig:
     poll_backoff_factor: float = 2.0
     key_prefix: str = "curie:sandbox"
     claim_prefix: str = "curie-thread"
+    # How long ``release(..., wait_gone=True)`` waits for the deleted claim AND
+    # its sandbox/pod to disappear. Kubernetes delete of a SandboxClaim returns
+    # while the object (and its pod) still exist; ResourceQuota charges the pod,
+    # so a claim-only wait is not enough (#2259). Operator reset-thread keeps
+    # the default False and is still bounded by the kernel's 5s release cap;
+    # the eval plane waits because a following cluster message has only 45s.
+    release_gone_timeout_seconds: float = 30.0
 
     def claim_name_for(self, thread_key: str, nonce: str) -> str:
         """A DNS-safe, per-generation claim name for a thread.
