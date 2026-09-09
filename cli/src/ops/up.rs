@@ -168,7 +168,6 @@ const GITHUB_APP_MANAGED_KEYS: &[&str] = &[
     "api.githubAppExistingSecret",
     "api.githubAppExistingSecretKey",
     "api.githubCloneBase",
-    "api.githubCloneBase",
 ];
 
 const REQUIRED_SECRETS: &[(&str, usize)] = &[
@@ -1273,8 +1272,6 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
         || MODEL_CREDENTIAL_REFERENCE_KEYS.contains(&key)
         || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
-        || key == GITHUB_TOKEN_KEY
-        || key == MODEL_CREDENTIAL_KEY
         || key == GVISOR_MODE_KEY
         || key == SLACK_TRUSTED_ORIGINS_KEY
 }
@@ -2006,8 +2003,6 @@ fn overlay_overridden_keys(
         .chain(crate::sealing::SEALING_MANAGED_KEYS)
         .chain(MODEL_CREDENTIAL_REFERENCE_KEYS)
         .chain(GITHUB_TOKEN_REFERENCE_KEYS)
-        .chain(std::iter::once(&GITHUB_TOKEN_KEY))
-        .chain(std::iter::once(&MODEL_CREDENTIAL_KEY))
     {
         overridden.insert((*key).to_string());
     }
@@ -4832,16 +4827,18 @@ mod tests {
                 .map(String::as_str),
             Some("120")
         );
+        let secret = |key: &str| {
+            opts.secrets
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
         assert_eq!(
-            effective
-                .get("dispatcher.slack.botTokenExistingSecret")
-                .map(String::as_str),
+            secret("dispatcher.slack.botTokenExistingSecret"),
             Some("acme-slack")
         );
         assert_eq!(
-            effective
-                .get("dispatcher.slack.botTokenExistingSecretKey")
-                .map(String::as_str),
+            secret("dispatcher.slack.botTokenExistingSecretKey"),
             Some("botToken")
         );
         assert!(
