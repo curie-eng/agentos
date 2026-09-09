@@ -14,6 +14,18 @@ use curie::ops::{
     parse_helm_history, rollback, select_rollback_revision, ClusterRollbackOutput, CommonOpts,
     HelmRevision, RollbackOpts,
 };
+use curie::schema_window::{live_in_window, window_for};
+
+/// Release v0.8.7 carries the same Alembic head as v0.8.6. Pin both the
+/// accepted live head and the fail-closed boundary for an unknown successor.
+#[test]
+fn v087_accepts_0039_and_refuses_an_unknown_newer_revision() {
+    let window = window_for("0.8.7").expect("0.8.7 is catalogued");
+    assert_eq!(window.schema_min, "0001");
+    assert_eq!(window.schema_head, "0039");
+    assert!(live_in_window("0039", &window));
+    assert!(!live_in_window("0040", &window));
+}
 
 fn write_exec(dir: &Path, name: &str, body: &str) {
     let path = dir.join(name);
