@@ -1886,6 +1886,20 @@ fn is_extra_env_value_key(key: &str) -> bool {
     key.contains(".extraEnv[") && (key.ends_with(".value") || key.contains(".valueFrom"))
 }
 
+/// Operator `--set` keys plus mail credential references the retained overlay
+/// already dropped. Next's live/secret overlay would otherwise re-pass a
+/// replaced `*ExistingSecret` and undo the inline replacement.
+fn overlay_overridden_keys(
+    opts: &UpOpts,
+    operator_sets: &[String],
+) -> std::collections::HashSet<String> {
+    let mut overridden = operator_set_keys(operator_sets);
+    if let Some(values) = &opts.retained_mail_values {
+        overridden.extend(values.1.keys().cloned());
+    }
+    overridden
+}
+
 /// Stamp first-class extraEnv successors and external Secret references from
 /// the migrated document. Shared by `cluster up` and `apply` so a legacy
 /// extraEnv entry is promoted even when `curie.yaml` does not mention it.
@@ -1894,7 +1908,7 @@ fn overlay_migration_results(
     values: &serde_json::Value,
     operator_sets: &[String],
 ) {
-    let overridden = operator_set_keys(operator_sets);
+    let overridden = overlay_overridden_keys(opts, operator_sets);
     for (_, helm_key) in crate::config_migrate::extra_env_successors() {
         if overridden.contains(*helm_key)
             || overridden
@@ -1916,7 +1930,7 @@ fn overlay_live_operator_values(
     values: &serde_json::Value,
     operator_sets: &[String],
 ) {
-    let overridden = operator_set_keys(operator_sets);
+    let overridden = overlay_overridden_keys(opts, operator_sets);
     overlay_json(opts, values, "", &overridden);
 }
 
@@ -4420,9 +4434,10 @@ mod tests {
             "channel-key"
         );
         let command = &up_commands(&opts)[0];
+        let shown = command.display();
         assert!(
-            !command.display().contains("channelTokenExistingSecret="),
-            "migration overlay must not resurrect the replaced external reference"
+            !shown.contains("channelTokenExistingSecret="),
+            "migration overlay must not resurrect the replaced external reference: {shown}"
         );
         assert_eq!(
             actual["worker"]["adapterCredentialsExistingSecretKey"],

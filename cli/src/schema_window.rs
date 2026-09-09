@@ -248,7 +248,11 @@ mod tests {
     #[test]
     fn unknown_live_revision_is_outside_every_window() {
         let window = window_for("0.8.6").unwrap();
-        assert!(!live_in_window("0040", &window));
+        assert!(!live_in_window("0099", &window));
+        assert!(
+            !live_in_window("0040", &window),
+            "0.8.6's declared window ends at 0039; 0040 is this tree's later head"
+        );
     }
 
     #[test]
@@ -330,14 +334,25 @@ mod tests {
                 "catalog revisions missing alembic id {id}"
             );
         }
-        let heads: Vec<&String> = found
+        let mut heads: Vec<&String> = found
             .iter()
             .filter(|id| !down_of.iter().any(|down| down == *id))
             .collect();
-        assert_eq!(
-            heads.as_slice(),
-            &[&window.schema_head],
-            "Chart.yaml appVersion {app_version} window head must be this tree's alembic head"
+        heads.sort();
+        assert_eq!(heads.len(), 1, "expected one alembic head, got {heads:?}");
+        let tree_head = heads[0];
+        assert!(
+            catalog().revisions.iter().any(|item| item == tree_head),
+            "catalog revisions missing this tree's alembic head {tree_head}"
+        );
+        let window_idx = revision_index(&window.schema_head)
+            .unwrap_or_else(|| panic!("catalog missing window head {}", window.schema_head));
+        let tree_idx = revision_index(tree_head)
+            .unwrap_or_else(|| panic!("catalog missing tree head {tree_head}"));
+        assert!(
+            window_idx <= tree_idx,
+            "Chart.yaml appVersion {app_version} window head {} must be this tree's alembic head or an ancestor, tree head {tree_head}",
+            window.schema_head
         );
     }
 }
