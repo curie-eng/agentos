@@ -553,7 +553,8 @@ Two platform-side steps come first, in this order:
    mints through `POST /channels/token` with the platform key, writes the token
    into the Secret the adapter actually reads (the chart Secret, or
    `mailAdapter.channelTokenExistingSecret` when that is set), rolls the adapter,
-   and prints `exp`. It never prints the token and never writes it through Helm
+   and prints `exp`. Each mint bumps the binding's generation, so a remint
+   revokes the previous token. It never prints the token and never writes it through Helm
    values, so `helm get values` cannot undo the rotation. `--show-exp` reports
    the installed token's `exp` and whether the platform still accepts it, the
    same observation `curie doctor` uses. The mint refuses with 409 for a
