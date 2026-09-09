@@ -2297,21 +2297,22 @@ jobs:
           helm get values curie -n curie -o json > "$RUNNER_TEMP/v084-retained-values.json"
           jq '
             (.worker.extraEnv // []) as $extra |
-            ([
-              $extra[] |
-              select(.name == "CURIE_RUNNER_TOTAL_TIMEOUT_S")
-            ]) as $timeouts |
-            if ($timeouts | length) != 1 then
+            (reduce $extra[] as $item (
+              {timeouts: [], kept: []};
+              if $item.name == "CURIE_RUNNER_TOTAL_TIMEOUT_S" then
+                .timeouts += [$item]
+              else
+                .kept += [$item]
+              end
+            )) as $partition |
+            if ($partition.timeouts | length) != 1 then
               error("expected one retained CURIE_RUNNER_TOTAL_TIMEOUT_S value")
             else
               .
             end |
-            ($timeouts[0].value | tonumber) as $timeout |
+            ($partition.timeouts[0].value | tonumber) as $timeout |
             .worker.runnerTotalTimeoutSeconds = $timeout |
-            .worker.extraEnv = [
-              $extra[] |
-              select(.name != "CURIE_RUNNER_TOTAL_TIMEOUT_S")
-            ] |
+            .worker.extraEnv = $partition.kept |
             .config.schemaVersion = "0.9.0" |
             .config.migratedFrom = "0.8.4"
           ' "$RUNNER_TEMP/v084-retained-values.json" > "$RUNNER_TEMP/v084-migrated-values.json"

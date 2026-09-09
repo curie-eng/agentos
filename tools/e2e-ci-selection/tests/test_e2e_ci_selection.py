@@ -778,9 +778,10 @@ def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> Non
         '> "$RUNNER_TEMP/v084-retained-values.json"'
     ) in upgrade_run
     assert "jq '" in upgrade_run
-    assert '($timeouts[0].value | tonumber) as $timeout' in upgrade_run
+    assert '(reduce $extra[] as $item (' in upgrade_run
+    assert '($partition.timeouts[0].value | tonumber) as $timeout' in upgrade_run
     assert '.worker.runnerTotalTimeoutSeconds = $timeout' in upgrade_run
-    assert '.worker.extraEnv = [' in upgrade_run
+    assert '.worker.extraEnv = $partition.kept' in upgrade_run
     assert '.config.schemaVersion = "0.9.0"' in upgrade_run
     assert '.config.migratedFrom = "0.8.4"' in upgrade_run
     assert (
