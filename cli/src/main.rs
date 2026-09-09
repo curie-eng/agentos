@@ -333,7 +333,11 @@ struct ClusterAgentTarget {
 /// A bundle with no `connectors.yaml` still reaches the prune: that is the case
 /// where a connector was REMOVED, and leaving it running with a credential
 /// mounted and nothing referencing it is the leak nobody notices.
-async fn sync_connectors(
+///
+/// This half only RESOLVES: it discovers the cluster binding and renders the
+/// objects, so the caller can read the owned secret names off the prepared sync
+/// (#2503) before handing it to [`apply_connectors`].
+async fn prepare_cluster_connectors(
     api_url: &str,
     api_key: &str,
     namespace: &str,
@@ -341,7 +345,7 @@ async fn sync_connectors(
     agent_id: &str,
     agent_name: &str,
     version_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<curie::connectors::PreparedConnectorSync> {
     let target = curie::connectors::bind_current_cluster(namespace, release).await?;
     let app_name = curie::connectors::discover_app_name(&target).await?;
     let connector_version = ConnectorVersion {
@@ -349,7 +353,7 @@ async fn sync_connectors(
         agent_name,
         version_id,
     };
-    let prepared = prepare_connectors(
+    prepare_connectors(
         api_url,
         api_key,
         namespace,
@@ -358,8 +362,7 @@ async fn sync_connectors(
         connector_version,
         target,
     )
-    .await?;
-    apply_connectors(prepared).await
+    .await
 }
 
 struct ConnectorVersion<'a> {
@@ -1754,7 +1757,11 @@ enum LocalAction {
         /// is resolved from your environment or the host secret vault (`curie
         /// secrets set <NAME>`) and sent to the platform, which stores it on the
         /// agent so the worker forwards it into the sandbox for a bundle's authed
-        /// MCP server. The value never appears in argv. Repeatable.
+        /// MCP server. The value never appears in argv. Repeatable. A hosted
+        /// connector's own declared `secrets:` names are bound automatically
+        /// (from the value this deploy already resolved for the connector) so
+        /// its derived Bearer header expands; this flag is for names beyond
+        /// that (#2503).
         #[arg(long = "secret", value_name = "NAME")]
         secret: Vec<String>,
     },
@@ -2790,14 +2797,39 @@ async fn resolve_compose_file(file: Option<String>, dry_run: bool) -> Result<Str
     materialize_artifact(resolved, dry_run, "compose").await
 }
 
+/// The sandbox connector-secret bind map for a cluster deploy (#2503).
+///
+/// Two sources, deliberately resolved differently:
+/// - an explicit `--secret NAME` keeps its existing semantics -- env first,
+///   then unscoped host storage, and a hard error when neither has it;
+/// - a hosted connector's declared name reuses the value the connector plan
+///   ALREADY resolved for this cluster scope. It is never re-resolved here: a
+///   scoped-only credential would not resolve at all, and a stale environment
+///   value would put a different credential in the sandbox than the connector
+///   pod holds. On overlap the scoped connector value therefore wins, because
+///   that is the credential the connector itself authenticates with and #1913's
+///   guarantee is one cluster, one credential.
+fn cluster_connector_bind_values(
+    explicit: &[String],
+    connector_names: &[String],
+    connector_values: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut values = curie::cluster_secrets::resolve_named_secrets(explicit)?;
+    for name in connector_names {
+        if let Some(value) = connector_values.get(name) {
+            values.insert(name.clone(), value.clone());
+        }
+    }
+    Ok(values)
+}
+
 async fn bind_cluster_connector_secrets(
     namespace: &str,
     release: &str,
     chart: Option<&str>,
     agent_name: &str,
-    secret_names: &[String],
+    secrets: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
-    let secrets = curie::cluster_secrets::resolve_named_secrets(secret_names)?;
     if secrets.is_empty() {
         return Ok(());
     }
@@ -2820,6 +2852,31 @@ async fn bind_cluster_connector_secrets(
         secrets,
     })
     .await
+}
+
+/// Bind the sandbox connector secrets for one deployed agent and then apply its
+/// prepared connector objects (#2503). The union of explicit `--secret` names
+/// and the bundle's connector-owned names is resolved against the values the
+/// connector plan already resolved for this cluster scope, bound into the
+/// per-agent Helm Secret, and only then are the connector objects applied --
+/// the one order both the single-target and `--all-targets` cluster deploy
+/// paths use.
+async fn bind_and_apply_cluster_connectors(
+    namespace: &str,
+    release: &str,
+    chart: Option<&str>,
+    agent_name: &str,
+    explicit_secrets: &[String],
+    connector_env_secret_names: &[String],
+    prepared: curie::connectors::PreparedConnectorSync,
+) -> Result<()> {
+    let bind_values = cluster_connector_bind_values(
+        explicit_secrets,
+        connector_env_secret_names,
+        prepared.owned_secret_values(),
+    )?;
+    bind_cluster_connector_secrets(namespace, release, chart, agent_name, bind_values).await?;
+    apply_connectors(prepared).await
 }
 
 async fn materialize_artifact(
@@ -4301,6 +4358,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // The list comes from the API, not a Rust YAML parse: ADR-0089
                 // keeps exactly one parser for this file, and a second could
                 // disagree with it about where a deploy lands.
+                // The env-var secrets this bundle's hosted connectors declare
+                // (#2503). Read once here, from the same connectors.yaml the
+                // deploy packs, so both cluster paths bind the sandbox with the
+                // names whose `${NAME}` the derived Bearer header expands.
+                let connector_env_secret_names = curie::connector_build::hosted_env_secret_names(
+                    &curie::connector_build::load(&plugin_dir)?,
+                );
+
                 let targets: Vec<Option<String>> = if all_targets {
                     let path = plugin_dir.join("deploy.yaml");
                     let content = std::fs::read_to_string(&path).map_err(|err| {
@@ -4449,27 +4514,23 @@ async fn run(command: Option<Command>) -> Result<()> {
                             }
                         };
 
-                        if !secret.is_empty() {
-                            if let Err(err) = bind_cluster_connector_secrets(
-                                &namespace,
-                                &release,
-                                chart.as_deref(),
-                                &deployed.agent_name,
-                                &secret,
-                            )
-                            .await
-                            {
-                                let payload = commands::all_targets_deploy_failure_json(
-                                    &target,
-                                    &completed,
-                                    Some(&deployed),
-                                    &err,
-                                );
-                                return Err(curie::exit::with_json_payload(err, payload));
-                            }
-                        }
-
-                        if let Err(err) = apply_connectors(prepared_connectors).await {
+                        // #2503: bind the connector's own declared secret
+                        // names alongside the explicit `--secret` set, with the
+                        // cluster-scoped values this plan already resolved
+                        // (#1913), so a hosted connector's derived Bearer header
+                        // expands in the sandbox. Binding precedes the apply that
+                        // consumes `prepared_connectors`.
+                        if let Err(err) = bind_and_apply_cluster_connectors(
+                            &namespace,
+                            &release,
+                            chart.as_deref(),
+                            &deployed.agent_name,
+                            &secret,
+                            &connector_env_secret_names,
+                            prepared_connectors,
+                        )
+                        .await
+                        {
                             let payload = commands::all_targets_deploy_failure_json(
                                 &target,
                                 &completed,
@@ -4478,6 +4539,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             );
                             return Err(curie::exit::with_json_payload(err, payload));
                         }
+
                         completed.push(commands::AllTargetsDeployResult {
                             target,
                             result: deployed,
@@ -4507,24 +4569,17 @@ async fn run(command: Option<Command>) -> Result<()> {
                     })
                     .await?;
 
-                    if !secret.is_empty() {
-                        bind_cluster_connector_secrets(
-                            &namespace,
-                            &release,
-                            chart.as_deref(),
-                            &deployed.agent_name,
-                            &secret,
-                        )
-                        .await?;
-                    }
-
                     // Stand up whatever the bundle's connectors.yaml declares
                     // (ADR-0086, #1063). After the deploy, so the objects exist
                     // before the next turn reaches for them; the credentials here
                     // are the CONNECTOR's, resolved locally and written straight to
                     // a K8s Secret, which is a different path from the sandbox
-                    // secret delivery #440 tracks.
-                    sync_connectors(
+                    // secret delivery #440 tracks. The connector's own declared
+                    // secret NAMES are bound into the sandbox too (#2503),
+                    // unioned with the explicit `--secret` set, so a hosted
+                    // connector's derived Bearer header expands in the sandbox.
+                    // Resolved before binding, applied after it.
+                    let prepared_connectors = prepare_cluster_connectors(
                         &api_url,
                         &api_key,
                         &namespace,
@@ -4532,6 +4587,17 @@ async fn run(command: Option<Command>) -> Result<()> {
                         &deployed.agent_id,
                         &deployed.agent_name,
                         &deployed.version_id,
+                    )
+                    .await?;
+
+                    bind_and_apply_cluster_connectors(
+                        &namespace,
+                        &release,
+                        chart.as_deref(),
+                        &deployed.agent_name,
+                        &secret,
+                        &connector_env_secret_names,
+                        prepared_connectors,
                     )
                     .await?;
                     emit(deployed)
@@ -5044,6 +5110,91 @@ mod tests {
     #[test]
     fn clap_surface_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// Serializes the `cluster_connector_bind_values` cases that mutate the
+    /// process environment, for the same reason and with the same limits as
+    /// `GITHUB_TOKEN_ENV_LOCK` below: `set_var` is not thread-safe against a
+    /// concurrent `getenv` from a test that does not take this lock. The
+    /// precedent in this crate is `cli/src/slack.rs`.
+    static BIND_VALUES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn bind_values_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        BIND_VALUES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn bind_values_binds_a_connector_secret_with_no_explicit_flag() {
+        // #2503: with zero `--secret` flags the connector's own declared name
+        // still reaches the sandbox bind map, carrying the value the connector
+        // plan already resolved for THIS cluster scope (#1913). No `--secret`
+        // means `resolve_named_secrets` iterates nothing, so neither the
+        // environment nor the host vault is consulted at all.
+        let values = super::cluster_connector_bind_values(
+            &[],
+            &["GH".to_string()],
+            &std::collections::BTreeMap::from([("GH".to_string(), "scoped".to_string())]),
+        )
+        .expect("an owned connector value needs no local resolution");
+        assert_eq!(
+            values,
+            std::collections::BTreeMap::from([("GH".to_string(), "scoped".to_string())])
+        );
+    }
+
+    #[test]
+    fn bind_values_prefers_the_scoped_connector_value_over_the_environment() {
+        // The overlap case: the operator also passed `--secret GH` and the
+        // environment holds a DIFFERENT credential. The connector pod
+        // authenticates with the cluster-scoped value, so the sandbox must get
+        // that one -- #1913 is one cluster, one credential, and a split would
+        // 401 exactly the derived Bearer header #2503 exists to make work.
+        let _guard = bind_values_env_lock();
+        let previous = std::env::var("CURIE_TEST_BIND_GH").ok();
+        std::env::set_var("CURIE_TEST_BIND_GH", "env-sentinel");
+
+        let values = super::cluster_connector_bind_values(
+            &["CURIE_TEST_BIND_GH".to_string()],
+            &["CURIE_TEST_BIND_GH".to_string()],
+            &std::collections::BTreeMap::from([(
+                "CURIE_TEST_BIND_GH".to_string(),
+                "scoped-sentinel".to_string(),
+            )]),
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("CURIE_TEST_BIND_GH", value),
+            None => std::env::remove_var("CURIE_TEST_BIND_GH"),
+        }
+
+        let values = values.expect("an env-resolvable --secret must not error");
+        assert_eq!(
+            values.get("CURIE_TEST_BIND_GH").map(String::as_str),
+            Some("scoped-sentinel"),
+            "the connector-scoped value must win over the environment value"
+        );
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn bind_values_with_nothing_to_bind_is_empty() {
+        // Baseline: no `--secret` and no connector-owned values binds nothing,
+        // preserving the pre-#2503 behavior for an ordinary bundle.
+        let values =
+            super::cluster_connector_bind_values(&[], &[], &std::collections::BTreeMap::new())
+                .expect("nothing to resolve");
+        assert!(values.is_empty());
+        // A declared connector name with no resolved value adds nothing
+        // either: the bind map never invents a value for a name.
+        let values = super::cluster_connector_bind_values(
+            &[],
+            &["GH".to_string()],
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("nothing to resolve");
+        assert!(values.is_empty());
     }
 
     #[test]

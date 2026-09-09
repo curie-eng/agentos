@@ -79,7 +79,13 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `name` / `from_secret` / `key`) and `secret_files` is by NAME only; neither form
   carries a value. Intake refuses any `sealed_secrets` declaration with
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
-  [sealed-credential](../sealed-credential/INTERFACE.md)). Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
+  [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
+  with `secrets:` declared, the rendered `.mcp.json` entry derives
+  `headers.Authorization: Bearer ${<first declared secret>}` -- the author still writes no `headers:`
+  on a hosted connector (`connectors.hosted_has_headers`) -- and `cluster deploy` binds that secret
+  name into the sandbox alongside any explicit `--secret` so the placeholder expands (#2503; a
+  `SecretRef` value does not reach the sandbox under ADR-0090, and the `url` fallback used by tiers
+  below cluster derives no header, both tracked as follow-ups). Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,
