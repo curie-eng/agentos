@@ -215,8 +215,18 @@ curie cluster message "Is any pod crashlooping right now?"
    curie build --plugin-dir examples/sre-bot --registry <registry-reference>
    ```
 
-   Do not continue until those prerequisites and the build succeed. Connector
-   bring up cannot complete, and no connector container starts, without them.
+   Bind `sre-approvals` before the next step. The bundle already declares that
+   route, and deploy is refused (`422` / `approval_routes.unbound`) until it is
+   bound:
+
+   ```bash
+   curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+   curie cluster approvals sre-bot --list-routes
+   ```
+
+   Do not continue until those prerequisites, the build, and the route binding
+   succeed. Connector bring up cannot complete, and no connector container
+   starts, without them. The deploy itself is refused until the route is bound.
 
 5. **Deploy the bundle.** This provisions the secrets from the earlier steps
    into the namespace; nothing else does.

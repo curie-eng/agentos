@@ -183,8 +183,8 @@ membership; two-person separation requires a distinct policy.
 The connector source declaration and the exact
 `mcp__k8s-write__restart_deployment` gate already ship together. There is no
 connector block to uncomment and no gate snippet to add. The remaining work is
-to scope the identity and allowlist, store the separate credential, then build
-and deploy from the declaration.
+to scope the identity and allowlist, store the separate credential, then build,
+bind the approval route, and deploy from the declaration.
 
 Read the four-layer table above before starting, and
 [`manifests/write-role.yaml`](manifests/write-role.yaml) before applying it.
@@ -280,30 +280,33 @@ command replaces the old manual image build and push ceremony. The exact
 approval gate is already versioned in the plugin manifest. There is no image
 line, connector uncomment, or gate edit in the bring-up path.
 
-**4. Deploy the bundle.**
-
-```bash
-curie cluster deploy --plugin-dir examples/sre-bot
-```
-
-The deploy renders only the digest from `connectors.lock.yaml`.
-
-**5. Bind the route, or the card has nowhere to post.**
+**4. Bind the route before deploy.**
 
 ```bash
 curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
 ```
 
-An unbound route fails SAFE -- it escalates to a human rather than executing --
-but you will see `approval route 'sre-approvals' is not bound for agent ...;
-escalating rather than routing the card` and no card will appear.
+The bundle already declares `sre-approvals`. A deploy whose bundle names a route
+with no entry in this agent's `approval_routes` is refused (`422`, or a rejected
+push with code `approval_routes.unbound`). Bind first; a bound route no bundle
+has declared yet is accepted, so this write is safe on the already-installed
+agent. Request-time escalation remains the backstop if a binding is later
+removed.
 
 **Route-binding writes and `--gate` are FULL REPLACEMENTS, not additive.** A
 write using `--route-resolution`, `--route-approvers`, or `--routes-from`
 replaces the whole route map, so name every route you want on every invocation.
 Notifications are declared only in the complete `--routes-from` map. Passing one
 route to add it silently drops the others.
+
+**5. Deploy the bundle.**
+
+```bash
+curie cluster deploy --plugin-dir examples/sre-bot
+```
+
+The deploy renders only the digest from `connectors.lock.yaml`.
 
 **6. Request one restart, confirm it as an authorized principal, and verify the rollout.**
 
@@ -591,11 +594,16 @@ A timed-out turn's entry on the `curie:runs` valkey stream is reclaimed by the
 platform's bounded-delivery/dead-letter backstop -- no manual XACK or other
 stream surgery is needed.
 
-**The bot says it escalated and no approval card appeared.** The route named in
-`approvalPolicy` is not bound for that agent. Bind it with
+**Deploy returns `422`, or a push is rejected with `approval_routes.unbound`.**
+The bundle declares a route with no entry in this agent's `approval_routes`.
+Bind every route the bundle declares, then redeploy.
+
+**The bot says it escalated and no approval card appeared.** The named route is
+not bound. Since #2436 a newly declared unbound route is refused at deploy; this
+request-time escalation is the backstop for a binding removed after that check
+ran. Bind it with
 `curie cluster approvals <agent> --route-resolution <name>=<channel>` and
-confirm with `--list-routes`. This fails safe -- an unbound route escalates, it
-never executes.
+confirm with `--list-routes`. An unbound route never executes.
 
 **The write fails AFTER a human approved it.** The worst shape: the approval is
 spent, nothing rolled, and the operator's attention is gone. Both instances of
