@@ -25,6 +25,16 @@ output as `[REDACTED:home_path]`. `pytest`'s `tmp_path` lives under the
 `tempfile` root (`/tmp` on this project's Linux images and CI), which is why the
 state path is built from it rather than from a home-relative directory.
 
+**A negative control on the export path must live in the message template.**
+`_otlp_body` builds the exported body from `record.msg` with *safe* formatting
+args elided back to a bare `%s`, substituting an arg's value only when redaction
+changed it — so a secret contributes its bounded marker and nothing else dynamic
+travels. The planted records therefore carry `PLANTED_CARRIER` as literal
+template text and the credential as the lone `%s` arg. Folding the credential
+into the template too would look like a simplification and would silently stop
+exercising `_otlp_body`'s arg-redaction path; moving the carrier into an arg
+would break the OTLP negative controls by construction rather than by regression.
+
 **Removing `basicConfig` is what makes third-party coverage load-bearing.** That
 call had one accidental virtue: it gave `discord`, `uvicorn` and `httpx` a root
 handler. Delete it and configure only the `curie_discord_adapter` package logger,
@@ -543,4 +553,52 @@ def test_a_third_party_library_warning_also_leaves_as_redacted_json(tmp_path: Pa
     )
     assert REDACTION_MARKER in output, (
         f"the third-party record never passed RedactingLogFilter; output:\n{output}"
+    )
+
+
+def test_the_uvicorn_access_log_is_redacted_json_too(tmp_path: Path) -> None:
+    """uvicorn must not be allowed to steal its own access logger back.
+
+    `uvicorn.Config.load()` — the first thing `Server.serve()` does — applies
+    uvicorn's default `LOGGING_CONFIG` through `dictConfig`, which attaches a
+    plain-text stdout handler to `uvicorn.access` and sets `propagate=False` on
+    it. That detaches the access log from the `uvicorn` namespace handler
+    `main()` installs, and the access log is precisely where request paths and
+    query strings go — the payload the `url_secret_param` redaction rule exists
+    for. So bootstrapping the `uvicorn` logger is necessary and not sufficient.
+
+    The mechanism that makes it sufficient is `log_config=None` on the
+    `uvicorn.Config` built in `run()`: uvicorn then leaves logging alone and
+    `uvicorn.access` stays `handlers=[] propagate=True`, reaching the redacting
+    JSON handler like every other logger here. A future author who drops that
+    kwarg as redundant will see this test go red, and this docstring is the
+    explanation of why.
+
+    Cannot pass vacuously: the fake `serve()` really does call `config.load()`,
+    `json_records` is strict so a stolen logger's stdout line is an error naming
+    it, and the carrier is asserted present before the token is asserted absent.
+    """
+    code, output = run_driver(driver_env(tmp_path, "access_log"))
+
+    assert code == 0, f"the driver did not exit cleanly; output:\n{output}"
+    records = json_records(output)
+    access = [record for record in records if record.get("logger") == "uvicorn.access"]
+    assert access, (
+        f"no uvicorn.access record was emitted as service JSON, so uvicorn's "
+        f"LOGGING_CONFIG kept ownership of it; saw "
+        f"{sorted({str(record.get('logger')) for record in records})}"
+    )
+    for record in access:
+        assert record.get("service.name") == SERVICE_NAME, (
+            f"an access record carries no service identity: {record}"
+        )
+    assert PLANTED_CARRIER in output, (
+        f"the planted access record was never emitted, so the redaction "
+        f"assertions below would pass vacuously; output:\n{output}"
+    )
+    assert PLANTED_CHANNEL_TOKEN not in output, (
+        f"the access log wrote the planted channel token verbatim:\n{output}"
+    )
+    assert REDACTION_MARKER in output, (
+        f"the access record never passed RedactingLogFilter; output:\n{output}"
     )

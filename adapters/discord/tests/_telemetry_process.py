@@ -68,14 +68,32 @@ def _emit_planted_record(logger_name: str) -> None:
     while `_otlp_body` walks ``record.args`` against the percent-format template
     on the OTLP side. A secret pre-interpolated into the template would silently
     skip the second one and the OTLP assertions would prove less than they claim.
+
+    The carrier, conversely, MUST be part of the template. `_otlp_body` keeps
+    dynamic args out of the exported body: it substitutes an arg's rendered value
+    only when redacting it *changed* it, so a secret contributes its bounded
+    marker while a safe arg is left as the bare ``%s`` placeholder. A carrier
+    passed as an arg therefore never reaches the collector, and the OTLP negative
+    controls could not hold by construction. Concatenation, not an f-string, so
+    ``record.msg`` is literal text and the credential stays the only arg.
     """
     logging.getLogger(logger_name).info(
-        "%s: credential=%s", PLANTED_CARRIER, os.environ[PLANTED_SECRET_ENV]
+        PLANTED_CARRIER + ": credential=%s", os.environ[PLANTED_SECRET_ENV]
     )
 
 
 def _install_fake_peers(scenario: str) -> None:
     async def fake_serve(self: uvicorn.Server, *args: Any, **kwargs: Any) -> None:
+        # `Server.serve()` calls `self.config.load()` first, so this fake does
+        # too. It is not ceremony: `load()` is where uvicorn applies its own
+        # `LOGGING_CONFIG` through `dictConfig`, attaching a plain-text stdout
+        # handler to `uvicorn.access` and setting `propagate=False` on it — which
+        # detaches the access log, and therefore every request path and query
+        # string, from whatever handler `main()` installed on the `uvicorn`
+        # namespace. Skipping `load()` would make this fake a *less* faithful
+        # peer in exactly the place a real leak lives, and the suite would be
+        # green over it. Only the socket-owning part of `serve()` is omitted.
+        self.config.load()
         # Return promptly rather than immediately: `run()` gathers this with the
         # Gateway coroutine, and yielding to the loop keeps the ordering closer
         # to the real one without making any test depend on the delay.
@@ -87,6 +105,15 @@ def _install_fake_peers(scenario: str) -> None:
         if scenario == "planted_secret":
             _emit_planted_record("curie_discord_adapter.main")
             return
+        if scenario == "access_log":
+            # Emitted from the Gateway coroutine, which `run()` gathers *after*
+            # the server coroutine has already called `config.load()`, so this
+            # record is written under whatever logging state uvicorn left behind
+            # — which is the whole point of the scenario.
+            logging.getLogger("uvicorn.access").warning(
+                PLANTED_CARRIER + ": credential=%s", os.environ[PLANTED_SECRET_ENV]
+            )
+            return
         if scenario == "third_party":
             # A CHILD of `discord`, not `discord` itself. The adapter runs under
             # third-party loggers it does not own, and `main()` must hand the
@@ -96,8 +123,10 @@ def _install_fake_peers(scenario: str) -> None:
             # an implementation that configured exactly one logger by name and
             # still left `discord.client`, `discord.gateway` and the rest on
             # `lastResort`.
+            # Carrier in the template, credential as the sole arg — see
+            # `_emit_planted_record` for why `_otlp_body` forces that split.
             logging.getLogger("discord.client").warning(
-                "%s: credential=%s", PLANTED_CARRIER, os.environ[PLANTED_SECRET_ENV]
+                PLANTED_CARRIER + ": credential=%s", os.environ[PLANTED_SECRET_ENV]
             )
             return
         if scenario == "descendant":
