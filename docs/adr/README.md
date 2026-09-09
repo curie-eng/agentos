@@ -165,4 +165,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0133 | [The control agent renders screens; a human presses the buttons](0133-the-control-agent-renders-screens-a-human-presses.md) | Draft |
 | 0134 | [A hook shares one thread per partition](0134-a-hook-shares-one-thread-per-partition.md) | Draft |
 | 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Draft |
+| 0144 | [The cluster lifecycle admits before it mutates, and its pause authority is installation-scoped](0144-the-upgrade-lifecycle-admits-before-it-mutates.md) | Accepted |
 <!-- END GENERATED: adr-index -->
