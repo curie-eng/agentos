@@ -2283,23 +2283,41 @@ jobs:
             --set agentSandbox.runner.tag=0.8.4 --set agentSandbox.runner.digest=sha256:4e19b285d4161d4667145ce9ea6e3efd11c1a9e22b1f1f2f49167994515b0b88
           kubectl rollout status deploy/curie-api -n curie --timeout=600s
       - name: Upgrade the v0.8.4 release to the candidate chart
-        env:
-          CURIE_BIN: cli/target/release/curie
         run: |
           set -euo pipefail
           # Live v0.8.4 worker env has duplicate CURIE_RUNNER_TOTAL_TIMEOUT_S
           # (first-class plus retained extraEnv). Helm's 3-way strategic merge
           # then drops the name from the live Deployment even when the candidate
           # target is unique, which is the 2026-09-04 soak. Recreate that one
-          # workload so the candidate spec is applied in full. Drive the
-          # supported cluster-up path so its versioned configuration migration
-          # promotes the retained 1700-second value instead of bypassing the
-          # candidate chart's reserved-environment guard. Raise the enclosing
-          # delivery budget and grace to keep that retained operator value valid.
+          # workload so the candidate spec is applied in full. Explicitly
+          # migrate the retained document before the candidate chart evaluates
+          # its reserved environment guard. Preserve unrelated extraEnv entries
+          # while promoting the retained timeout to its first class value.
           kubectl delete deploy/curie-worker -n curie --wait=true --timeout=120s
-          "$CURIE_BIN" cluster up \
-            --chart charts/curie --namespace curie --release curie \
-            --fake-model --forward-only \
+          helm get values curie -n curie -o json > "$RUNNER_TEMP/v084-retained-values.json"
+          jq '
+            (.worker.extraEnv // []) as $extra |
+            ([
+              $extra[] |
+              select(.name == "CURIE_RUNNER_TOTAL_TIMEOUT_S")
+            ]) as $timeouts |
+            if ($timeouts | length) != 1 then
+              error("expected one retained CURIE_RUNNER_TOTAL_TIMEOUT_S value")
+            else
+              .
+            end |
+            ($timeouts[0].value | tonumber) as $timeout |
+            .worker.runnerTotalTimeoutSeconds = $timeout |
+            .worker.extraEnv = [
+              $extra[] |
+              select(.name != "CURIE_RUNNER_TOTAL_TIMEOUT_S")
+            ] |
+            .config.schemaVersion = "0.9.0" |
+            .config.migratedFrom = "0.8.4"
+          ' "$RUNNER_TEMP/v084-retained-values.json" > "$RUNNER_TEMP/v084-migrated-values.json"
+          helm upgrade curie charts/curie -n curie -f "$RUNNER_TEMP/v084-migrated-values.json" \
+            --timeout 15m \
+            --set api.migrate.forwardOnly=true \
             --set worker.deliveryBudgetSeconds=1800 \
             --set worker.terminationGracePeriodSeconds=1860 \
             --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
@@ -2308,15 +2326,15 @@ jobs:
             --set ui.image.repository=curie-ui --set ui.image.tag=upgrade-candidate --set ui.image.digest= --set ui.image.pullPolicy=Never \
             --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=upgrade-candidate --set agentSandbox.runner.digest= --set agentSandbox.runner.imagePullPolicy=Never \
             --set agentSandbox.runner.prewarm.imagePullPolicy=Never
-          helm get values curie -n curie -o json > "$RUNNER_TEMP/v084-migrated-values.json"
+          helm get values curie -n curie -o json > "$RUNNER_TEMP/v084-effective-values.json"
           jq -e '
             .worker.runnerTotalTimeoutSeconds == 1700 and
             .worker.deliveryBudgetSeconds == 1800 and
             .worker.terminationGracePeriodSeconds == 1860 and
             ([.worker.extraEnv[]? | select(.name == "CURIE_RUNNER_TOTAL_TIMEOUT_S")] | length) == 0 and
             .config.schemaVersion == "0.9.0" and
-            (.config.migratedFrom | startswith("0.8"))
-          ' "$RUNNER_TEMP/v084-migrated-values.json"
+            .config.migratedFrom == "0.8.4"
+          ' "$RUNNER_TEMP/v084-effective-values.json"
           kubectl rollout status deploy/curie-api -n curie --timeout=600s
           kubectl rollout status deploy/curie-worker -n curie --timeout=600s
       - name: Verify live-manifest parity and target-version convergence
