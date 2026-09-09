@@ -273,6 +273,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
         "CURIE_HARNESS",
+        # runner-local SDK deny list (#2429); read by the runner from its own env
+        # via extraEnv, unset keeps every tool available. Not a boot contract key.
+        "CURIE_DISALLOWED_TOOLS",
         # Delivery budget and ownership lease (ADR-0131, #1971), read from the
         # WORKER's env by WorkerConfig. Never a sandbox boot key: they govern
         # how the worker paces and reclaims its own delivery loop, not
