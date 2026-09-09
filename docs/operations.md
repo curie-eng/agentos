@@ -673,7 +673,14 @@ The PVC is PII-bearing application data: it can hold email addresses, message an
 thread identifiers, recovery text, and delivery receipts, though never the three
 credentials or a platform database credential. Back up with a storage snapshot
 that is consistent for SQLite, or stop the Deployment before copying the file.
-Restore the claim before starting the writer. An older image refuses a newer
+Restore the claim before starting the writer.
+
+A disposable synthetic restore of postgres records, immutable bundle objects,
+that SQLite delivery state, and a Valkey dump is `curie dev restore-drill`
+(#2427). It uses those existing export/restore mechanisms, requires operator
+keys and config to be supplied separately, and refuses an omitted or corrupt
+component before serving. It does not establish a recurring production backup,
+an RPO/RTO target, or Valkey stream replay. An older image refuses a newer
 schema; restore the pre-upgrade snapshot or roll forward rather than
 deleting state to force a rollback. A chart-managed PVC is deleted by Helm
 uninstall, subject to the StorageClass reclaim policy; an `existingClaim` is not

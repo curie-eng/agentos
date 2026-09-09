@@ -1060,6 +1060,22 @@ enum DevAction {
     /// #492's forgotten-context bug, `bash scripts/check-wire-tolerance.sh`).
     /// Offline, no credential.
     WireTolerance,
+    /// Bounded synthetic restore drill for #2427: back up postgres, bundles,
+    /// mail SQLite, and Valkey from a disposable compose install, restore onto
+    /// a distinct target, and refuse an omitted or corrupt component
+    /// (`bash cli/scripts/restore-drill.sh`). Not a production backup product
+    /// and not an RPO/RTO claim.
+    RestoreDrill {
+        /// Validate an existing backup directory without starting a stack.
+        #[arg(long)]
+        check_backup: Option<PathBuf>,
+        /// JSON object of separately supplied key names. Required with --check-backup.
+        #[arg(long)]
+        supplied_config: Option<PathBuf>,
+        /// Omit this required component and expect the completeness guard to refuse.
+        #[arg(long)]
+        negative: Option<String>,
+    },
     /// Set the release version across cli/Cargo.toml + Chart.yaml
     /// version/appVersion (and refresh the CLI lockfile) so a release cut can't
     /// leave the three out of sync. Does not commit or tag.
@@ -2975,6 +2991,27 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::WireTolerance => {
                 commands::dev_script("scripts/check-wire-tolerance.sh", &[]).await
+            }
+            DevAction::RestoreDrill {
+                check_backup,
+                supplied_config,
+                negative,
+            } => {
+                let mut args = Vec::new();
+                if let Some(path) = check_backup {
+                    args.push("--check-backup".to_string());
+                    args.push(path.display().to_string());
+                }
+                if let Some(path) = supplied_config {
+                    args.push("--supplied-config".to_string());
+                    args.push(path.display().to_string());
+                }
+                if let Some(component) = negative {
+                    args.push("--negative".to_string());
+                    args.push(component);
+                }
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/restore-drill.sh", &arg_refs).await
             }
             DevAction::BumpVersion { version, dry_run } => {
                 commands::bump_version(&version, dry_run).await
@@ -5470,6 +5507,40 @@ mod tests {
             cli.command,
             Some(Command::Dev {
                 action: DevAction::ChartRuntimeE2e { force: true }
+            })
+        ));
+        let cli = Cli::try_parse_from(["curie", "dev", "restore-drill"])
+            .expect("dev restore-drill should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::RestoreDrill {
+                    check_backup: None,
+                    supplied_config: None,
+                    negative: None,
+                }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "restore-drill",
+            "--check-backup",
+            "/tmp/backup",
+            "--supplied-config",
+            "/tmp/supplied.json",
+            "--negative",
+            "bundles",
+        ])
+        .expect("dev restore-drill flags should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::RestoreDrill {
+                    check_backup: Some(_),
+                    supplied_config: Some(_),
+                    negative: Some(_),
+                }
             })
         ));
     }
