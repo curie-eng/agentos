@@ -1988,10 +1988,17 @@ fn doctor_ready_tracks_the_checks() {
         serde_json::Value::Bool(true),
         "a fully wired report is ready: {json}"
     );
+    // #2496: binding is necessary but not sufficient. This install is exposed on
+    // a NodePort with polling off, and Curie never creates the GitHub webhook,
+    // so nothing observed carries a push -- `deploys_verified: true` here was a
+    // delivery promise from public exposure alone. `ready` still holds: the
+    // delivery row is deliberately `Ok` (crying wolf at a working NodePort
+    // install is what teaches operators to ignore doctor), so no check is
+    // MISSING, which is the only thing `ready` claims.
     assert_eq!(
         json["deploys_verified"],
-        serde_json::Value::Bool(true),
-        "all-bound agents mean git-push deploys were verified: {json}"
+        serde_json::Value::Bool(false),
+        "exposure without a webhook or poller is not a verified deploy path: {json}"
     );
 }
 

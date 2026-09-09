@@ -1320,10 +1320,37 @@ pub fn summary(checks: &[Check]) -> String {
                 `curie cluster message`."
             .to_string();
     }
-    if !has("clone-credential") || !has("webhook") || state("repo-binding") == Some(State::Missing)
+    if !has("clone-credential")
+        || state("webhook") == Some(State::Missing)
+        || state("repo-binding") == Some(State::Missing)
     {
         return "Answering in Slack. Git-push deploys are not wired yet -- see the \
                 missing items above."
+            .to_string();
+    }
+    // A SKIPPED delivery row is not a missing one (#2496). `!has("webhook")`
+    // used to cover both, so an install whose computed-values read failed got
+    // the same "not wired yet" verdict as one that really is unarmed -- a
+    // positive absence claim built on an observation that never happened, which
+    // is the exact conflation this check was rewritten to remove.
+    if state("webhook") == Some(State::NotApplicable) {
+        return "Answering in Slack. Whether git-push deploys are wired could not be \
+                checked -- see the Push delivery line above."
+            .to_string();
+    }
+    // The one `Ok` that must not read as wired. `ExposedUnverified` stays `Ok`
+    // on purpose (crying wolf at a working NodePort install is what taught
+    // operators to ignore this check), but Curie never creates the GitHub
+    // webhook, so exposure alone is not a delivery path and `Fully wired: ...
+    // git-push deploys` would be exactly the promise from public exposure alone
+    // that #2496 forbids. Hedged the same way the `repo-binding` skip is.
+    if checks.iter().any(|c| {
+        c.id == "webhook"
+            && c.detail
+                .contains(crate::delivery::EXPOSED_UNVERIFIED_MARKER)
+    }) {
+        return "Answering in Slack. Git-push deploys are unverified -- see the Push \
+                delivery line above."
             .to_string();
     }
     // repo-binding reads NotApplicable only when the platform API was never
@@ -1667,6 +1694,11 @@ mod tests {
                     slack_bot_token: true,
                     clone_credential: Some("github app".into()),
                     api_exposure: Some("NodePort 30799".into()),
+                    // An ARMED delivery path, not just exposure (#2496):
+                    // exposure alone now reads as unverified, since Curie never
+                    // creates the GitHub webhook. Polling is the path Curie
+                    // itself drives, so this is the shape that earns the verdict.
+                    commit_poll_interval_seconds: Some(60.0),
                     agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
                     ..laptop()
                 },
@@ -2858,6 +2890,11 @@ mod tests {
     #[test]
     fn deploys_verified_tracks_repo_binding_ok() {
         let bound = Facts {
+            // An ARMED delivery path, not just exposure (#2496): exposure
+            // alone now reads as unverified, so this fixture needs the
+            // poller too or `deploys_verified` would stay false for a
+            // reason unrelated to the repo binding this test is about.
+            commit_poll_interval_seconds: Some(60.0),
             agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
             ..wired()
         };
@@ -2867,9 +2904,15 @@ mod tests {
         };
         assert_eq!(bound_out.to_json()["deploys_verified"], json!(true));
 
+        let unread_facts = Facts {
+            // Delivery armed here too (#2496), so the `false` below is
+            // isolated to the unread repo binding, not to a missing poller.
+            commit_poll_interval_seconds: Some(60.0),
+            ..wired()
+        };
         let unread = DoctorOutput {
-            checks: evaluate(&wired()),
-            summary: summary(&evaluate(&wired())),
+            checks: evaluate(&unread_facts),
+            summary: summary(&evaluate(&unread_facts)),
         };
         assert_eq!(unread.to_json()["deploys_verified"], json!(false));
         assert_eq!(
@@ -2880,6 +2923,9 @@ mod tests {
         );
 
         let empty = Facts {
+            // Delivery armed here too (#2496), so the `false` below is
+            // isolated to the empty agent list, not to a missing poller.
+            commit_poll_interval_seconds: Some(60.0),
             agents: Some(vec![]),
             ..wired()
         };
@@ -2917,10 +2963,19 @@ mod tests {
         };
         let checks = evaluate(&f);
         assert_eq!(find(&checks, "webhook").state, State::Ok);
+        // Still `Ok` -- calling a working NodePort install broken is the
+        // cry-wolf this check refuses. But the one-line verdict no longer reads
+        // exposure as wired (#2496): Curie never creates the GitHub webhook, so
+        // `Fully wired: ... git-push deploys` off exposure alone was a delivery
+        // promise nothing had observed, contradicting this row's own detail.
+        let summary = summary(&checks);
         assert!(
-            summary(&checks).contains("Fully wired"),
-            "{}",
-            summary(&checks)
+            !summary.contains("Fully wired"),
+            "exposure alone must not read as fully wired, got {summary}"
+        );
+        assert!(
+            summary.contains("Git-push deploys are unverified"),
+            "an exposed-but-unverified install must be hedged, got {summary}"
         );
     }
 
@@ -4836,6 +4891,21 @@ pub async fn observe_delivery(o: &crate::ops::CommonOpts) -> crate::delivery::De
             };
         }
     };
+    // Before anything is judged: a document that answered but is unreadable at
+    // this key is a failed observation, not an unarmed install (#2496). Helm
+    // can answer `null` for an empty body, which `fetch_helm_values` passes
+    // through as a SUCCESSFUL read, so "the call returned Ok" is not the same
+    // question as "the interval was observed".
+    let poll = match crate::delivery::read_poll_interval(&computed) {
+        crate::delivery::PollReading::Unreadable => {
+            return crate::delivery::DeliveryFacts {
+                discovery_failure: Some(crate::delivery::UNREADABLE_INTERVAL_REASON.to_string()),
+                ..Default::default()
+            };
+        }
+        crate::delivery::PollReading::Absent => None,
+        crate::delivery::PollReading::Observed(seconds) => Some(seconds),
+    };
     // Ingress first, and only then the kubectl round-trip: a deploy pays for
     // this observation, so the probe is skipped whenever ingress already
     // answered -- the same order `cluster_facts` uses, for the same reason.
@@ -4846,11 +4916,7 @@ pub async fn observe_delivery(o: &crate::ops::CommonOpts) -> crate::delivery::De
     }
     crate::delivery::DeliveryFacts {
         exposure,
-        poll_interval_seconds: crate::delivery::parse_poll_interval(
-            computed
-                .get("api")
-                .and_then(|api| api.get("commitPollIntervalSeconds")),
-        ),
+        poll_interval_seconds: poll,
         discovery_failure: None,
     }
 }
@@ -5091,11 +5157,20 @@ async fn gather_with_worker_claims(
         f.model_release_fake = release_fake_model(&computed);
         // COMPUTED, not supplied (#1950): this key's chart default is `0`, so
         // the supplied read cannot distinguish "polling off" from "never set".
-        f.commit_poll_interval_seconds = crate::delivery::parse_poll_interval(
-            computed
-                .get("api")
-                .and_then(|api| api.get("commitPollIntervalSeconds")),
-        );
+        // Three outcomes, not two (#2496): a document that came back but is
+        // unreadable at this key is a failed OBSERVATION and joins the other
+        // discovery failures below, because "not armed" about a value nobody
+        // could read is the same conflation this check exists to remove.
+        match crate::delivery::read_poll_interval(&computed) {
+            crate::delivery::PollReading::Unreadable => {
+                f.delivery_discovery_failure =
+                    Some(crate::delivery::UNREADABLE_INTERVAL_REASON.to_string());
+            }
+            crate::delivery::PollReading::Absent => f.commit_poll_interval_seconds = None,
+            crate::delivery::PollReading::Observed(seconds) => {
+                f.commit_poll_interval_seconds = Some(seconds);
+            }
+        }
         // COMPUTED for the same #1950 reason the interval is, and now for a
         // second one (#2496): `cluster deploy`'s `observe_delivery` already
         // reads exposure off the computed values, so leaving doctor on the
@@ -5271,10 +5346,22 @@ impl crate::ui::CliOutput for DoctorOutput {
         serde_json::json!({
             "summary": self.summary,
             "ready": self.checks.iter().all(|c| c.state != State::Missing),
+            // Binding is necessary but not sufficient (#2496): a bound agent
+            // behind an exposed-but-unverified API has no observed path that
+            // carries a push, and `deploys_verified: true` there is the same
+            // delivery promise from public exposure alone that the summary line
+            // no longer makes. `ready` is deliberately left alone -- it is the
+            // "nothing is MISSING" roll-up over every check, and the delivery
+            // row stays `Ok` on purpose.
             "deploys_verified": self
                 .checks
                 .iter()
-                .any(|c| c.id == "repo-binding" && c.state == State::Ok),
+                .any(|c| c.id == "repo-binding" && c.state == State::Ok)
+                && self.checks.iter().any(|c| {
+                    c.id == "webhook"
+                        && c.state == State::Ok
+                        && !c.detail.contains(crate::delivery::EXPOSED_UNVERIFIED_MARKER)
+                }),
             "checks": self.checks,
             "guidance": guidance(&self.checks),
         })

@@ -24,7 +24,7 @@
 //!   pub fn render_optional(delivery: Option<&Delivery>) -> Option<DeliveryLine>
 //!   pub fn bind_note(repo: &str) -> String
 //!   pub fn polling_fix_suffix(targeted_up: &str) -> String
-//!   pub fn parse_poll_interval(value: Option<&serde_json::Value>) -> Option<f64>
+//!   pub fn read_poll_interval(computed: &serde_json::Value) -> PollReading
 //!
 //! plus two new `curie::doctor::Facts` fields the doctor cases below construct:
 //!
@@ -39,10 +39,10 @@
 //! cannot satisfy, so every AC-bearing assertion lives here.
 
 use curie::delivery::{
-    assess, bind_note, parse_poll_interval, polling_fix_suffix, render, render_optional, Delivery,
-    DeliveryFacts,
+    assess, bind_note, polling_fix_suffix, read_poll_interval, render, render_optional, Delivery,
+    DeliveryFacts, PollReading,
 };
-use curie::doctor::{evaluate, Check, Facts, ReleaseProbe, State};
+use curie::doctor::{evaluate, summary, Check, Facts, ReleaseProbe, State};
 
 fn facts(exposure: Option<&str>, interval: Option<f64>, failure: Option<&str>) -> DeliveryFacts {
     DeliveryFacts {
@@ -306,13 +306,22 @@ fn zero_negative_nan_and_absent_intervals_are_not_polling() {
 /// Helm records `--set-string api.commitPollIntervalSeconds="60"` as a JSON
 /// string. A number-only read would report an armed install as not armed, so
 /// both encodings must parse identically and feed the same assessment.
+///
+/// #2496 fixer: the reader now answers with three outcomes rather than
+/// `Option<f64>`. ABSENT and PRESENT-BUT-UNREADABLE were folded together, and
+/// both then rendered `NotArmed` at the call sites -- a verdict about a value
+/// nobody could read, which is this ticket's own defect one level down. The
+/// null / unparseable expectations below therefore changed from "not observed,
+/// same as absent" to `Unreadable`, which the observers turn into a discovery
+/// failure. The number/string parity and the absent case are unchanged.
 #[test]
 fn string_and_number_intervals_parse_and_assess_identically() {
-    let as_number = parse_poll_interval(Some(&serde_json::json!(60)));
-    let as_string = parse_poll_interval(Some(&serde_json::json!("60")));
+    let doc = |value: serde_json::Value| serde_json::json!({ "api": { "commitPollIntervalSeconds": value } });
+    let as_number = read_poll_interval(&doc(serde_json::json!(60)));
+    let as_string = read_poll_interval(&doc(serde_json::json!("60")));
     assert_eq!(
         as_number,
-        Some(60.0),
+        PollReading::Observed(60.0),
         "a numeric interval must parse, got {as_number:?}"
     );
     assert_eq!(
@@ -320,26 +329,57 @@ fn string_and_number_intervals_parse_and_assess_identically() {
         "--set-string records the interval as a JSON string and must parse the same \
          as a number, got {as_string:?} vs {as_number:?}"
     );
+    let PollReading::Observed(from_string) = as_string else {
+        panic!("a string-recorded interval must be observed, got {as_string:?}")
+    };
     assert_eq!(
-        assess(&facts(None, as_string, None)),
+        assess(&facts(None, Some(from_string), None)),
         Delivery::Polling { seconds: 60.0 },
         "a string-recorded interval must arm polling, not read as not-armed"
     );
 
     assert_eq!(
-        parse_poll_interval(None),
-        None,
-        "an absent key is not observed, not zero"
+        read_poll_interval(&serde_json::json!({ "api": {} })),
+        PollReading::Absent,
+        "an absent key on a readable document is the chart-default shape, not zero"
     );
     assert_eq!(
-        parse_poll_interval(Some(&serde_json::json!(serde_json::Value::Null))),
-        None,
-        "a null value is not observed"
+        read_poll_interval(&serde_json::json!({})),
+        PollReading::Absent,
+        "no api block at all is still a readable document with the key absent"
     );
+    for unreadable in [
+        serde_json::Value::Null,
+        serde_json::json!(true),
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!("not-a-number"),
+    ] {
+        let reading = read_poll_interval(&doc(unreadable.clone()));
+        assert_eq!(
+            reading,
+            PollReading::Unreadable,
+            "a present but uninterpretable value ({unreadable}) must not collapse into \
+             absent -- it becomes a discovery failure, got {reading:?}"
+        );
+    }
+    // A "successful" helm read can still hand back a document nobody can read:
+    // `fetch_helm_values` passes a null body through as `Ok(Some(null))`.
+    for not_a_document in [
+        serde_json::Value::Null,
+        serde_json::json!([]),
+        serde_json::json!(7),
+    ] {
+        assert_eq!(
+            read_poll_interval(&not_a_document),
+            PollReading::Unreadable,
+            "a computed payload that is not an object establishes nothing ({not_a_document})"
+        );
+    }
     assert_eq!(
-        parse_poll_interval(Some(&serde_json::json!("not-a-number"))),
-        None,
-        "an unparseable value must not be invented as an interval"
+        read_poll_interval(&serde_json::json!({ "api": 3 })),
+        PollReading::Unreadable,
+        "an api node that is not an object is unreadable, not an absent key"
     );
 }
 
@@ -548,6 +588,71 @@ fn webhook_check_is_skipped_not_missing_when_values_unreadable() {
         check.fix.is_none(),
         "doctor must not hand out a fix for something it could not observe, got {:?}",
         check.fix
+    );
+}
+
+/// #2496 fixer, findings 1 and 3. The check row respected all four cases; the
+/// one-line VERDICT did not. It keyed off `has("webhook")`, so a SKIPPED row
+/// (case 4, discovery failed) produced the same "not wired yet" sentence as a
+/// genuinely unarmed install, and an `Ok` row carrying the exposed-but-
+/// unverified caveat (case 3) produced `Fully wired: ... git-push deploys` --
+/// a delivery promise from public exposure alone, which is exactly what this
+/// ticket forbids. The rest of the install is wired in both fixtures, so the
+/// delivery state is the only thing moving the verdict.
+#[test]
+fn the_summary_verdict_respects_all_four_delivery_cases() {
+    let wired = || Facts {
+        model_credential: Some("CURIE_CREDENTIALS".to_string()),
+        bundle_name: Some("my-agent".to_string()),
+        docker_ok: true,
+        slack_app_token: true,
+        slack_bot_token: true,
+        clone_credential: Some("github app".to_string()),
+        agents: Some(vec![("bot".to_string(), Some("acme/bot".to_string()))]),
+        ..doctor_facts()
+    };
+
+    let skipped = summary(&evaluate(&Facts {
+        delivery_discovery_failure: Some(
+            "could not read this release's computed Helm values".to_string(),
+        ),
+        ..wired()
+    }));
+    assert!(
+        !skipped.contains("not wired yet"),
+        "a skipped delivery row is not a missing one, got {skipped}"
+    );
+    assert!(
+        skipped.contains("could not be checked"),
+        "a failed read must say it could not tell, got {skipped}"
+    );
+
+    let exposed = summary(&evaluate(&Facts {
+        api_exposure: Some("NodePort 30799".to_string()),
+        ..wired()
+    }));
+    assert!(
+        !exposed.contains("Fully wired"),
+        "exposure alone is not a delivery path and must not read as wired, got {exposed}"
+    );
+    assert!(
+        exposed.contains("unverified"),
+        "exposure alone must be hedged, got {exposed}"
+    );
+
+    let polling = summary(&evaluate(&Facts {
+        commit_poll_interval_seconds: Some(60.0),
+        ..wired()
+    }));
+    assert!(
+        polling.contains("Fully wired"),
+        "an armed poller IS a delivery path and must still read as wired, got {polling}"
+    );
+
+    let not_armed = summary(&evaluate(&wired()));
+    assert!(
+        not_armed.contains("not wired yet"),
+        "a genuinely unarmed install keeps the not-wired verdict, got {not_armed}"
     );
 }
 

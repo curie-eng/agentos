@@ -164,6 +164,13 @@ pub fn render(delivery: &Delivery) -> DeliveryLine {
 /// versus `missing` versus `skipped` depends on doctor's cry-wolf policy, and a
 /// recovery command needs a namespace and release this module has no business
 /// knowing.
+/// The clause that makes an `ExposedUnverified` row honest, named so doctor's
+/// one-line verdict can recognise that row without re-deriving the rule (#2496).
+/// `summary()` sees only `(id, state, detail)`, and this case is `Ok` for
+/// cry-wolf reasons while being the one `Ok` that must NOT read as wired --
+/// matching this constant is how those two facts stay one fact.
+pub const EXPOSED_UNVERIFIED_MARKER: &str = "not a confirmed push path";
+
 pub fn render_detail(delivery: &Delivery) -> String {
     match delivery {
         Delivery::NotArmed => "no ingress and no NodePort, and api.commitPollIntervalSeconds is \
@@ -180,8 +187,8 @@ pub fn render_detail(delivery: &Delivery) -> String {
             seconds(*s)
         ),
         Delivery::ExposedUnverified { how } => format!(
-            "{how} — Curie does not create the GitHub webhook, so this is an exposed API, not a \
-             confirmed push path"
+            "{how} — Curie does not create the GitHub webhook, so this is an exposed API, \
+             {EXPOSED_UNVERIFIED_MARKER}"
         ),
         // A skipped row states the observation failure and nothing else, so the
         // line-oriented wording is already exactly right.
@@ -209,16 +216,70 @@ pub fn bind_note(repo: &str) -> String {
 // here so its pinned test path keeps resolving.
 pub use crate::doctor::polling_fix_suffix;
 
-/// Read `api.commitPollIntervalSeconds` out of a helm values node. Helm records
-/// `--set-string api.commitPollIntervalSeconds="60"` as a JSON *string*, so a
-/// number-only read would report an armed install as not armed.
-pub fn parse_poll_interval(value: Option<&serde_json::Value>) -> Option<f64> {
-    match value? {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
-        // Null, bool, array, object: nothing was OBSERVED. Coercing any of them
-        // to 0.0 would turn an unreadable key into a "not armed" verdict, which
-        // is the conflation `discovery_failure` exists to prevent.
-        _ => None,
+/// What a read of `api.commitPollIntervalSeconds` actually established (#2496).
+///
+/// Three outcomes, not two. `Option<f64>` had only "a number" and "no number",
+/// and folding ABSENT together with PRESENT-BUT-UNREADABLE is this ticket's own
+/// defect one level down: an absent key on a readable document is the ordinary
+/// ClusterIP install the chart renders as `0`, while a null / bool / array /
+/// object / unparseable-string value is a document nobody could read. Rendering
+/// `NotArmed` for the second is a verdict about something never observed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PollReading {
+    /// The key is genuinely absent from an otherwise readable document. The
+    /// chart default is `0`, so this assesses exactly like an observed `0`.
+    Absent,
+    /// A number (or a `--set-string` numeric string) was read.
+    Observed(f64),
+    /// The document, or this key within it, could not be read. Must become a
+    /// [`DeliveryFacts::discovery_failure`], never a `NotArmed` verdict.
+    Unreadable,
+}
+
+/// Read `api.commitPollIntervalSeconds` out of a COMPUTED helm values document.
+///
+/// The whole document is the input, not the extracted node, because two of the
+/// three outcomes are properties of the document rather than of the value: a
+/// computed payload that is not an object at all (helm can answer `null` for an
+/// empty body, `ops::fetch_helm_values` passes that through as `Ok(Some(null))`,
+/// and that "successful" read establishes nothing), and an `api` node that is
+/// not an object, both of which a node-level reader would report as a plain
+/// absent key. Callers therefore cannot accidentally lose the distinction.
+///
+/// Helm records `--set-string api.commitPollIntervalSeconds="60"` as a JSON
+/// *string*, so a number-only read would report an armed install as not armed.
+pub fn read_poll_interval(computed: &serde_json::Value) -> PollReading {
+    let Some(root) = computed.as_object() else {
+        return PollReading::Unreadable;
+    };
+    let api = match root.get("api") {
+        // No `api` key at all on a readable document: nothing set it, which is
+        // the chart-default shape, not an unreadable one.
+        None | Some(serde_json::Value::Null) => return PollReading::Absent,
+        Some(api) => api,
+    };
+    let Some(api) = api.as_object() else {
+        return PollReading::Unreadable;
+    };
+    match api.get("commitPollIntervalSeconds") {
+        None => PollReading::Absent,
+        Some(serde_json::Value::Number(n)) => n
+            .as_f64()
+            .map_or(PollReading::Unreadable, PollReading::Observed),
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .parse::<f64>()
+            .map_or(PollReading::Unreadable, PollReading::Observed),
+        // Null, bool, array, object, unparseable string: the key is THERE and
+        // says something this reader cannot interpret. Coercing any of them to
+        // `0.0` -- or to a plain absence -- turns an unreadable key into a "not
+        // armed" verdict, the conflation `discovery_failure` exists to prevent.
+        Some(_) => PollReading::Unreadable,
     }
 }
+
+/// The reason string a caller records when [`read_poll_interval`] could not
+/// read the key. Stated once so both observers word the skip identically.
+pub const UNREADABLE_INTERVAL_REASON: &str =
+    "this release's computed Helm values recorded an unreadable \
+     api.commitPollIntervalSeconds";
