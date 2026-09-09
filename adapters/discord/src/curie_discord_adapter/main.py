@@ -198,12 +198,12 @@ async def run() -> None:
     adapter = DiscordAdapter(config, state)
     reply_service = DiscordReplyService(adapter, state)
     app = create_reply_app(reply_service, config.adapter_secret)
-    # serve() applies uvicorn's own LOGGING_CONFIG via dictConfig, which hands uvicorn.access
-    # a plain-text stdout handler and sets propagate=False, detaching it from the uvicorn
-    # namespace handler set up above. Access lines carry method, path and query string, exactly
-    # what url_secret_param redacts, so log_config=None skips uvicorn's config: uvicorn.access
-    # gets no handler and propagate=True, so it reaches the redacting JSON handler like every
-    # other logger here.
+    # uvicorn.Config(...)'s own constructor applies uvicorn's own LOGGING_CONFIG via dictConfig,
+    # which hands uvicorn.access a plain-text stdout handler and sets propagate=False, detaching
+    # it from the uvicorn namespace handler set up above. Access lines carry method, path and
+    # query string, exactly what url_secret_param redacts, so log_config=None skips uvicorn's
+    # config: uvicorn.access gets no handler and propagate=True, so it reaches the redacting
+    # JSON handler like every other logger here.
     server = uvicorn.Server(
         uvicorn.Config(
             app,

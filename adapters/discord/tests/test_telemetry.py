@@ -91,6 +91,15 @@ REDACTION_MARKER = "[REDACTED:channel_token]"
 # loudly rather than start passing vacuously.
 PLANTED_CARRIER = "planted telemetry probe record for the discord adapter"
 
+# Duplicated from `_telemetry_process.THIRD_PARTY_CHILD_LOGGERS` for the same
+# `sys.path` reason as the carrier above. One child per namespace listed in
+# `main._THIRD_PARTY_LOG_NAMESPACES`, except `uvicorn`, which is pinned by
+# `test_the_uvicorn_access_log_is_redacted_json_too` under a strictly harder
+# condition (uvicorn's own `dictConfig` has run by then). Its omission here is
+# deliberate, not an oversight: a second, weaker copy of that coverage would add
+# no mutation the access-log test does not already kill.
+THIRD_PARTY_CHILD_LOGGERS = ("discord.client", "httpx._client")
+
 
 def free_port() -> int:
     """A port the OS has just confirmed free, released immediately.
@@ -171,6 +180,22 @@ class OtlpReceiver:
             for resource in request.resource_logs
             for scope in resource.scope_logs
         )
+
+    def logger_names(self) -> set[str]:
+        """The logger name of every exported record.
+
+        The SDK's `LoggingHandler` calls `get_logger(record.name)`, so a record's
+        originating logger arrives as its instrumentation *scope* name. That is
+        the only place the name survives export, and reading it is what lets a
+        test say "a record from THIS logger reached the collector" rather than
+        the much weaker "some record did".
+        """
+        return {
+            scope.scope.name
+            for request in self.log_requests()
+            for resource in request.resource_logs
+            for scope in resource.scope_logs
+        }
 
     def service_names(self) -> set[str]:
         return {
@@ -274,6 +299,48 @@ def run_driver(env: dict[str, str], *, timeout: float = 60.0) -> tuple[int, str]
     return process.returncode, process.stdout
 
 
+def assert_carrier_survived_and_secret_did_not(text: str, *, where: str) -> None:
+    """The shared redaction triplet, asserted against one surface: `where`.
+
+    Three assertions, in this exact order, repeat verbatim across the tests
+    below regardless of whether `text` is the process's decoded stderr or the
+    decoded bytes a local OTLP collector received: the non-secret carrier text
+    IS present, the raw planted token is NOT present, and the
+    `[REDACTED:channel_token]` marker IS present.
+
+    The carrier assertion runs FIRST, deliberately: without it, the two secret
+    assertions that follow are satisfied just as well by output that never
+    contained the planted record at all, so a caller could not tell "redacted"
+    apart from "never emitted" — the carrier check is what keeps the negative
+    controls from passing vacuously.
+    """
+    assert PLANTED_CARRIER in text, (
+        f"the planted record was never emitted to {where}, so the redaction "
+        f"assertions below would pass vacuously"
+    )
+    assert PLANTED_CHANNEL_TOKEN not in text, (
+        f"the planted channel token survived into {where}"
+    )
+    assert REDACTION_MARKER in text, (
+        f"{where} carries no channel_token placeholder, so the record never "
+        f"passed RedactingLogFilter"
+    )
+
+
+def wait_for_export(receiver: OtlpReceiver, *, where: str) -> None:
+    """Poll until the collector has received at least one log record.
+
+    Centralizes the polling shape shared by every exporting test — only the
+    `BatchLogRecordProcessor`'s force-flush on exit ever makes a record arrive
+    at all, since its 1000 ms schedule delay outlives these short-lived
+    processes — so a dropped `telemetry.shutdown()` call on any exit path shows
+    up here as a timeout rather than as a wrong value. `where` names what this
+    call site expected to see arrive, so a timeout still identifies which path
+    is missing its flush.
+    """
+    wait_until(lambda: receiver.log_record_count() > 0, 10.0, where)
+
+
 def json_records(output: str) -> list[dict[str, object]]:
     """Every non-blank output line, parsed as a service log record.
 
@@ -320,16 +387,8 @@ def test_a_planted_secret_in_a_package_log_line_is_redacted_in_process_output(
     code, output = run_driver(driver_env(tmp_path, "planted_secret"))
 
     assert code == 0, f"the driver did not exit cleanly; output:\n{output}"
-    assert PLANTED_CARRIER in output, (
-        f"the log record carrying the planted secret was never emitted, so the "
-        f"redaction assertions below would pass vacuously; output:\n{output}"
-    )
-    assert PLANTED_CHANNEL_TOKEN not in output, (
-        f"the planted channel token survived into process output:\n{output}"
-    )
-    assert REDACTION_MARKER in output, (
-        f"the record was emitted but carries no channel_token placeholder, so it "
-        f"never passed RedactingLogFilter; output:\n{output}"
+    assert_carrier_survived_and_secret_did_not(
+        output, where=f"process output:\n{output}"
     )
 
 
@@ -357,11 +416,10 @@ def test_log_records_actually_reach_a_local_otlp_collector_redacted(
     code, output = run_driver(env)
     assert code == 0, f"the driver did not exit cleanly; output:\n{output}"
 
-    wait_until(
-        lambda: receiver.log_record_count() > 0,
-        10.0,
-        "an ExportLogsServiceRequest carrying at least one log record on /v1/logs — "
-        "none arrived, which is what a missing bootstrap or a dropped "
+    wait_for_export(
+        receiver,
+        where="an ExportLogsServiceRequest carrying at least one log record on "
+        "/v1/logs — none arrived, which is what a missing bootstrap or a dropped "
         f"telemetry.shutdown() force-flush looks like. Process output:\n{output}",
     )
 
@@ -371,19 +429,11 @@ def test_log_records_actually_reach_a_local_otlp_collector_redacted(
         f"{sorted(receiver.service_names())}"
     )
 
-    exported = receiver.all_bytes()
     # Negative control, exactly as in the stderr test: the carrier text must be
     # on the wire before "the secret is not on the wire" means anything.
-    assert PLANTED_CARRIER.encode() in exported, (
-        "the planted record reached the collector's socket in no recognizable "
-        "form, so the redaction assertion below would pass vacuously"
-    )
-    assert PLANTED_CHANNEL_TOKEN.encode() not in exported, (
-        "the planted channel token was exported verbatim to the collector"
-    )
-    assert REDACTION_MARKER.encode() in exported, (
-        "the exported body carries no channel_token placeholder, so `_otlp_body` "
-        "never saw the record"
+    exported = receiver.all_bytes()
+    assert_carrier_survived_and_secret_did_not(
+        exported.decode("utf-8", errors="replace"), where="the collector's socket"
     )
 
 
@@ -484,22 +534,16 @@ def test_telemetry_is_flushed_on_an_error_exit_too(
         f"the synthetic gateway failure was swallowed; an adapter that exits 0 on "
         f"a Gateway crash never restarts. Output:\n{output}"
     )
-    wait_until(
-        lambda: receiver.log_record_count() > 0,
-        10.0,
-        "a log record exported on the error path — none arrived, so "
+    wait_for_export(
+        receiver,
+        where="a log record exported on the error path — none arrived, so "
         f"telemetry.shutdown() did not run in main()'s finally. Output:\n{output}",
     )
 
     exported = receiver.all_bytes()
-    assert PLANTED_CARRIER.encode() in exported, (
-        "records were exported but not the planted one, so the redaction "
-        "assertion below would pass vacuously"
+    assert_carrier_survived_and_secret_did_not(
+        exported.decode("utf-8", errors="replace"), where="the error path's export"
     )
-    assert PLANTED_CHANNEL_TOKEN.encode() not in exported, (
-        "the planted channel token was exported verbatim on the error path"
-    )
-    assert REDACTION_MARKER.encode() in exported
     # The traceback Python prints for the uncaught RuntimeError is written by the
     # interpreter, outside logging, so it is not asserted to be JSON here. Its
     # message is credential-free by construction (see the driver) precisely so
@@ -509,7 +553,9 @@ def test_telemetry_is_flushed_on_an_error_exit_too(
     )
 
 
-def test_a_third_party_library_warning_also_leaves_as_redacted_json(tmp_path: Path) -> None:
+def test_a_third_party_library_warning_also_leaves_as_redacted_json(
+    tmp_path: Path, otlp: tuple[OtlpReceiver, str]
+) -> None:
     """`discord`, `uvicorn` and `httpx` records go through the same handler.
 
     The regression this catches is created by the fix itself. `basicConfig`'s one
@@ -519,40 +565,72 @@ def test_a_third_party_library_warning_also_leaves_as_redacted_json(tmp_path: Pa
     to the very stderr an operator ships to log retention. discord.py fires that
     path unprompted on every boot with its optional-voice warning.
 
-    Driven through `discord.client`, a *child* of `discord`, so what is pinned is
-    propagation coverage: an implementation that configured one logger by exact
-    name would still leave `discord.gateway`, `discord.http` and every sibling
-    uncovered, and this test fails on it.
+    Driven through a *child* of each namespace — `discord.client`, `httpx._client`
+    — so what is pinned is propagation coverage: an implementation that
+    configured one logger by exact name would still leave `discord.gateway`,
+    `discord.http` and every sibling uncovered, and this test fails on it.
+
+    One record per namespace, and one assertion per namespace, is what makes the
+    constant load-bearing entry by entry. Emitting only through `discord.client`
+    left `httpx` deletable from `_THIRD_PARTY_LOG_NAMESPACES` with the suite
+    green: httpx logs at DEBUG in practice and `logging.lastResort` fires only at
+    WARNING+, so an uncovered httpx never printed a plain-text line for
+    `json_records` to catch. `uvicorn` is not re-emitted here; it is pinned by
+    the access-log test under a harder condition, and duplicating it would add no
+    coverage.
+
+    The collector half additionally pins `logger_provider=telemetry.logger_provider`
+    in the bootstrap loop: drop it and third-party records still reach the
+    redacting JSON handler on stderr — every stderr assertion here stays green —
+    while nothing from those namespaces is ever exported. Only an OTLP assertion
+    naming those loggers kills that mutation.
 
     Cannot pass vacuously: `json_records` is strict, so a `lastResort` line is an
     error naming the escapee rather than a skipped line, and the carrier text is
-    asserted present before the raw token is asserted absent.
+    asserted present before the raw token is asserted absent, on stderr and on
+    the wire alike.
     """
-    code, output = run_driver(driver_env(tmp_path, "third_party"))
+    receiver, base_url = otlp
+    code, output = run_driver(
+        driver_env(tmp_path, "third_party", OTEL_EXPORTER_OTLP_ENDPOINT=base_url)
+    )
 
     assert code == 0, f"the driver did not exit cleanly; output:\n{output}"
     records = json_records(output)
+    emitted = {str(record.get("logger")) for record in records}
+    for logger_name in THIRD_PARTY_CHILD_LOGGERS:
+        assert logger_name in emitted, (
+            f"no record from {logger_name} was emitted as service JSON, so its "
+            f"namespace either never fired or escaped to lastResort; saw "
+            f"{sorted(emitted)}"
+        )
     third_party = [
-        record for record in records if str(record.get("logger", "")).startswith("discord")
+        record for record in records if str(record.get("logger")) in THIRD_PARTY_CHILD_LOGGERS
     ]
-    assert third_party, (
-        f"no record from a discord.py logger was emitted as service JSON, so it "
-        f"either never fired or escaped to lastResort; saw "
-        f"{sorted({str(record.get('logger')) for record in records})}"
-    )
     for record in third_party:
         assert record.get("service.name") == SERVICE_NAME, (
             f"a third-party record carries no service identity: {record}"
         )
-    assert PLANTED_CARRIER in output, (
-        f"the planted third-party record was never emitted, so the redaction "
-        f"assertions below would pass vacuously; output:\n{output}"
+    assert_carrier_survived_and_secret_did_not(
+        output, where=f"third-party process output:\n{output}"
     )
-    assert PLANTED_CHANNEL_TOKEN not in output, (
-        f"a third-party logger wrote the planted channel token verbatim:\n{output}"
+
+    wait_for_export(
+        receiver,
+        where="an exported log record from a third-party logger — none arrived, "
+        "which is what dropping logger_provider from main()'s third-party "
+        f"bootstrap loop looks like while stderr stays green. Output:\n{output}",
     )
-    assert REDACTION_MARKER in output, (
-        f"the third-party record never passed RedactingLogFilter; output:\n{output}"
+    exported_loggers = receiver.logger_names()
+    for logger_name in THIRD_PARTY_CHILD_LOGGERS:
+        assert logger_name in exported_loggers, (
+            f"{logger_name} reached stderr but never the collector, so its "
+            f"bootstrap was given no logger_provider; exported "
+            f"{sorted(exported_loggers)}"
+        )
+    exported = receiver.all_bytes()
+    assert_carrier_survived_and_secret_did_not(
+        exported.decode("utf-8", errors="replace"), where="the third-party export"
     )
 
 
@@ -592,13 +670,60 @@ def test_the_uvicorn_access_log_is_redacted_json_too(tmp_path: Path) -> None:
         assert record.get("service.name") == SERVICE_NAME, (
             f"an access record carries no service identity: {record}"
         )
-    assert PLANTED_CARRIER in output, (
-        f"the planted access record was never emitted, so the redaction "
-        f"assertions below would pass vacuously; output:\n{output}"
+    assert_carrier_survived_and_secret_did_not(
+        output, where=f"uvicorn access-log output:\n{output}"
+    )
+
+
+def test_telemetry_is_flushed_when_the_process_exits_on_a_base_exception(
+    tmp_path: Path, otlp: tuple[OtlpReceiver, str]
+) -> None:
+    """`SystemExit` is not an `Exception`, and the flush must survive it anyway.
+
+    `main()` is written as `try: asyncio.run(run()) finally: telemetry.shutdown()`,
+    which flushes on every exit. A reviewer named the mutation that today's tests
+    do not kill:
+
+        try:
+            asyncio.run(run())
+        except Exception:
+            telemetry.shutdown()
+            raise
+        telemetry.shutdown()
+
+    Normal exit still delivers, and `test_telemetry_is_flushed_on_an_error_exit_too`
+    still passes because its scenario raises `RuntimeError` — but every
+    `BaseException` exit silently stops flushing. That is not an exotic path:
+    `SystemExit` is exactly how a boot refusal and a signal-driven stop leave this
+    process, so the mutation would drop the records of the two shutdowns an
+    operator is most likely to be reading afterwards.
+
+    Both halves are load-bearing, as in the error-exit test. The exit code proves
+    the `BaseException` propagated rather than being swallowed or re-raised as
+    something else; the delivered record proves `shutdown()` ran on that path,
+    since the `BatchLogRecordProcessor`'s 1000 ms schedule delay outlives this
+    process by far and nothing arrives without the force-flush.
+    """
+    receiver, base_url = otlp
+    env = driver_env(tmp_path, "base_exception_exit", OTEL_EXPORTER_OTLP_ENDPOINT=base_url)
+
+    code, output = run_driver(env)
+
+    assert code == 3, (
+        f"the driver did not exit with the scenario's SystemExit code, so the "
+        f"BaseException was swallowed or replaced; got {code}. Output:\n{output}"
+    )
+    wait_for_export(
+        receiver,
+        where="a log record exported on the SystemExit path — none arrived, so "
+        "the flush is guarded by `except Exception` rather than `finally`. "
+        f"Output:\n{output}",
+    )
+
+    exported = receiver.all_bytes()
+    assert_carrier_survived_and_secret_did_not(
+        exported.decode("utf-8", errors="replace"), where="the SystemExit path's export"
     )
     assert PLANTED_CHANNEL_TOKEN not in output, (
-        f"the access log wrote the planted channel token verbatim:\n{output}"
-    )
-    assert REDACTION_MARKER in output, (
-        f"the access record never passed RedactingLogFilter; output:\n{output}"
+        f"the planted token leaked into process output on the SystemExit path:\n{output}"
     )

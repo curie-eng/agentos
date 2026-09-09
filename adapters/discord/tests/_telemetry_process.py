@@ -59,6 +59,19 @@ PLANTED_CARRIER = "planted telemetry probe record for the discord adapter"
 # this one on the root handler, and the `descendant` scenario would expose it.
 FUTURE_MODULE_LOGGER = "curie_discord_adapter.a_module_added_later"
 
+# One CHILD logger per namespace `main._THIRD_PARTY_LOG_NAMESPACES` claims, minus
+# `uvicorn`, which the `access_log` scenario already pins through
+# `uvicorn.access` under the harsher condition of uvicorn's own `dictConfig`
+# having run. Duplicating it here would add a weaker second copy of that
+# coverage, so its absence from this tuple is deliberate rather than forgotten.
+#
+# Children, not the namespace roots: the bootstrap is handed the roots, so
+# coverage is a claim about propagation, and an implementation that configured
+# exactly one logger by name would still leave every real library logger --
+# `discord.gateway`, `httpx._client` -- on `lastResort`. One entry per namespace
+# is what makes deleting a namespace from that constant turn a test red.
+THIRD_PARTY_CHILD_LOGGERS = ("discord.client", "httpx._client")
+
 
 def _emit_planted_record(logger_name: str) -> None:
     """Log the planted credential as a ``%s`` ARG, never baked into the template.
@@ -115,19 +128,27 @@ def _install_fake_peers(scenario: str) -> None:
             )
             return
         if scenario == "third_party":
-            # A CHILD of `discord`, not `discord` itself. The adapter runs under
-            # third-party loggers it does not own, and `main()` must hand the
-            # bootstrap the parent names — so proving coverage means proving
-            # propagation from a child, the same way the package logger covers
-            # `curie_discord_adapter.*`. Hardcoding `discord` would pass against
-            # an implementation that configured exactly one logger by name and
-            # still left `discord.client`, `discord.gateway` and the rest on
-            # `lastResort`.
+            # A CHILD of each namespace, never the namespace itself. The adapter
+            # runs under third-party loggers it does not own, and `main()` must
+            # hand the bootstrap the parent names — so proving coverage means
+            # proving propagation from a child, the same way the package logger
+            # covers `curie_discord_adapter.*`. Hardcoding `discord` would pass
+            # against an implementation that configured exactly one logger by
+            # name and still left `discord.client`, `discord.gateway` and the
+            # rest on `lastResort`.
+            #
+            # Every namespace gets its own record, at WARNING so `lastResort`
+            # would fire on an uncovered one. Emitting through only one of them
+            # is what let `httpx` be deleted from `_THIRD_PARTY_LOG_NAMESPACES`
+            # with the suite still green: httpx logs at DEBUG in practice, so a
+            # quiet boot stays all-JSON and nothing goes red.
+            #
             # Carrier in the template, credential as the sole arg — see
             # `_emit_planted_record` for why `_otlp_body` forces that split.
-            logging.getLogger("discord.client").warning(
-                PLANTED_CARRIER + ": credential=%s", os.environ[PLANTED_SECRET_ENV]
-            )
+            for logger_name in THIRD_PARTY_CHILD_LOGGERS:
+                logging.getLogger(logger_name).warning(
+                    PLANTED_CARRIER + ": credential=%s", os.environ[PLANTED_SECRET_ENV]
+                )
             return
         if scenario == "descendant":
             _emit_planted_record("curie_discord_adapter.main")
@@ -135,6 +156,24 @@ def _install_fake_peers(scenario: str) -> None:
                 "a module added after the bootstrap was written also logs"
             )
             return
+        if scenario == "base_exception_exit":
+            _emit_planted_record("curie_discord_adapter.main")
+            # `SystemExit` is a `BaseException` and NOT an `Exception`, which is
+            # the whole point: `main()` uses `try/finally`, so it flushes here
+            # too, while the reviewer's mutation
+            #
+            #     try: asyncio.run(run())
+            #     except Exception: telemetry.shutdown(); raise
+            #     telemetry.shutdown()
+            #
+            # keeps `error_exit` and the normal path green and silently stops
+            # flushing on exactly this one. A boot refusal and a signal-driven
+            # stop both leave this process as a `SystemExit`, so it is the
+            # likeliest real exit of the three. The code is a distinctive value
+            # so the test can prove the exception was not swallowed and
+            # re-raised as something else. No credential in the message, for the
+            # same reason as `error_exit` below.
+            raise SystemExit(3)
         if scenario == "error_exit":
             _emit_planted_record("curie_discord_adapter.main")
             # The message carries NO secret on purpose. Python prints an

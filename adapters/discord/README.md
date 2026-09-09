@@ -55,8 +55,11 @@ Those remain in the environment or mounted bindings file.
 `main()` calls `bootstrap_service_telemetry` on the `curie_discord_adapter`
 package logger, so every module beneath it — including ones added later —
 writes single-line JSON that has passed
-`curie_telemetry.redact.RedactingLogFilter`, and its logs, traces and metrics
-export over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The three
+`curie_telemetry.redact.RedactingLogFilter`, and those logs export over OTLP
+when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The bootstrap also installs the
+trace and metric exporters, but the adapter authors no spans and records no
+instruments yet, so those two signals carry nothing until someone
+instruments a call path. The three
 third-party namespaces the process runs under (`discord`, `uvicorn`, `httpx`)
 are bootstrapped alongside it, because they lost their handler when
 `logging.basicConfig` was removed and would otherwise print unredacted text via
