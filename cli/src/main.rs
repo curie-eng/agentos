@@ -1045,6 +1045,25 @@ enum DevAction {
     /// Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/).
     /// Refuses when a schema changed shape without a version bump.
     SchemaBaseline,
+    /// Isolated worker/runner recovery drills (#2425,
+    /// `bash cli/scripts/recovery-drill.sh`): worker death mid-turn, runner
+    /// death, a configured deadline plus follow-up, Valkey outage, and API
+    /// restart on a task-owned local or cluster install. Refuses the permanent
+    /// soak namespace/release. Checkout-only.
+    RecoveryDrill {
+        /// `local` compose stack or a task-owned `cluster` Helm install.
+        #[arg(long, default_value = "local")]
+        surface: String,
+        /// Scenario to run, or `all`.
+        #[arg(long, default_value = "all")]
+        scenario: String,
+        /// Recovery bound in seconds after a healthy worker replacement is available.
+        #[arg(long, default_value_t = 120)]
+        bound_seconds: u32,
+        /// Allow a kube context other than `k8scratch` (cluster surface only).
+        #[arg(long)]
+        force: bool,
+    },
     /// Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points
     /// at, not merely that its NetworkPolicies are applied (#1153,
     /// `bash scripts/check-netpol-enforcement.sh`). Structured as a
@@ -2989,6 +3008,29 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::ChartRuntimeE2e { force } => {
                 let args: &[&str] = if force { &["--force"] } else { &[] };
                 commands::dev_script("scripts/chart-runtime-e2e.sh", args).await
+            }
+            DevAction::RecoveryDrill {
+                surface,
+                scenario,
+                bound_seconds,
+                force,
+            } => {
+                let bound = bound_seconds.to_string();
+                let mut args: Vec<&str> = vec![
+                    "--surface",
+                    surface.as_str(),
+                    "--scenario",
+                    scenario.as_str(),
+                    "--bound-seconds",
+                    bound.as_str(),
+                ];
+                if force {
+                    args.push("--force");
+                }
+                if ui::ui().json() {
+                    args.push("--json");
+                }
+                commands::dev_script("cli/scripts/recovery-drill.sh", &args).await
             }
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
@@ -5602,6 +5644,44 @@ mod tests {
                 }
             })
         ));
+        let cli = Cli::try_parse_from(["curie", "dev", "recovery-drill"])
+            .expect("dev recovery-drill should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::RecoveryDrill { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "recovery-drill",
+            "--surface",
+            "cluster",
+            "--scenario",
+            "worker-death",
+            "--bound-seconds",
+            "120",
+            "--force",
+        ])
+        .expect("dev recovery-drill flags should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action:
+                    DevAction::RecoveryDrill {
+                        surface,
+                        scenario,
+                        bound_seconds,
+                        force,
+                    },
+            }) => {
+                assert_eq!(surface, "cluster");
+                assert_eq!(scenario, "worker-death");
+                assert_eq!(bound_seconds, 120);
+                assert!(force);
+            }
+            _ => panic!("expected recovery-drill"),
+        }
     }
 
     // Proves the `dev` verb set is closed: an unrecognized verb must fail to

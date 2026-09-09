@@ -5462,6 +5462,58 @@
           "name": "schema-baseline"
         },
         {
+          "about": "Isolated worker/runner recovery drills (#2425, `bash cli/scripts/recovery-drill.sh`): worker death mid-turn, runner death, a configured deadline plus follow-up, Valkey outage, and API restart on a task-owned local or cluster install. Refuses the permanent soak namespace/release. Checkout-only",
+          "args": [
+            {
+              "default_values": [
+                "local"
+              ],
+              "global": false,
+              "help": "`local` compose stack or a task-owned `cluster` Helm install",
+              "id": "surface",
+              "long": "surface",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "all"
+              ],
+              "global": false,
+              "help": "Scenario to run, or `all`",
+              "id": "scenario",
+              "long": "scenario",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "120"
+              ],
+              "global": false,
+              "help": "Recovery bound in seconds after a healthy worker replacement is available",
+              "id": "bound_seconds",
+              "long": "bound-seconds",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow a kube context other than `k8scratch` (cluster surface only)",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "recovery-drill"
+        },
+        {
           "about": "Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points at, not merely that its NetworkPolicies are applied (#1153, `bash scripts/check-netpol-enforcement.sh`). Structured as a non-vacuity check: it proves a DENIED direction is genuinely blocked before trusting any allowed one, so a CNI that ignores NetworkPolicy (kindnet, minikube's default) FAILS rather than passing green",
           "hidden": false,
           "name": "netpol-check"
