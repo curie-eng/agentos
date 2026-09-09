@@ -520,7 +520,7 @@ http
 {{- $exporterType := first (splitList "/" $name) -}}
 {{- if not (or (eq $exporterType "nop") (eq $exporterType "debug")) -}}
 {{- if not (kindIs "map" $config) -}}
-{{- fail (printf "otelCollector.extraExporters[%q] is a network exporter and must be a map with retry_on_failure and sending_queue settings." $name) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] is a network exporter and must be a map with retry_on_failure and a bounded queue." $name) -}}
 {{- end -}}
 {{- $headers := get $config "headers" -}}
 {{- if and $headers (not (kindIs "map" $headers)) -}}
@@ -544,6 +544,19 @@ http
 {{- end -}}
 {{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_interval" "value" (get $retry "max_interval")) -}}
 {{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_elapsed_time" "value" (get $retry "max_elapsed_time")) -}}
+{{- if eq $exporterType "prometheusremotewrite" -}}
+{{- if hasKey $config "sending_queue" -}}
+{{- fail (printf "otelCollector.extraExporters[%q] is prometheusremotewrite and must use remote_write_queue, not sending_queue. Collector 0.119 rejects sending_queue on this exporter." $name) -}}
+{{- end -}}
+{{- $queue := get $config "remote_write_queue" -}}
+{{- if not (kindIs "map" $queue) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must configure remote_write_queue with enabled: true and a finite queue_size." $name) -}}
+{{- end -}}
+{{- $queueSize := int (get $queue "queue_size") -}}
+{{- if or (ne (lower (toString (get $queue "enabled"))) "true") (le $queueSize 0) (gt $queueSize 100000) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] remote_write_queue must be enabled and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
+{{- else -}}
 {{- $queue := get $config "sending_queue" -}}
 {{- if not (kindIs "map" $queue) -}}
 {{- fail (printf "otelCollector.extraExporters[%q] must configure sending_queue with enabled: true, storage: file_storage, and a finite queue_size." $name) -}}
@@ -551,6 +564,7 @@ http
 {{- $queueSize := int (get $queue "queue_size") -}}
 {{- if or (ne (lower (toString (get $queue "enabled"))) "true") (ne (toString (get $queue "storage")) "file_storage") (le $queueSize 0) (gt $queueSize 100000) -}}
 {{- fail (printf "otelCollector.extraExporters[%q] sending_queue must be enabled, use storage: file_storage, and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

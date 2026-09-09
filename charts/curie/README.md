@@ -365,7 +365,14 @@ the traces pipeline. `extraLogPipelineExporters` and
 `extraMetricPipelineExporters` do the equivalent for the respective signal
 pipelines. Helm rejects a missing exporter or a network exporter without its
 bounded retry and persistent queue protections. The development-only `debug`
-exporter is available only when enabled.
+exporter is available only when enabled. The chart default keeps metrics on
+`nop/metrics`. The SRE-bot overlay
+(`examples/sre-bot/observability/curie-values.yaml`) appends
+`prometheusremotewrite/soak` so a Prometheus with
+`web.enable-remote-write-receiver` retains Curie series. A locally rendered
+overlay is not proof that a live Collector is exporting, and a disposable
+runtime proof is not proof the permanent soak overlay is deployed; see
+`examples/sre-bot/docs/METRICS-ROLLOUT.md`.
 
 Built-in exporter names (`otlphttp/langfuse`, `nop/logs`, `nop/metrics`, and
 `debug`) are reserved and cannot be overridden through `extraExporters`.
