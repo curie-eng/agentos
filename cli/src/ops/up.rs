@@ -7287,14 +7287,14 @@ mod tests {
 }
 
 #[derive(Debug, Clone)]
-struct NamespaceRecord {
+pub(crate) struct NamespaceRecord {
     labels: BTreeMap<String, String>,
     uid: String,
     resource_version: String,
     terminating: bool,
 }
 
-enum NamespaceProbe {
+pub(crate) enum NamespaceProbe {
     Absent,
     Present(NamespaceRecord),
 }
@@ -7380,7 +7380,7 @@ async fn discard_failed_gvisor_install_if_never_deployed(
     }
 }
 
-async fn namespace_probe(namespace: &str) -> Result<NamespaceProbe> {
+pub(crate) async fn namespace_probe(namespace: &str) -> Result<NamespaceProbe> {
     let (ok, out, err) = run_capture(&namespace_get_cmd(namespace)).await?;
     if !ok {
         bail!(
@@ -7907,8 +7907,7 @@ async fn stamp_created_controller_namespace(o: &CommonOpts, existed_before: bool
     Ok(())
 }
 
-#[allow(dead_code)]
-fn hook_jobs_cmd(o: &CommonOpts) -> OpsCommand {
+pub(crate) fn hook_jobs_cmd(o: &CommonOpts) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -7927,8 +7926,7 @@ fn hook_jobs_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-#[allow(dead_code)]
-fn hook_jobs_delete_cmd(o: &CommonOpts, names: &[String]) -> OpsCommand {
+pub(crate) fn hook_jobs_delete_cmd(o: &CommonOpts, names: &[String]) -> OpsCommand {
     let mut args = vec![plain("delete"), plain("job")];
     args.extend(names.iter().cloned().map(plain));
     args.extend([
@@ -7939,8 +7937,7 @@ fn hook_jobs_delete_cmd(o: &CommonOpts, names: &[String]) -> OpsCommand {
     OpsCommand::new("kubectl", args)
 }
 
-#[allow(dead_code)]
-fn parse_hook_job_names(output: &str, o: &CommonOpts) -> Result<Vec<String>> {
+pub(crate) fn parse_hook_job_names(output: &str, o: &CommonOpts) -> Result<Vec<String>> {
     let document: serde_json::Value =
         serde_json::from_str(output).context("parsing the Helm hook Job inventory")?;
     let items = document
@@ -8013,8 +8010,7 @@ fn parse_hook_job_names(output: &str, o: &CommonOpts) -> Result<Vec<String>> {
 /// narrows to this release's Helm-managed Jobs; the go-template then emits only
 /// objects carrying Helm's hook annotation. Kubernetes object names cannot
 /// contain shell whitespace, so the bounded `for` loop preserves each name.
-#[allow(dead_code)]
-fn hook_cleanup_resume_command(o: &CommonOpts) -> String {
+pub(crate) fn hook_cleanup_resume_command(o: &CommonOpts) -> String {
     let selector = format!(
         "app.kubernetes.io/instance={},app.kubernetes.io/managed-by=Helm",
         o.release

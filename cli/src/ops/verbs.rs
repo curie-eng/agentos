@@ -215,10 +215,18 @@ enum SweepOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOutcome {
+    Removed,
+    NoMatch,
+    Failed,
+}
+
 /// A teardown step that can remain outstanding after a fail-forward `down`.
 #[derive(Debug, PartialEq, Eq)]
 enum TeardownStep {
     HelmUninstall,
+    HookCleanup,
     NamespaceSweep,
 }
 
@@ -226,10 +234,17 @@ enum TeardownStep {
 /// `Absent` helm is done; a `Failed` helm leaves `HelmUninstall` outstanding. A
 /// `Removed` sweep is done; a `Failed` sweep leaves `NamespaceSweep`
 /// outstanding. Order matches `down_commands` (helm before sweep).
-fn outstanding_steps(helm: HelmOutcome, sweep: SweepOutcome) -> Vec<TeardownStep> {
+fn outstanding_steps(
+    helm: HelmOutcome,
+    hooks: HookOutcome,
+    sweep: SweepOutcome,
+) -> Vec<TeardownStep> {
     let mut out = Vec::new();
     if matches!(helm, HelmOutcome::Failed) {
         out.push(TeardownStep::HelmUninstall);
+    }
+    if matches!(hooks, HookOutcome::Failed) {
+        out.push(TeardownStep::HookCleanup);
     }
     if matches!(sweep, SweepOutcome::Failed) {
         out.push(TeardownStep::NamespaceSweep);
@@ -271,16 +286,15 @@ fn resume_command(remaining: &[TeardownStep], o: &CommonOpts) -> String {
     // Helm before sweep, matching `down_commands` execution order.
     steps.sort_by_key(|step| match step {
         TeardownStep::HelmUninstall => 0,
-        TeardownStep::NamespaceSweep => 1,
+        TeardownStep::HookCleanup => 1,
+        TeardownStep::NamespaceSweep => 2,
     });
     let lines: Vec<String> = steps
         .iter()
-        .map(|step| {
-            let idx = match step {
-                TeardownStep::HelmUninstall => 0,
-                TeardownStep::NamespaceSweep => 1,
-            };
-            cmds[idx].display()
+        .map(|step| match step {
+            TeardownStep::HelmUninstall => cmds[0].display(),
+            TeardownStep::HookCleanup => hook_cleanup_resume_command(o),
+            TeardownStep::NamespaceSweep => cmds[1].display(),
         })
         .collect();
     match lines.as_slice() {
@@ -289,9 +303,25 @@ fn resume_command(remaining: &[TeardownStep], o: &CommonOpts) -> String {
         [first, second] => {
             format!("{first}; s1=$?; {second}; s2=$?; [ \"$s1\" -eq 0 ] && [ \"$s2\" -eq 0 ]")
         }
-        // `remaining` only ever holds HelmUninstall and/or NamespaceSweep, so a
-        // third element is unreachable; stay defensive rather than panic.
-        _ => lines.join("; "),
+        _ => {
+            let mut command = String::new();
+            for (index, line) in lines.iter().enumerate() {
+                let number = index + 1;
+                if !command.is_empty() {
+                    command.push_str("; ");
+                }
+                command.push_str(line);
+                command.push_str(&format!("; s{number}=$?"));
+            }
+            command.push_str("; ");
+            command.push_str(
+                &(1..=lines.len())
+                    .map(|number| format!("[ \"$s{number}\" -eq 0 ]"))
+                    .collect::<Vec<_>>()
+                    .join(" && "),
+            );
+            command
+        }
     }
 }
 
@@ -422,12 +452,14 @@ pub(crate) fn failure_reason(stderr: &str) -> &str {
 /// nothing was actually deleted.
 fn teardown_result(
     helm: HelmOutcome,
+    hooks: HookOutcome,
     sweep: SweepOutcome,
     helm_err: &str,
+    hook_err: &str,
     sweep_err: &str,
     o: &CommonOpts,
 ) -> anyhow::Result<ClusterDownOutput> {
-    let remaining = outstanding_steps(helm, sweep);
+    let remaining = outstanding_steps(helm, hooks, sweep);
     if remaining.is_empty() {
         return Ok(ClusterDownOutput::Down {
             release_was_absent: matches!(helm, HelmOutcome::Absent),
@@ -439,9 +471,10 @@ fn teardown_result(
     // a non-failed step never blocks retryability, a permanent failed step always
     // does.
     let helm_retryable = !matches!(helm, HelmOutcome::Failed) || is_connectivity_failure(helm_err);
+    let hook_retryable = !matches!(hooks, HookOutcome::Failed) || is_connectivity_failure(hook_err);
     let sweep_retryable =
         !matches!(sweep, SweepOutcome::Failed) || is_connectivity_failure(sweep_err);
-    let transient = helm_retryable && sweep_retryable;
+    let transient = helm_retryable && hook_retryable && sweep_retryable;
 
     // The one-line reason drawn from the failed step that DETERMINES the class,
     // composed into the message so the human Display (P1) names WHY teardown
@@ -452,21 +485,31 @@ fn teardown_result(
     let reason = if transient {
         if matches!(helm, HelmOutcome::Failed) {
             failure_reason(helm_err)
+        } else if matches!(hooks, HookOutcome::Failed) {
+            failure_reason(hook_err)
         } else {
             failure_reason(sweep_err)
         }
     } else if !helm_retryable {
         failure_reason(helm_err)
+    } else if !hook_retryable {
+        failure_reason(hook_err)
     } else {
         failure_reason(sweep_err)
     };
 
-    let message = if matches!(sweep, SweepOutcome::Removed) {
+    let message = if matches!(helm, HelmOutcome::Failed)
+        && !matches!(hooks, HookOutcome::Failed)
+        && matches!(sweep, SweepOutcome::Removed)
+    {
         // Sweep succeeded (compute stopped); only the stale helm record remains.
         format!(
             "helm uninstall failed ({reason}) but the run-created namespaces were swept; the release record remains. Resume with: {cmd}"
         )
-    } else if matches!(sweep, SweepOutcome::NoMatch) {
+    } else if matches!(helm, HelmOutcome::Failed)
+        && !matches!(hooks, HookOutcome::Failed)
+        && matches!(sweep, SweepOutcome::NoMatch)
+    {
         // #768: the sweep's label selector matched nothing -- this release never
         // created (or was installed into a pre-existing) namespace, so nothing
         // was actually removed. This is NOT the swept case above: do not claim
@@ -559,20 +602,33 @@ pub(super) fn ns_common(opts: &CommonOpts, ns: &str, dry_run: bool) -> CommonOpt
 }
 
 /// `kubectl get namespace <ns>`: the pre-existence probe `up` runs before the
-/// install so it stamps ownership only on namespaces it creates.
+/// install so it stamps ownership only on namespaces it creates. `--ignore-not-found`
+/// plus JSON output lets a missing namespace be Absent instead of a hard error.
 pub(crate) fn namespace_get_cmd(namespace: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
-        vec![plain("get"), plain("namespace"), plain(namespace)],
+        vec![
+            plain("get"),
+            plain("namespace"),
+            plain(namespace),
+            plain("--ignore-not-found"),
+            plain("-o"),
+            plain("json"),
+        ],
     )
 }
 
-/// Whether `namespace` already exists on the cluster. A nonzero `kubectl get`
-/// (typically NotFound) reads as absent, so `up` treats it as fresh and stamps
-/// it; any other transport error surfaces later on the install itself.
+/// Whether `namespace` already exists on the cluster. Empty stdout after
+/// `--ignore-not-found` is absent; a transport error is a real failure.
 pub(crate) async fn namespace_exists(namespace: &str) -> Result<bool> {
-    let (ok, _out, _err) = run_capture(&namespace_get_cmd(namespace)).await?;
-    Ok(ok)
+    let (ok, out, err) = run_capture(&namespace_get_cmd(namespace)).await?;
+    if !ok {
+        bail!(
+            "could not inspect namespace `{namespace}`: {}",
+            failure_reason(&err)
+        );
+    }
+    Ok(!out.trim().is_empty())
 }
 
 /// Parse the hostname out of a kubeconfig `cluster.server` URL
@@ -951,16 +1007,20 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     let cmds = down_commands(&opts.common);
     if opts.common.dry_run {
         return Ok(ClusterDownOutput::DryRun(crate::ui::DryRunPlan {
-            lines: cmds.iter().map(|cmd| cmd.display()).collect(),
+            lines: vec![
+                cmds[0].display(),
+                hook_cleanup_resume_command(&opts.common),
+                cmds[1].display(),
+            ],
         }));
     }
     ui.warn(&format!(
-        "this uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach), leaving any pre-existing namespaces untouched",
+        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, and shared controller namespaces are retained",
         opts.common.release, opts.common.namespace
     ));
     if !opts.yes
         && !confirm(&format!(
-            "This uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach). Continue? [y/N] ",
+            "This uninstalls release '{0}' in namespace '{1}', removes its Helm hook Jobs, and deletes only namespaces owned by the exact release/install-namespace pair; unowned or shared namespaces are retained. Continue? [y/N] ",
             opts.common.release, opts.common.namespace
         ))?
     {
@@ -978,7 +1038,10 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     let uninstall = &cmds[0];
     ui.plumbing(&format!("+ {}", uninstall.display()));
     let step = cl.step("uninstalling release");
-    let (ok, out, helm_err) = run_capture(uninstall).await?;
+    let (ok, out, helm_err) = match run_capture(uninstall).await {
+        Ok(captured) => captured,
+        Err(error) => (false, String::new(), format!("{error:#}")),
+    };
     let helm_outcome = if ok {
         step.done("removed");
         HelmOutcome::Removed
@@ -992,6 +1055,80 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     for line in out.lines().chain(helm_err.lines()) {
         ui.plumbing(line);
     }
+
+    // Failed Helm hooks may be retained even after uninstall. Remove only Jobs
+    // selected by this release's exact Helm labels and carrying `helm.sh/hook`.
+    let step = cl.step("removing Helm hook Jobs");
+    let mut hook_err = String::new();
+    let hook_outcome = match namespace_probe(&opts.common.namespace).await {
+        Ok(NamespaceProbe::Absent) => {
+            step.done("namespace absent");
+            HookOutcome::NoMatch
+        }
+        Err(error) => {
+            hook_err = format!("{error:#}");
+            step.fail("failed");
+            HookOutcome::Failed
+        }
+        Ok(NamespaceProbe::Present(_)) => {
+            let list = hook_jobs_cmd(&opts.common);
+            ui.plumbing(&format!("+ {}", list.display()));
+            match run_capture(&list).await {
+                Err(error) => {
+                    hook_err = format!("{error:#}");
+                    step.fail("failed");
+                    HookOutcome::Failed
+                }
+                Ok((false, _out, err)) => {
+                    hook_err = err;
+                    step.fail("failed");
+                    HookOutcome::Failed
+                }
+                Ok((true, out, _err)) => match parse_hook_job_names(&out, &opts.common) {
+                    Err(error) => {
+                        hook_err = format!("{error:#}");
+                        step.fail("failed");
+                        HookOutcome::Failed
+                    }
+                    Ok(names) if names.is_empty() => {
+                        step.done("no matching hooks");
+                        HookOutcome::NoMatch
+                    }
+                    Ok(names) => {
+                        let delete = hook_jobs_delete_cmd(&opts.common, &names);
+                        ui.plumbing(&format!("+ {}", delete.display()));
+                        match run_capture(&delete).await {
+                            Err(error) => {
+                                hook_err = format!("{error:#}");
+                                step.fail("failed");
+                                HookOutcome::Failed
+                            }
+                            Ok((false, out, err)) => {
+                                for line in out.lines().chain(err.lines()) {
+                                    ui.plumbing(line);
+                                }
+                                hook_err = err;
+                                step.fail("failed");
+                                HookOutcome::Failed
+                            }
+                            Ok((true, out, err)) => {
+                                for line in out.lines().chain(err.lines()) {
+                                    ui.plumbing(line);
+                                }
+                                if out.trim().is_empty() {
+                                    step.done("already absent");
+                                    HookOutcome::NoMatch
+                                } else {
+                                    step.done("removed");
+                                    HookOutcome::Removed
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    };
 
     // Namespace sweep (runtime artifacts Helm does not own). Runs
     // UNCONDITIONALLY: it is Helm-independent by design (#707) and is what
@@ -1028,8 +1165,10 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     // error whose exit class and message follow from the outcomes plus stderr.
     teardown_result(
         helm_outcome,
+        hook_outcome,
         sweep_outcome,
         &helm_err,
+        &hook_err,
         &sweep_err,
         &opts.common,
     )
@@ -4216,6 +4355,24 @@ mod tests {
 
     use crate::ops::testsupport::*;
 
+    fn complete_teardown(
+        helm: HelmOutcome,
+        sweep: SweepOutcome,
+        helm_err: &str,
+        sweep_err: &str,
+        o: &CommonOpts,
+    ) -> anyhow::Result<ClusterDownOutput> {
+        teardown_result(
+            helm,
+            HookOutcome::NoMatch,
+            sweep,
+            helm_err,
+            "",
+            sweep_err,
+            o,
+        )
+    }
+
     // #707 ownership-aware teardown. `down` deletes only the namespaces THIS
     // release created (carrying the release-scoped ownership label `up` stamped),
     // instead of the old hardcoded `curie agent-sandbox-system` literal sweep.
@@ -4474,35 +4631,59 @@ mod tests {
 
         // Happy path: helm removed, sweep clean -> nothing outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed
+            ),
             Vec::<TeardownStep>::new()
         );
         // Already-absent release, sweep clean -> still nothing outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Absent, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Absent,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed
+            ),
             Vec::<TeardownStep>::new()
         );
         // Fail-forward win: helm failed but the sweep removed the namespaces
         // (compute stopped); only the stale helm release record remains.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed
+            ),
             vec![HelmUninstall]
         );
         // Nothing could be removed; the API server is still unreachable.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::Failed),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Failed
+            ),
             vec![HelmUninstall, NamespaceSweep]
         );
         // Helm removed but the sweep failed -> only the sweep is outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::Failed),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Failed
+            ),
             vec![NamespaceSweep]
         );
         // #768: a zero-match sweep (pre-existing namespace, never labeled by
         // #707) is a completed step, same as an actual removal -- there is
         // nothing left for THIS step to do, so it must not be outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::NoMatch),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::NoMatch
+            ),
             Vec::<TeardownStep>::new()
         );
         // #768: helm failed and the sweep matched nothing -> only the helm
@@ -4510,7 +4691,11 @@ mod tests {
         // but critically it did NOT stop any compute, unlike the Removed case
         // above.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::NoMatch),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::NoMatch
+            ),
             vec![HelmUninstall]
         );
     }
@@ -4692,7 +4877,7 @@ mod tests {
     #[test]
     fn teardown_result_all_removed_is_success() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Removed, SweepOutcome::Removed, "", "", &o)
+        let res = complete_teardown(HelmOutcome::Removed, SweepOutcome::Removed, "", "", &o)
             .expect("a complete teardown is Ok");
         assert!(matches!(
             res,
@@ -4706,7 +4891,7 @@ mod tests {
     #[test]
     fn teardown_result_absent_release_is_success_absent() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Absent, SweepOutcome::Removed, "", "", &o)
+        let res = complete_teardown(HelmOutcome::Absent, SweepOutcome::Removed, "", "", &o)
             .expect("an already-absent release still completes");
         assert!(matches!(
             res,
@@ -4726,7 +4911,7 @@ mod tests {
         let helm_err =
             "Kubernetes cluster unreachable: Get \"https://h:6443/version\": net/http: TLS handshake timeout";
         let sweep_err = "Kubernetes cluster unreachable: connection refused";
-        let err = teardown_result(
+        let err = complete_teardown(
             HelmOutcome::Failed,
             SweepOutcome::Failed,
             helm_err,
@@ -4762,7 +4947,7 @@ mod tests {
     fn teardown_result_connectivity_helm_only_failed_surfaces_swept_and_helm_resume() {
         let o = common_distinct_release();
         let helm_err = "Kubernetes cluster unreachable: net/http: TLS handshake timeout";
-        let err = teardown_result(HelmOutcome::Failed, SweepOutcome::Removed, helm_err, "", &o)
+        let err = complete_teardown(HelmOutcome::Failed, SweepOutcome::Removed, helm_err, "", &o)
             .expect_err("a stale helm record is still an incomplete teardown");
 
         let (class, fix) = crate::exit::classify(&err);
@@ -4801,7 +4986,7 @@ mod tests {
     fn teardown_result_zero_match_sweep_never_claims_compute_was_removed() {
         let o = common_distinct_release();
         let helm_err = "Kubernetes cluster unreachable: net/http: TLS handshake timeout";
-        let err = teardown_result(HelmOutcome::Failed, SweepOutcome::NoMatch, helm_err, "", &o)
+        let err = complete_teardown(HelmOutcome::Failed, SweepOutcome::NoMatch, helm_err, "", &o)
             .expect_err("a stale helm record is still an incomplete teardown");
 
         let shown = err.to_string();
@@ -4841,7 +5026,7 @@ mod tests {
     #[test]
     fn teardown_result_zero_match_sweep_with_helm_removed_is_still_success() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Removed, SweepOutcome::NoMatch, "", "", &o)
+        let res = complete_teardown(HelmOutcome::Removed, SweepOutcome::NoMatch, "", "", &o)
             .expect("a zero-match sweep alongside a clean helm uninstall is a complete teardown");
         assert!(matches!(
             res,
@@ -4860,7 +5045,7 @@ mod tests {
         let o = common_distinct_release();
         let forbidden =
             "Error: query: failed to query with labels: namespaces is forbidden: User cannot list resource \"namespaces\"";
-        let err = teardown_result(
+        let err = complete_teardown(
             HelmOutcome::Failed,
             SweepOutcome::Failed,
             forbidden,
@@ -4912,7 +5097,7 @@ mod tests {
             "Error: Kubernetes cluster unreachable: Get \"https://h:6443/version\": dial tcp 10.0.0.1:6443: connect: connection refused";
         let sweep_err =
             "Error: namespaces is forbidden: User \"sa\" cannot delete resource \"namespaces\" in API group";
-        let err = teardown_result(
+        let err = complete_teardown(
             HelmOutcome::Failed,
             SweepOutcome::Failed,
             helm_err,
@@ -5008,7 +5193,7 @@ mod tests {
     fn teardown_result_helm_failure_with_multibyte_stderr_does_not_panic() {
         let o = common_distinct_release();
         let helm_err = String::from_utf8_lossy(b"abcde\xe9fghij\n").into_owned();
-        let err = teardown_result(
+        let err = complete_teardown(
             HelmOutcome::Failed,
             SweepOutcome::Removed,
             &helm_err,
