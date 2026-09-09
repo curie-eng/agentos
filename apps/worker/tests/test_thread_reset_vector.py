@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import quote
 
+from aci_protocol import QueuedTurn, ReplyHandle
 from curie_worker.consumer import THREAD_RESET_INFLIGHT_SET, THREAD_RESET_SET
+from curie_worker.kernel import _thread_key_for
 
-_VECTOR = (
-    Path(__file__).resolve().parents[3] / "tests" / "vectors" / "thread-reset-set.json"
-)
-_EXPECTED_KEYS = {"comment", "thread_reset_set", "thread_reset_inflight_set"}
+_VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "thread-reset-set.json"
+_EXPECTED_KEYS = {
+    "comment",
+    "thread_reset_set",
+    "thread_reset_inflight_set",
+    "thread_key_examples",
+}
 
 
 def test_thread_reset_keys_match_the_frozen_vector() -> None:
@@ -23,3 +29,25 @@ def test_thread_reset_keys_match_the_frozen_vector() -> None:
     )
     assert parsed["thread_reset_set"] == THREAD_RESET_SET
     assert parsed["thread_reset_inflight_set"] == THREAD_RESET_INFLIGHT_SET
+    examples = parsed["thread_key_examples"]
+    assert examples, "the vector must freeze at least one scoped thread-key example"
+    for example in examples:
+        turn = QueuedTurn(
+            event_id="EvSIM-vector",
+            conversation_id=example["conversation_id"],
+            author="U1",
+            text="ping",
+            reply_handle=ReplyHandle(
+                kind=example["kind"], channel=example["channel"], placeholder="p-1"
+            ),
+            received_at="2026-07-05T00:00:00+00:00",
+        )
+        assert _thread_key_for(turn) == example["thread_key"]
+        assert example["thread_key"] == ":".join(
+            quote(part, safe="")
+            for part in (
+                example["kind"],
+                example["channel"],
+                example["conversation_id"],
+            )
+        )

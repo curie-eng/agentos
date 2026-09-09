@@ -81,7 +81,7 @@ def _invoke_selector(
     return completed, output
 
 
-def _expected_output(*selected: str) -> str:
+def _expected_output(*selected: str, pytest_needed: bool = True) -> str:
     selected_tiers = set(selected)
     lines = [
         f"{OUTPUT_KEYS[tier]}={'true' if tier in selected_tiers else 'false'}"
@@ -89,6 +89,7 @@ def _expected_output(*selected: str) -> str:
     ]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected_tiers)
     lines.append(f"skill_local_tiers={skill_local}")
+    lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     return "\n".join(lines) + "\n"
 
 
@@ -96,10 +97,12 @@ def _assert_selection(
     tmp_path: Path,
     path: str,
     selected: tuple[str, ...],
+    *,
+    pytest_needed: bool = True,
 ) -> None:
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
-    assert output == _expected_output(*selected)
+    assert output == _expected_output(*selected, pytest_needed=pytest_needed)
 
 
 @pytest.mark.parametrize(
@@ -113,7 +116,10 @@ def _assert_selection(
         ("apps/worker/example.py", ("local", "local-release", "cluster")),
         ("otel/collector.yaml", ("local", "local-release")),
         ("cli/example.rs", BASE_TIERS),
+        ("cli/src/main.rs", BASE_TIERS),
         ("packages/example.py", BASE_TIERS),
+        ("packages/aci-protocol/src/aci_protocol/wire.py", BASE_TIERS),
+        ("packages/plugin-format/src/plugin_format/manifest.py", BASE_TIERS),
         ("pyproject.toml", BASE_TIERS),
         ("uv.lock", BASE_TIERS),
     ],
@@ -192,7 +198,40 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
     tmp_path: Path,
     path: str,
 ) -> None:
-    _assert_selection(tmp_path, path, ())
+    _assert_selection(tmp_path, path, (), pytest_needed=False)
+
+
+@pytest.mark.parametrize(
+    ("path", "pytest_needed"),
+    [
+        ("apps/ui/package.json", True),
+        ("apps/ui/pnpm-lock.yaml", True),
+        ("apps/dispatcher/src/curie_dispatcher/app.py", True),
+        ("scripts/README.md", False),
+        ("scripts/check-docs.sh", False),
+        ("scripts/check-pr-body.sh", False),
+        (".github/workflows/pr-body.yaml", False),
+        ("packages/test-support/src/curie_test_support/valkey.py", True),
+        ("examples/coder/evals/cases.json", False),
+    ],
+)
+def test_known_non_runtime_paths_select_no_e2e_tiers(
+    tmp_path: Path,
+    path: str,
+    pytest_needed: bool,
+) -> None:
+    _assert_selection(tmp_path, path, (), pytest_needed=pytest_needed)
+
+
+def test_unapproved_markdown_fallback_selects_all_base_tiers(tmp_path: Path) -> None:
+    _assert_selection(tmp_path, "UNAPPROVED.md", BASE_TIERS)
+
+
+def test_charts_curie_still_selects_cluster(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, "charts/curie/values.yaml")
+    assert completed.returncode == 0, completed.stderr
+    outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
+    assert outputs["cluster"] == "true"
 
 
 @pytest.mark.parametrize(
@@ -202,8 +241,6 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
         (".github/workflows/ci.yaml", TIERS),
         (".github/workflows/README.md", BASE_TIERS),
         (".github/action.yml", BASE_TIERS),
-        ("scripts/README.md", BASE_TIERS),
-        ("scripts/check-docs.sh", BASE_TIERS),
         ("apps/api/README.md", ("local", "local-release", "cluster")),
         ("apps/api/runtime-config.yaml", ("local", "local-release", "cluster")),
         ("packages/plugin-format/README.md", BASE_TIERS),
@@ -389,6 +426,24 @@ def test_selector_rejects_invalid_registries(
     registry.write_text(registry_text)
     completed, _output = _invoke_selector(tmp_path, "charts/example.yaml", registry=registry)
     assert completed.returncode != 0
+
+
+def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Path) -> None:
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        VALID_REGISTRY.replace("    docs: []", "    docs: []\n    charts/ci: []")
+    )
+    ignored, ignored_output = _invoke_selector(
+        tmp_path, "charts/ci/probe.sh", registry=registry
+    )
+    assert ignored.returncode == 0, ignored.stderr
+    assert ignored_output == _expected_output(pytest_needed=False)
+
+    selected, selected_output = _invoke_selector(
+        tmp_path, "charts/curie/values.yaml", registry=registry
+    )
+    assert selected.returncode == 0, selected.stderr
+    assert selected_output == _expected_output("cluster", "released-upgrade")
 
 
 AGGREGATE_EXPRESSIONS = {
@@ -651,7 +706,6 @@ def test_released_upgrade_candidate_images_opt_into_forward_only_migrations() ->
     candidate_upgrade_steps = (
         "Upgrade the legacy release to the candidate chart",
         "Upgrade a second time and preserve the generated attester",
-        "Upgrade the v0.8.4 release to the candidate chart",
         "Existing cluster rung smoke on the upgraded candidate",
     )
     for name in candidate_upgrade_steps:
@@ -659,6 +713,13 @@ def test_released_upgrade_candidate_images_opt_into_forward_only_migrations() ->
         assert "helm upgrade curie charts/curie -n curie" in run
         assert "--set api.image.tag=upgrade-candidate" in run
         assert "--set api.migrate.forwardOnly=true" in run
+
+    migrated_upgrade = named_steps[
+        "Upgrade the v0.8.4 release to the candidate chart"
+    ]["run"]
+    assert "helm upgrade curie charts/curie -n curie" in migrated_upgrade
+    assert 'api.migrate.forwardOnly=true' in migrated_upgrade
+    assert "--set api.image.tag=upgrade-candidate" in migrated_upgrade
 
 
 def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> None:
@@ -712,12 +773,41 @@ def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> Non
 
     upgrade_run = named_steps["Upgrade the v0.8.4 release to the candidate chart"]["run"]
     assert "kubectl delete deploy/curie-worker -n curie" in upgrade_run
-    assert "helm upgrade curie charts/curie -n curie" in upgrade_run
-    assert "--reset-then-reuse-values" in upgrade_run
+    assert (
+        'helm get values curie -n curie -o json '
+        '> "$RUNNER_TEMP/v084-retained-values.json"'
+    ) in upgrade_run
+    assert "jq '" in upgrade_run
+    assert '(reduce $extra[] as $item (' in upgrade_run
+    assert '($partition.timeouts[0].value | tonumber) as $timeout' in upgrade_run
+    assert '.worker.runnerTotalTimeoutSeconds = $timeout' in upgrade_run
+    assert '.worker.extraEnv = $partition.kept' in upgrade_run
+    assert '.config.schemaVersion = "0.9.0"' in upgrade_run
+    assert '.config.migratedFrom = "0.8.4"' in upgrade_run
+    assert (
+        'helm upgrade curie charts/curie -n curie '
+        '-f "$RUNNER_TEMP/v084-migrated-values.json"'
+    ) in upgrade_run
+    assert "--set api.migrate.forwardOnly=true" in upgrade_run
+    assert "--reset-then-reuse-values" not in upgrade_run
+    assert "--set worker.deliveryBudgetSeconds=1800" in upgrade_run
+    assert "--set worker.terminationGracePeriodSeconds=1860" in upgrade_run
     assert (
         "--set worker.image.repository=curie-worker "
         "--set worker.image.tag=upgrade-candidate"
     ) in upgrade_run
+    assert (
+        'helm get values curie -n curie -o json '
+        '> "$RUNNER_TEMP/v084-effective-values.json"'
+    ) in upgrade_run
+    for migration_assertion in (
+        ".worker.runnerTotalTimeoutSeconds == 1700",
+        ".worker.deliveryBudgetSeconds == 1800",
+        '.name == "CURIE_RUNNER_TOTAL_TIMEOUT_S"',
+        '.config.schemaVersion == "0.9.0"',
+        '.config.migratedFrom == "0.8.4"',
+    ):
+        assert migration_assertion in upgrade_run
 
     parity_run = named_steps[
         "Verify live-manifest parity and target-version convergence"
@@ -818,7 +908,7 @@ def _run_aggregate(
 def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
     selected, output = _invoke_selector(tmp_path, "ARCHITECTURE.md")
     assert selected.returncode == 0, selected.stderr
-    assert output == _expected_output()
+    assert output == _expected_output(pytest_needed=False)
     outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
 
     skipped = _run_aggregate(

@@ -20,6 +20,7 @@ Responsibilities layered on the translation:
 from __future__ import annotations
 
 import contextlib
+import hmac
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -39,8 +40,13 @@ from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
-from .adapter import ModelSession, PartialMessageBoundary, model_message_to_conversation
-from .approval import ApprovalGate
+from .adapter import (
+    ModelSession,
+    PartialMessageBoundary,
+    StreamedToolUseBoundary,
+    model_message_to_conversation,
+)
+from .approval import PUBLISH_TOOL_NAME, ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
     ApprovalContext,
@@ -97,6 +103,13 @@ APPROVAL_NOT_ACTED_CLASSIFICATION = "approval-not-acted"
 # substantive answer but no tool-call evidence. Rides the free-form
 # ErrorEvent.classification field like the markers above, so it is contract-safe.
 FALSE_COMPLETION_CLASSIFICATION = "false-completion"
+# The fail-closed classification for a publication call the runner observed on
+# the stream but could NOT record as a pending approval (#2294): a malformed
+# proposal, or a gate that does not carry the publication tool at all. Unlike
+# the two observe-only markers above this one is terminal -- it rides an
+# error+final pair, because a publication request that produced no approval
+# record must never finalize looking like a clean turn.
+PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
 
 
 def _is_auth_rejection(message: object) -> bool:
@@ -250,6 +263,19 @@ class SessionRunner:
         # over-permitting two concurrent turns on the single SDK generator.
         self._turn_lock = anyio.Semaphore(1, max_value=1)
         self._interrupt_requested = False
+        # Timeout is deliberately distinct from an ACI/operator interrupt: the
+        # former is a failed delivery boundary while the latter is an intentional
+        # cancellation. The opaque epoch binds the side-channel request to exactly
+        # this handler-owned turn without becoming an ACI field or trace attribute.
+        self._timeout_requested = False
+        # Set only for an accepted timeout control request. The SDK serializes
+        # control and query lines onto its stdin, and the CLI interrupt applies
+        # only to the query live when that line is read. The run-turn owner waits
+        # for this event before deciding whether the ordered stop was delivered
+        # or needs the abandonment safety-net below.
+        self._timeout_interrupt_settled: anyio.Event | None = None
+        self._timeout_interrupt_delivered = False
+        self._turn_epoch: str | None = None
         self._status = SessionStatus.IDLE_AWAITING_INPUT
         self._started = False
         # True only while a turn can still accept a steer: from turn start until
@@ -447,6 +473,10 @@ class SessionRunner:
             self._session = self._factory()
             await self._session.connect()
             self._interrupt_requested = False
+            self._timeout_requested = False
+            self._timeout_interrupt_settled = None
+            self._timeout_interrupt_delivered = False
+            self._turn_epoch = None
             self._turn_open = False
             self._active_state = None
             self._status = SessionStatus.IDLE_AWAITING_INPUT
@@ -475,6 +505,40 @@ class SessionRunner:
         if self._session is not None:
             await self._session.interrupt()
 
+    async def timeout(self, turn_epoch: str) -> bool:
+        """Stop the exact current turn and mark its terminal as a timeout failure.
+
+        The accepted flag is stored before the SDK await so every completion race
+        sees timeout precedence. A replay, stale epoch, or call outside an open
+        turn is a no-op; in particular it cannot poison the next lock owner.
+        """
+
+        current_epoch = self._turn_epoch
+        if (
+            self._session is None
+            or not self._turn_open
+            or self._timeout_requested
+            or current_epoch is None
+            or not hmac.compare_digest(
+                turn_epoch.encode("utf-8"), current_epoch.encode("utf-8")
+            )
+        ):
+            return False
+        timeout_interrupt_settled = anyio.Event()
+        self._timeout_requested = True
+        self._timeout_interrupt_settled = timeout_interrupt_settled
+        try:
+            await self._session.interrupt()
+            # A delayed SDK acknowledgement can return after this turn has
+            # released ownership and a later turn has installed fresh timeout
+            # state. Only the turn that still owns this completion event may
+            # suppress its abandonment safety-net interrupt.
+            if self._timeout_interrupt_settled is timeout_interrupt_settled:
+                self._timeout_interrupt_delivered = True
+        finally:
+            timeout_interrupt_settled.set()
+        return True
+
     async def run_inbound(self, message: Event | Interrupt) -> AsyncIterator[str]:
         """Produce the NDJSON a compliant runner emits for one inbound frame.
 
@@ -493,7 +557,11 @@ class SessionRunner:
             yield line
 
     async def run_turn(
-        self, event: Event, *, parent: Context | None = None
+        self,
+        event: Event,
+        *,
+        parent: Context | None = None,
+        turn_epoch: str | None = None,
     ) -> AsyncGenerator[str]:
         """Run one turn, streaming ACI NDJSON lines and enforcing the budget.
 
@@ -509,6 +577,10 @@ class SessionRunner:
             start = time.monotonic()
             logger.info("turn start session=%s user=%s", self._session_id, event.user)
             self._interrupt_requested = False
+            self._timeout_requested = False
+            self._timeout_interrupt_settled = None
+            self._timeout_interrupt_delivered = False
+            self._turn_epoch = turn_epoch
             self._turn_open = True
             self._history_durable = False
             state = TurnState()
@@ -525,6 +597,25 @@ class SessionRunner:
                 "outcome": "accepted",
             }
             record_metric("curie.turn.accepted", attributes=metric_attributes)
+            metrics_emitted = False
+
+            def emit_completed_metrics() -> None:
+                """Emit the terminal metric pair once, synchronously."""
+
+                nonlocal metrics_emitted
+                if metrics_emitted:
+                    return
+                metrics_emitted = True
+                completed_attributes = {
+                    "service.name": "curie-runner",
+                    "source": "runner",
+                    "outcome": metric_outcome,
+                }
+                elapsed = time.monotonic() - start
+                record_metric("curie.turn.completed", attributes=completed_attributes)
+                record_metric(
+                    "curie.turn.duration", elapsed, attributes=completed_attributes
+                )
 
             try:
                 with self._tracer.run_span(
@@ -561,7 +652,25 @@ class SessionRunner:
                         # is intentionally not caught here -- the finally handles
                         # that abandonment case.
                         self._turn_open = False
-                        if self._interrupt_requested:
+                        if self._timeout_requested:
+                            # The body-boundary timeout is a failure even when the
+                            # SDK reports its interrupt as an iterator exception.
+                            # The caller may still be reading this direct session
+                            # path, so retain a terminal final when it is deliverable.
+                            self._status = SessionStatus.CLASSIFIED_FAILURE
+                            metric_outcome = self._metric_outcome(tracker)
+                            gen.finish_turn(
+                                timeout_requested=True,
+                                interrupt_requested=self._interrupt_requested,
+                                classified_failure=True,
+                            )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run timed out",
+                                    status=SessionStatus.CLASSIFIED_FAILURE,
+                                )
+                            )
+                        elif self._interrupt_requested:
                             # Some SDK iterators surface the runner-requested
                             # interrupt as an exception instead of a terminal
                             # ResultMessage. The interrupt remains authoritative:
@@ -590,7 +699,7 @@ class SessionRunner:
                             )
                             self._status = SessionStatus.CLASSIFIED_FAILURE
                             metric_outcome = self._metric_outcome(tracker)
-                            gen.set_failed()
+                            self._set_failed(gen)
                             yield to_ndjson_line(
                                 ErrorEvent(
                                     message=f"runner error: {exc}",
@@ -604,29 +713,71 @@ class SessionRunner:
                                 )
                             )
                     finally:
-                        # If the turn never reached a terminal final (_turn_open still
-                        # set), the consumer abandoned the stream mid-run (client
-                        # disconnect -> GeneratorExit, or cancellation). Stop the SDK
-                        # so it does not keep executing tools past the released turn
-                        # lock and bleed into the next turn. Best-effort.
-                        if self._turn_open and self._session is not None:
-                            with contextlib.suppress(Exception):
-                                await self._session.interrupt()
-                        self._turn_open = False
+                        try:
+                            # A timeout accepted while the stream was suspended at
+                            # a yield reaches this no-yield block via GeneratorExit
+                            # (or cancellation). Store its root terminal and metric
+                            # pair synchronously, before cleanup can await or be
+                            # cancelled; RunTracer's later abandonment fallback is
+                            # idempotent.
+                            if self._timeout_requested:
+                                self._status = SessionStatus.CLASSIFIED_FAILURE
+                                gen.finish_turn(
+                                    timeout_requested=True,
+                                    interrupt_requested=self._interrupt_requested,
+                                    classified_failure=True,
+                                )
+                                metric_outcome = self._metric_outcome(tracker)
+                                emit_completed_metrics()
+                        finally:
+                            # The SDK serializes this turn's stop and any later
+                            # query onto one locked stdin stream. Wait until the
+                            # timeout attempt settles before cleanup: a normally
+                            # returned stop is already ordered ahead of the next
+                            # query and the CLI cannot latch it for that later
+                            # turn. If the timeout call does not return normally,
+                            # the cleanup path below supplies the safety-net while
+                            # this turn still owns the lock; cancellation before
+                            # the write sends nothing for a later turn to observe.
+                            timeout_settled = self._timeout_interrupt_settled
+                            if timeout_settled is not None:
+                                with anyio.CancelScope(shield=True):
+                                    await timeout_settled.wait()
+                            # Retire this turn's control token before cleanup can
+                            # await the session-global interrupt. A timeout that
+                            # arrives during that await is stale and must not
+                            # queue a stop that could be consumed by the next
+                            # turn after this owner releases the lock.
+                            self._turn_epoch = None
+                            # If the turn never reached a terminal final (_turn_open
+                            # still set), the consumer abandoned the stream mid-run
+                            # (client disconnect -> GeneratorExit, or cancellation).
+                            # Stop the SDK so it cannot keep executing tools past the
+                            # released turn lock and bleed into the next turn.
+                            try:
+                                if (
+                                    self._turn_open
+                                    and not self._timeout_interrupt_delivered
+                                    and self._session is not None
+                                ):
+                                    with contextlib.suppress(Exception):
+                                        await self._session.interrupt()
+                            finally:
+                                self._turn_open = False
+                                self._turn_epoch = None
             finally:
                 self._active_state = None
-                completed_attributes = {
-                    "service.name": "curie-runner",
-                    "source": "runner",
-                    "outcome": metric_outcome,
-                }
-                elapsed = time.monotonic() - start
-                record_metric("curie.turn.completed", attributes=completed_attributes)
-                record_metric(
-                    "curie.turn.duration", elapsed, attributes=completed_attributes
-                )
+                try:
+                    emit_completed_metrics()
+                finally:
+                    self._turn_open = False
+                    self._turn_epoch = None
+                    self._timeout_interrupt_settled = None
+                    self._timeout_interrupt_delivered = False
 
     def _metric_outcome(self, tracker: BudgetTracker) -> str:
+        if self._timeout_requested:
+            return "classified_failure"
         if self._status is SessionStatus.DONE:
             return "done"
         if self._status is SessionStatus.AWAITING_APPROVAL:
@@ -636,6 +787,18 @@ class SessionRunner:
         if self._interrupt_requested:
             return "interrupted"
         return "idle"
+
+    def _set_failed(self, gen: _GenerationSpan) -> None:
+        """Store timeout first when a generic failure site wins the race."""
+
+        if self._timeout_requested:
+            gen.finish_turn(
+                timeout_requested=True,
+                interrupt_requested=self._interrupt_requested,
+                classified_failure=True,
+            )
+        else:
+            gen.set_failed()
 
     async def _drive_turn(
         self,
@@ -650,6 +813,14 @@ class SessionRunner:
         gen.query_observed()
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
+            if isinstance(message, StreamedToolUseBoundary):
+                gen.record_first_response_boundary()
+                gen.streamed_tool_use(
+                    message.call_id,
+                    message.tool_name,
+                    observed_time_ns=message.observed_time_ns,
+                )
+                continue
             if isinstance(message, PartialMessageBoundary):
                 gen.record_first_response_boundary()
                 continue
@@ -663,7 +834,7 @@ class SessionRunner:
                 # terminal ``model-credential-rejected`` error is emitted regardless.
                 with contextlib.suppress(Exception):
                     await self._session.interrupt()
-                gen.set_failed()
+                self._set_failed(gen)
                 for line in self._auth_halt_lines():
                     yield line
                 return
@@ -709,12 +880,17 @@ class SessionRunner:
                 tracker.add_increment(usage)
             budget_hit = tracker.exceeded
             events = translate_message(message, state, self._classifier, gen)
+            # Synchronous, on the very iteration that delivered the block and
+            # strictly before any ResultMessage iteration classifies the turn
+            # (#2294). Never a task, and nothing is awaited between observing a
+            # publication call and classifying the turn that made it.
+            self._observe_publication_calls(state)
             decided_result_final: Final | None = None
             if isinstance(message, ResultMessage):
                 terminal_reason = getattr(message, "terminal_reason", None)
-                cancelled = self._interrupt_requested
+                cancelled = self._interrupt_requested and not self._timeout_requested
                 subtype = message.subtype or ""
-                result_failed = budget_hit or (
+                result_failed = self._timeout_requested or budget_hit or (
                     not cancelled and (message.is_error or subtype.startswith("error"))
                 )
                 if not budget_hit:
@@ -746,7 +922,7 @@ class SessionRunner:
                     )
                 if isinstance(outbound, Final):
                     if budget_hit:
-                        gen.set_failed()
+                        self._set_failed(gen)
                         for line in self._budget_halt_lines():
                             yield line
                         return
@@ -757,13 +933,26 @@ class SessionRunner:
                         )
                     else:
                         final = decided_result_final
+                    unrecorded = self._publication_unrecorded_lines(state, final)
+                    if unrecorded:
+                        self._set_failed(gen)
+                        for line in unrecorded:
+                            yield line
+                        return
+                    self._log_publication_fallback_alone(state)
+                    self._log_publication_not_carried(state, final)
                     for line in self._approval_not_acted_lines(state, final):
                         yield line
                     for line in self._false_completion_lines(state, final):
                         yield line
+                    # A timeout can land while one of the warning lines above is
+                    # suspended at its yield. Re-apply its precedence immediately
+                    # before publishing the terminal final.
+                    final = self._reclassify(final)
                     self._status = final.status
                     self._turn_open = False
                     gen.finish_turn(
+                        timeout_requested=self._timeout_requested,
                         interrupt_requested=self._interrupt_requested,
                         classified_failure=final.status
                         is SessionStatus.CLASSIFIED_FAILURE,
@@ -787,7 +976,7 @@ class SessionRunner:
                 # Budget crossed on a non-terminal message: stop the live run,
                 # then emit the same error+final pair.
                 await self._session.interrupt()
-                gen.set_failed()
+                self._set_failed(gen)
                 for line in self._budget_halt_lines():
                     yield line
                 return
@@ -795,20 +984,31 @@ class SessionRunner:
         # The turn iterator ended without a terminal result (e.g. an interrupt
         # aborted before the model produced one). Emit a final so the stream
         # always terminates in a final event.
-        status = (
-            SessionStatus.IDLE_AWAITING_INPUT
-            if self._interrupt_requested
-            else SessionStatus.DONE
-        )
+        if self._timeout_requested:
+            status = SessionStatus.CLASSIFIED_FAILURE
+        elif self._interrupt_requested:
+            status = SessionStatus.IDLE_AWAITING_INPUT
+        else:
+            status = SessionStatus.DONE
         self._merge_gate_block(state)
         final = _apply_approval_override(Final(text="", status=status), state)
+        unrecorded = self._publication_unrecorded_lines(state, final)
+        if unrecorded:
+            self._set_failed(gen)
+            for line in unrecorded:
+                yield line
+            return
+        self._log_publication_fallback_alone(state)
+        self._log_publication_not_carried(state, final)
         for line in self._approval_not_acted_lines(state, final):
             yield line
         for line in self._false_completion_lines(state, final):
             yield line
+        final = self._reclassify(final)
         self._status = final.status
         self._turn_open = False
         gen.finish_turn(
+            timeout_requested=self._timeout_requested,
             interrupt_requested=self._interrupt_requested,
             classified_failure=final.status is SessionStatus.CLASSIFIED_FAILURE,
             approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
@@ -820,6 +1020,238 @@ class SessionRunner:
         if final.status is SessionStatus.AWAITING_APPROVAL:
             state.final_text = final.text or state.assistant_text
         yield to_ndjson_line(final)
+
+    def _observe_publication_calls(self, state: TurnState) -> None:
+        """Record every publication call the runner sees on the stream (#2294).
+
+        The runner's own observer, alongside the PreToolUse hook (#1852) and
+        ``can_use_tool`` (#245). Against the real SDK it is normally the FIRST
+        writer, not a rare backstop: the ``AssistantMessage`` carrying the
+        ``ToolUseBlock`` reaches this loop before the CLI dispatches PreToolUse
+        (observed live, #2294), so the hook's own ``block`` then finds the
+        record already standing and only adds its halt marker. The fake tier is
+        the inverted case -- its gate seam runs before the block is delivered,
+        so there the observation is the duplicate.
+
+        Either ordering yields exactly one record with identical fields, which
+        is the point. What this closes is the case the live run hit: neither SDK
+        layer recorded the call at all, the in-process tool body ran and
+        returned its defensive ``is_error``, and the turn was about to finalize
+        DONE with nothing for a human to approve.
+
+        It can only record or fail closed -- it never allows a call and never
+        mints a grant. Called on every message of the turn, it acts only on
+        calls it has not seen yet, and it is deliberately synchronous: the
+        record must stand before the ResultMessage iteration classifies the
+        turn (see the call site in ``_drive_turn``).
+
+        A call it cannot record stores the FIRST such reason in
+        ``state.publication_unrecorded``, for the fail-closed error message
+        ONLY. It is deliberately NOT sticky: observation continues over every
+        later call in the turn, because the gate's own deny text tells the model
+        to "Correct it and retry", so a malformed first attempt must not poison
+        the corrected record that follows it. Whether the turn actually fails
+        closed is decided from the OUTCOME at classification time -- see
+        ``_publication_unrecorded_lines``.
+        """
+
+        gate = self._approval_gate
+        while state.publication_calls_observed < len(state.publication_calls):
+            payload = state.publication_calls[state.publication_calls_observed]
+            state.publication_calls_observed += 1
+            if gate is None or PUBLISH_TOOL_NAME not in gate.required:
+                # The model named the publication tool where the platform has no
+                # gated checkout to publish from. Recording it anyway would ask a
+                # human to authorize an action that cannot exist, so fail closed.
+                state.publication_unrecorded = state.publication_unrecorded or (
+                    "the session carries no publication approval gate, so the"
+                    " request could not be recorded"
+                )
+                continue
+            try:
+                recorded = gate.observe_publication(payload)
+            except ValueError as exc:
+                # First reason wins for the message; the loop carries on so a
+                # corrected retry later in the same turn can still record.
+                state.publication_unrecorded = state.publication_unrecorded or str(exc)
+                continue
+            if recorded:
+                # Neutral wording, and NOT a warning: against the real SDK this
+                # observer is normally the FIRST writer, because the
+                # AssistantMessage carrying the ToolUseBlock reaches this loop
+                # before the CLI dispatches PreToolUse (observed live, #2294,
+                # session=live-publish-gated). Writing first proves nothing about
+                # whether a gate layer decided, so claiming "no layer recorded
+                # this" here fired on the fully gated path too. The real
+                # layer-missed signal is at turn end, in
+                # ``_log_publication_fallback_alone``.
+                logger.debug(
+                    "publication call observed on the stream and recorded session=%s",
+                    self._session_id,
+                )
+            else:
+                # A record already stands. On the fake tier that is the gate
+                # layer's (it runs before the block is delivered); on the real
+                # path it is this observer's own earlier call in the same turn.
+                logger.debug(
+                    "publication already recorded this turn session=%s",
+                    self._session_id,
+                )
+
+    def _log_publication_fallback_alone(self, state: TurnState) -> None:
+        """Warn when the stream observer was the ONLY layer that decided (#2294).
+
+        The honest "a gate layer missed this call" signal, and it can only be
+        computed at turn end. Per-call it is unknowable: against the real SDK the
+        stream delivers the ``ToolUseBlock`` to ``_drive_turn`` BEFORE the CLI
+        dispatches PreToolUse, so the observer writes first on every real
+        publication call, gated or not (observed live, #2294). Only the fake tier
+        runs its gate seam ahead of the block, so "the hook got there first"
+        describes that tier alone.
+
+        ``pending_halt`` is the discriminator: it is set by ``ApprovalGate.block``
+        and by nothing else, so ONLY the PreToolUse hook (#1852) or
+        ``can_use_tool`` (#245) can set it. The observer deliberately never does.
+        A turn that observed a publication call, ends holding its record, and
+        still has ``pending_halt`` False is therefore a turn in which neither SDK
+        layer denied the call -- the exact #2294 condition, and the one an
+        operator needs to see, because a gate that reports itself armed while
+        deciding nothing is the one they trust.
+
+        Called from the two Final emission sites, which are mutually exclusive
+        (each returns after yielding), so this logs at most once per turn.
+        Skipped on the interrupt/timeout paths: neither ran the gate to a
+        decision, so neither says anything about the layers.
+        """
+
+        gate = self._approval_gate
+        if (
+            not state.publication_calls
+            or gate is None
+            or gate.pending_summary is None
+            or gate.pending_granted_tool != PUBLISH_TOOL_NAME
+            or gate.pending_halt
+            or self._interrupt_requested
+            or self._timeout_requested
+        ):
+            return
+        logger.warning(
+            "publication stream fallback stood alone session=%s: neither the"
+            " PreToolUse hook nor can_use_tool denied this publication call;"
+            " the pending approval was recorded from the stream",
+            self._session_id,
+        )
+
+    def _log_publication_not_carried(self, state: TurnState, final: Final) -> None:
+        """Warn when a parked turn carries a DIFFERENT approval than the publish.
+
+        A turn has one pending approval slot, so a publication call can lose it
+        to a gated tool denied earlier in the turn or to a policy
+        ``request_approval`` (``_merge_gate_block`` never overwrites a standing
+        policy summary with a permission block). That is legitimate -- the turn
+        parks on a real decision and nothing is lost -- but the publish intent
+        does NOT ride the final, so after the human resolves the card the model
+        must ask to publish again. Silently dropping that is how a publication
+        request disappears without any operator-visible trace, so it is a
+        warning rather than a failure: failing the turn would discard the very
+        approval a human still has to act on.
+
+        Called from the two mutually exclusive Final emission sites, so it logs
+        at most once per turn.
+        """
+
+        if (
+            not state.publication_calls
+            or final.status is not SessionStatus.AWAITING_APPROVAL
+            or final.approval_granted_tool == PUBLISH_TOOL_NAME
+        ):
+            return
+        if state.publication_unrecorded is not None:
+            # Not slot contention: this request was never recordable in the
+            # first place (a malformed proposal, or a gate without the publish
+            # tool). Naming only the other approval here would misreport it and
+            # send an operator looking for a race that did not happen.
+            logger.warning(
+                "publication request not carried session=%s: the publication"
+                " request itself could not be recorded: %s; the turn is awaiting"
+                " a different approval (%s)",
+                self._session_id,
+                state.publication_unrecorded,
+                final.approval_granted_tool or final.approval_gate_kind or "unknown",
+            )
+            return
+        logger.warning(
+            "publication request not carried session=%s: the turn is awaiting a"
+            " different approval (%s); the model must request publication again"
+            " after it resolves",
+            self._session_id,
+            final.approval_granted_tool or final.approval_gate_kind or "unknown",
+        )
+
+    def _publication_unrecorded_lines(self, state: TurnState, final: Final) -> list[str]:
+        """The fail-closed error+final pair for an unrecordable publication (#2294).
+
+        Modeled on ``_auth_halt_lines``: a terminal pair, not an observe-only
+        warning frame. The runner saw a publication request and the turn is
+        ending with no pending approval to show for it, so the only safe report
+        is a classified failure carrying NO approval fields -- an approval card
+        with no usable proposal is worse than none, and a DONE final would be
+        the very silent hole #2294 closed.
+
+        **The decision is keyed on the FINAL about to be emitted, never on gate
+        state.** A turn holds exactly ONE pending approval slot
+        (``ApprovalGate._record_pending``'s first-block-wins rule, and
+        ``_merge_gate_block``'s preference for a standing policy summary), so
+        another approval can legitimately own it: a gated ``Bash`` call denied
+        before the publish call arrived, or a ``request_approval`` the model
+        raised in the same turn. Reading gate state would then rewrite a turn
+        that is correctly parked on a real human decision into a classified
+        failure, DESTROYING a card a human could have acted on -- a strictly
+        worse outcome than the silent DONE #2294 set out to fix. So an
+        AWAITING_APPROVAL final is never overridden; the unclaimed publish
+        intent is reported by ``_log_publication_not_carried`` instead.
+
+        A sticky "any attempt failed -> fail the turn" rule is wrong for the
+        same reason: the gate's deny text tells the model to "Correct it and
+        retry", so a malformed attempt followed by a corrected one must end
+        awaiting-approval on the record that stands.
+
+        Precedence is unchanged and deliberately narrow: a final that already
+        reports a classified failure keeps its own cause, and an operator
+        interrupt (or a timeout) outranks this entirely -- a human pressing stop
+        gets idle-awaiting-input, not a failure about a request their stop
+        already prevented. What is left is the real hole: publish calls were
+        observed and the turn is about to report a clean, unparked outcome.
+        """
+
+        if (
+            not state.publication_calls
+            or final.status is SessionStatus.AWAITING_APPROVAL
+            or final.status is SessionStatus.CLASSIFIED_FAILURE
+            or self._interrupt_requested
+            or self._timeout_requested
+        ):
+            return []
+        reason = state.publication_unrecorded or (
+            "the publication call was not recorded by any approval gate layer"
+        )
+        logger.error("publication request not recorded session=%s: %s", self._session_id, reason)
+        self._turn_open = False
+        self._status = SessionStatus.CLASSIFIED_FAILURE
+        return [
+            to_ndjson_line(
+                ErrorEvent(
+                    message=f"publication request was not recorded: {reason}",
+                    classification=PUBLICATION_UNRECORDED_CLASSIFICATION,
+                )
+            ),
+            to_ndjson_line(
+                Final(
+                    text="run failed: publication request could not be recorded",
+                    status=SessionStatus.CLASSIFIED_FAILURE,
+                )
+            ),
+        ]
 
     def _approval_not_acted_lines(self, state: TurnState, final: Final) -> list[str]:
         """The OBSERVE-ONLY reconciliation warning (#544, Decision A2).
@@ -960,7 +1392,11 @@ class SessionRunner:
 
         # See the "Approval halt" bullet above: an operator interrupt outranks a
         # runner-requested one, so the marker is copied only in its absence.
-        if gate.pending_halt and not self._interrupt_requested:
+        if (
+            gate.pending_halt
+            and not self._interrupt_requested
+            and not self._timeout_requested
+        ):
             state.approval_halt_requested = True
 
     def _budget_halt_lines(self) -> list[str]:
@@ -1026,6 +1462,11 @@ class SessionRunner:
         would look like a failure and could trip F1's escalation path.
         """
 
+        if self._timeout_requested:
+            return Final(
+                text=final.text or "run timed out",
+                status=SessionStatus.CLASSIFIED_FAILURE,
+            )
         if self._interrupt_requested:
             return Final(
                 text=final.text or "run interrupted",

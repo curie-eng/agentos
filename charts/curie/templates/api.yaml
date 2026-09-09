@@ -76,9 +76,15 @@ spec:
               max_attempts=60
               probe_error_class=""
               while [ "$attempt" -le "$max_attempts" ]; do
+                # Lift ssl= out of the DSN into the connect kwarg (#2431).
+                # asyncpg's DSN parser knows sslmode, not ssl, so an ssl=
+                # query arg is forwarded as a server setting. Pass the mode
+                # string through: ssl=True is verify-full; ssl="require"
+                # encrypts without a CA, matching SQLAlchemy's ?ssl=require.
                 if probe_error_class=$(python -c '
               import asyncio
               import os
+              from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
               try:
                   import asyncpg
@@ -87,7 +93,19 @@ spec:
                       database_url = os.environ["DATABASE_URL"].replace(
                           "postgresql+asyncpg://", "postgresql://", 1
                       )
-                      connection = await asyncpg.connect(database_url, timeout=2)
+                      parsed = urlparse(database_url)
+                      query = []
+                      ssl = None
+                      for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+                          if key == "ssl":
+                              ssl = value
+                          else:
+                              query.append((key, value))
+                      database_url = urlunparse(parsed._replace(query=urlencode(query)))
+                      connect_kwargs = {"timeout": 2}
+                      if ssl is not None:
+                          connect_kwargs["ssl"] = ssl
+                      connection = await asyncpg.connect(database_url, **connect_kwargs)
                       await connection.close()
 
                   asyncio.run(probe())
@@ -198,7 +216,7 @@ spec:
             - name: GITHUB_CLONE_BASE
               value: {{ .Values.api.githubCloneBase | quote }}
             - name: LANGFUSE_HOST
-              value: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
+              value: {{ include "curie.langfuse.url" . }}
             - name: LANGFUSE_PUBLIC_KEY
               value: {{ .Values.langfuse.init.projectPublicKey | quote }}
             - name: LANGFUSE_SECRET_KEY
@@ -258,27 +276,20 @@ spec:
             # the setting an operator is trying to make.
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ .Values.api.slackUsergroupCacheTtlSeconds | quote }}
-            {{- with .Values.api.extraEnv }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv) | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 8000
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 24
+            {{- toYaml .Values.api.readinessProbe | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 15
-            failureThreshold: 6
+            {{- toYaml .Values.api.livenessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
 {{- end }}

@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 
 #[allow(unused_imports)]
-use super::{command::*, providers::*, up::*};
+use super::{command::*, convergence, providers::*, up::*};
 
 pub struct DownOpts {
     pub common: CommonOpts,
@@ -21,6 +21,10 @@ pub struct RollbackOpts {
     /// without this flag, since helm never finished applying such a revision.
     pub allow_failed_revision: bool,
     pub yes: bool,
+    /// Test-only negative control for #2296: skip the schema compatibility
+    /// gate so the status filter's unsafe target is handed to Helm.
+    /// The clap path never sets this.
+    pub disable_schema_gate: bool,
 }
 
 /// The version declared by the chart at `chart`, read from its own `Chart.yaml`.
@@ -53,13 +57,15 @@ pub async fn chart_version(chart: &str) -> Result<String> {
 /// (live for a real run, [`chart_fullname`] under `--dry-run`), so this builder
 /// still makes no cluster call of its own.
 pub fn status_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
-    vec![
+    let mut commands = vec![
         helm_status_cmd(o),
         pods_cmd(o),
         svc_cmd(o, fullname, "ui"),
         svc_cmd(o, fullname, "langfuse-web"),
         kubeconfig_host_cmd(),
-    ]
+    ];
+    commands.extend(convergence::dry_run_commands(o));
+    commands
 }
 
 fn helm_status_cmd(o: &CommonOpts) -> OpsCommand {
@@ -209,10 +215,18 @@ enum SweepOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOutcome {
+    Removed,
+    NoMatch,
+    Failed,
+}
+
 /// A teardown step that can remain outstanding after a fail-forward `down`.
 #[derive(Debug, PartialEq, Eq)]
 enum TeardownStep {
     HelmUninstall,
+    HookCleanup,
     NamespaceSweep,
 }
 
@@ -220,10 +234,17 @@ enum TeardownStep {
 /// `Absent` helm is done; a `Failed` helm leaves `HelmUninstall` outstanding. A
 /// `Removed` sweep is done; a `Failed` sweep leaves `NamespaceSweep`
 /// outstanding. Order matches `down_commands` (helm before sweep).
-fn outstanding_steps(helm: HelmOutcome, sweep: SweepOutcome) -> Vec<TeardownStep> {
+fn outstanding_steps(
+    helm: HelmOutcome,
+    hooks: HookOutcome,
+    sweep: SweepOutcome,
+) -> Vec<TeardownStep> {
     let mut out = Vec::new();
     if matches!(helm, HelmOutcome::Failed) {
         out.push(TeardownStep::HelmUninstall);
+    }
+    if matches!(hooks, HookOutcome::Failed) {
+        out.push(TeardownStep::HookCleanup);
     }
     if matches!(sweep, SweepOutcome::Failed) {
         out.push(TeardownStep::NamespaceSweep);
@@ -265,16 +286,15 @@ fn resume_command(remaining: &[TeardownStep], o: &CommonOpts) -> String {
     // Helm before sweep, matching `down_commands` execution order.
     steps.sort_by_key(|step| match step {
         TeardownStep::HelmUninstall => 0,
-        TeardownStep::NamespaceSweep => 1,
+        TeardownStep::HookCleanup => 1,
+        TeardownStep::NamespaceSweep => 2,
     });
     let lines: Vec<String> = steps
         .iter()
-        .map(|step| {
-            let idx = match step {
-                TeardownStep::HelmUninstall => 0,
-                TeardownStep::NamespaceSweep => 1,
-            };
-            cmds[idx].display()
+        .map(|step| match step {
+            TeardownStep::HelmUninstall => cmds[0].display(),
+            TeardownStep::HookCleanup => hook_cleanup_resume_command(o),
+            TeardownStep::NamespaceSweep => cmds[1].display(),
         })
         .collect();
     match lines.as_slice() {
@@ -283,9 +303,25 @@ fn resume_command(remaining: &[TeardownStep], o: &CommonOpts) -> String {
         [first, second] => {
             format!("{first}; s1=$?; {second}; s2=$?; [ \"$s1\" -eq 0 ] && [ \"$s2\" -eq 0 ]")
         }
-        // `remaining` only ever holds HelmUninstall and/or NamespaceSweep, so a
-        // third element is unreachable; stay defensive rather than panic.
-        _ => lines.join("; "),
+        _ => {
+            let mut command = String::new();
+            for (index, line) in lines.iter().enumerate() {
+                let number = index + 1;
+                if !command.is_empty() {
+                    command.push_str("; ");
+                }
+                command.push_str(line);
+                command.push_str(&format!("; s{number}=$?"));
+            }
+            command.push_str("; ");
+            command.push_str(
+                &(1..=lines.len())
+                    .map(|number| format!("[ \"$s{number}\" -eq 0 ]"))
+                    .collect::<Vec<_>>()
+                    .join(" && "),
+            );
+            command
+        }
     }
 }
 
@@ -386,7 +422,7 @@ fn is_help_pointer(line: &str) -> bool {
 /// Safety property: a stderr that is ONLY help text has no diagnosis to
 /// recover, so the cut falls back to the base rule's answer rather than to an
 /// empty string. This can improve the surfaced reason, never blank it.
-pub(super) fn failure_reason(stderr: &str) -> &str {
+pub(crate) fn failure_reason(stderr: &str) -> &str {
     let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
     let base = lines.iter().rev().find(|l| !l.is_empty()).copied();
     // Everything from the last usage header on is the tool's own help text.
@@ -416,12 +452,14 @@ pub(super) fn failure_reason(stderr: &str) -> &str {
 /// nothing was actually deleted.
 fn teardown_result(
     helm: HelmOutcome,
+    hooks: HookOutcome,
     sweep: SweepOutcome,
     helm_err: &str,
+    hook_err: &str,
     sweep_err: &str,
     o: &CommonOpts,
 ) -> anyhow::Result<ClusterDownOutput> {
-    let remaining = outstanding_steps(helm, sweep);
+    let remaining = outstanding_steps(helm, hooks, sweep);
     if remaining.is_empty() {
         return Ok(ClusterDownOutput::Down {
             release_was_absent: matches!(helm, HelmOutcome::Absent),
@@ -433,9 +471,10 @@ fn teardown_result(
     // a non-failed step never blocks retryability, a permanent failed step always
     // does.
     let helm_retryable = !matches!(helm, HelmOutcome::Failed) || is_connectivity_failure(helm_err);
+    let hook_retryable = !matches!(hooks, HookOutcome::Failed) || is_connectivity_failure(hook_err);
     let sweep_retryable =
         !matches!(sweep, SweepOutcome::Failed) || is_connectivity_failure(sweep_err);
-    let transient = helm_retryable && sweep_retryable;
+    let transient = helm_retryable && hook_retryable && sweep_retryable;
 
     // The one-line reason drawn from the failed step that DETERMINES the class,
     // composed into the message so the human Display (P1) names WHY teardown
@@ -446,21 +485,31 @@ fn teardown_result(
     let reason = if transient {
         if matches!(helm, HelmOutcome::Failed) {
             failure_reason(helm_err)
+        } else if matches!(hooks, HookOutcome::Failed) {
+            failure_reason(hook_err)
         } else {
             failure_reason(sweep_err)
         }
     } else if !helm_retryable {
         failure_reason(helm_err)
+    } else if !hook_retryable {
+        failure_reason(hook_err)
     } else {
         failure_reason(sweep_err)
     };
 
-    let message = if matches!(sweep, SweepOutcome::Removed) {
+    let message = if matches!(helm, HelmOutcome::Failed)
+        && !matches!(hooks, HookOutcome::Failed)
+        && matches!(sweep, SweepOutcome::Removed)
+    {
         // Sweep succeeded (compute stopped); only the stale helm record remains.
         format!(
             "helm uninstall failed ({reason}) but the run-created namespaces were swept; the release record remains. Resume with: {cmd}"
         )
-    } else if matches!(sweep, SweepOutcome::NoMatch) {
+    } else if matches!(helm, HelmOutcome::Failed)
+        && !matches!(hooks, HookOutcome::Failed)
+        && matches!(sweep, SweepOutcome::NoMatch)
+    {
         // #768: the sweep's label selector matched nothing -- this release never
         // created (or was installed into a pre-existing) namespace, so nothing
         // was actually removed. This is NOT the swept case above: do not claim
@@ -553,20 +602,33 @@ pub(super) fn ns_common(opts: &CommonOpts, ns: &str, dry_run: bool) -> CommonOpt
 }
 
 /// `kubectl get namespace <ns>`: the pre-existence probe `up` runs before the
-/// install so it stamps ownership only on namespaces it creates.
-fn namespace_get_cmd(namespace: &str) -> OpsCommand {
+/// install so it stamps ownership only on namespaces it creates. `--ignore-not-found`
+/// plus JSON output lets a missing namespace be Absent instead of a hard error.
+pub(crate) fn namespace_get_cmd(namespace: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
-        vec![plain("get"), plain("namespace"), plain(namespace)],
+        vec![
+            plain("get"),
+            plain("namespace"),
+            plain(namespace),
+            plain("--ignore-not-found"),
+            plain("-o"),
+            plain("json"),
+        ],
     )
 }
 
-/// Whether `namespace` already exists on the cluster. A nonzero `kubectl get`
-/// (typically NotFound) reads as absent, so `up` treats it as fresh and stamps
-/// it; any other transport error surfaces later on the install itself.
-pub(super) async fn namespace_exists(namespace: &str) -> Result<bool> {
-    let (ok, _out, _err) = run_capture(&namespace_get_cmd(namespace)).await?;
-    Ok(ok)
+/// Whether `namespace` already exists on the cluster. Empty stdout after
+/// `--ignore-not-found` is absent; a transport error is a real failure.
+pub(crate) async fn namespace_exists(namespace: &str) -> Result<bool> {
+    let (ok, out, err) = run_capture(&namespace_get_cmd(namespace)).await?;
+    if !ok {
+        bail!(
+            "could not inspect namespace `{namespace}`: {}",
+            failure_reason(&err)
+        );
+    }
+    Ok(!out.trim().is_empty())
 }
 
 /// Parse the hostname out of a kubeconfig `cluster.server` URL
@@ -598,8 +660,12 @@ pub struct ClusterStatus {
     pub ready: usize,
     pub total: usize,
     pub unhealthy: Vec<String>,
+    /// Diagnoses that could not be MADE, kept apart from `unhealthy` so they
+    /// never reach the exit code.
+    pub warnings: Vec<String>,
     pub pods_listed: bool,
     pub urls: Vec<ServiceUrl>,
+    pub delivery: crate::completion_outbox::Report,
     pub upgrade: super::upgrade::UpgradeStatusView,
 }
 
@@ -608,7 +674,10 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
         match self {
             ClusterStatusOutput::DryRun(plan) => plan.to_json(),
             ClusterStatusOutput::Status(s) => {
-                let healthy = s.total > 0 && s.ready == s.total && s.unhealthy.is_empty();
+                let healthy = s.total > 0
+                    && s.ready == s.total
+                    && s.unhealthy.is_empty()
+                    && !s.delivery.degraded;
                 serde_json::json!({
                     "namespace": s.namespace,
                     "revision": s.revision,
@@ -620,7 +689,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                         "unhealthy": s.unhealthy,
                         "rows": s.pods.iter().map(PodRow::to_json).collect::<Vec<_>>(),
                     },
+                    "warnings": s.warnings,
                     "urls": s.urls.iter().map(ServiceUrl::to_json).collect::<Vec<_>>(),
+                    "delivery": serde_json::to_value(&s.delivery).expect("delivery serializes"),
                     "healthy": healthy,
                     "upgrade": s.upgrade.to_json(),
                 })
@@ -643,6 +714,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 if !s.pods_listed {
                     ui.warn(&format!("could not list pods in namespace {}", s.namespace));
                 }
+                for warning in &s.warnings {
+                    ui.warn(warning);
+                }
                 for url in &s.urls {
                     url.render(ui);
                 }
@@ -652,7 +726,11 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     s.upgrade.phase.as_deref().unwrap_or("idle"),
                     s.upgrade.known_good_version.as_deref().unwrap_or("none")
                 ));
-                if s.total > 0 && s.ready == s.total && s.unhealthy.is_empty() {
+                if s.total > 0
+                    && s.ready == s.total
+                    && s.unhealthy.is_empty()
+                    && !s.delivery.degraded
+                {
                     ui.success(&format!("healthy ({}/{} pods ready)", s.ready, s.total));
                 } else if s.total == 0 {
                     ui.warn("no pods running");
@@ -668,6 +746,34 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
     }
 }
 
+pub(crate) enum MailVerdict {
+    Fine,
+    Unknown,
+    Unhealthy,
+}
+
+pub(crate) fn mail_verdict(report: &crate::mail_channel::Report) -> MailVerdict {
+    if !report.known() {
+        MailVerdict::Unknown
+    } else if !report.healthy() {
+        MailVerdict::Unhealthy
+    } else {
+        MailVerdict::Fine
+    }
+}
+
+const VALUES_READ_FOR_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+pub(crate) fn mail_probe_is_gated_off(computed: Option<&serde_json::Value>) -> bool {
+    computed.is_some_and(|values| {
+        !crate::doctor::helm_truthy(
+            values
+                .get("mailAdapter")
+                .and_then(|value| value.get("deploy")),
+        )
+    })
+}
+
 pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     if opts.dry_run {
         // A dry run makes no cluster call, so the release's fullname cannot be
@@ -675,17 +781,38 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         // `dry_run_fullname` computes it and emits the caveat that says so.
         let fullname = dry_run_fullname(&opts.release);
         return Ok(ClusterStatusOutput::DryRun(crate::ui::DryRunPlan {
-            lines: status_commands(&opts, &fullname)
-                .iter()
-                .map(|cmd| cmd.display())
+            lines: std::iter::once(convergence::DRY_RUN_NOTE.to_owned())
+                .chain(
+                    status_commands(&opts, &fullname)
+                        .iter()
+                        .map(OpsCommand::display),
+                )
                 .collect(),
         }));
     }
     require_on_path("helm")?;
     require_on_path("kubectl")?;
 
-    // (a) Helm release state -> a bright header line.
-    let (helm_ok, helm_out, helm_err) = run_capture(&helm_status_cmd(&opts)).await?;
+    let helm_status = helm_status_cmd(&opts);
+    let pods = pods_cmd(&opts);
+    let (helm, pods_read, observed, fullname, host, computed, worker_claim_probe, mut upgrade) = tokio::join!(
+        run_capture(&helm_status),
+        run_capture(&pods),
+        convergence::observe(&opts),
+        release_fullname(&opts.namespace, &opts.release),
+        discover_host(),
+        tokio::time::timeout(
+            VALUES_READ_FOR_GATE_TIMEOUT,
+            fetch_release_computed_values(&opts),
+        ),
+        crate::worker_claims::select_cluster(&opts.namespace, &opts.release),
+        super::upgrade::load_upgrade_status(&opts.namespace, &opts.release, None),
+    );
+    let computed = computed.unwrap_or_else(|_| {
+        Err(crate::exit::CliError::failure("timed out reading computed Helm values").into())
+    });
+
+    let (helm_ok, helm_out, helm_err) = helm?;
     let field = |name: &str, default: &str| -> String {
         helm_out
             .lines()
@@ -707,9 +834,9 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         )
     });
 
-    // (b) Pod health.
-    let (ok, out, _) = run_capture(&pods_cmd(&opts)).await?;
-    let (pods, ready, total, unhealthy) = if ok {
+    let (ok, out, _) = pods_read?;
+    let mut warnings: Vec<String> = Vec::new();
+    let (mut pods, ready, total, mut unhealthy) = if ok {
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&out)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
@@ -719,29 +846,96 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         (Vec::new(), 0, 0, Vec::new())
     };
 
-    // (c) URL discovery. Resolve the release's rendered fullname once, here on
-    // the live branch -- `--dry-run` returned above without touching kubectl.
-    // The host lookup does not depend on the fullname, so the two run
-    // concurrently rather than paying for each other's round-trip; the service
-    // reads below need both and fan out after.
-    let (fullname, host) = tokio::join!(
-        release_fullname(&opts.namespace, &opts.release),
-        discover_host(),
+    if !mail_probe_is_gated_off(computed.as_ref().ok().and_then(Option::as_ref)) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&out) {
+            if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
+                for report in
+                    crate::mail_channel::observe_pods(&opts.namespace, &opts.release, items).await
+                {
+                    match mail_verdict(&report) {
+                        MailVerdict::Unknown => {
+                            warnings.push(format!("{}: {}", report.pod, report.detail));
+                        }
+                        MailVerdict::Unhealthy => {
+                            unhealthy.push(format!("{}: {}", report.pod, report.detail));
+                        }
+                        MailVerdict::Fine => {}
+                    }
+                    if let Some(row) = pods.iter_mut().find(|row| row.name == report.pod) {
+                        row.status = format!("{}; {}", row.status, report.detail);
+                        row.mail_channel = Some(report);
+                    }
+                }
+            }
+        }
+    }
+
+    match observed {
+        Ok(observation) => unhealthy.extend(observation.issues),
+        Err(error) => unhealthy.push(format!("convergence could not be verified: {error}")),
+    }
+    if !ok {
+        unhealthy.push("could not list release pods".to_string());
+    }
+
+    let (ui_url, langfuse_url, worker_claims, delivery) = tokio::join!(
+        resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
+        resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false),
+        worker_claim_probe.observe(),
+        async {
+            match serde_json::from_str::<serde_json::Value>(&out) {
+                Ok(value) => {
+                    let items = value
+                        .get("items")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    crate::completion_outbox::observe_pods(&opts.namespace, &opts.release, &items)
+                        .await
+                }
+                Err(_) => None,
+            }
+        },
     );
-    let urls = vec![
-        resolve_service_url(&opts, &fullname, "ui", "UI", &host, true).await,
-        resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false).await,
-    ];
+    let urls = vec![ui_url, langfuse_url];
 
-    let chart_version = helm_ok.then(|| field("CHART:", "").trim().to_string());
-    let upgrade = super::upgrade::load_upgrade_status(
-        &opts.namespace,
-        &opts.release,
-        chart_version.filter(|v| !v.is_empty()),
-    )
-    .await;
+    match &worker_claims.state {
+        crate::worker_claims::ClaimsState::ClaimsEnabled => {
+            if let Some(row) = worker_claims
+                .worker_pod
+                .as_deref()
+                .and_then(|pod| pods.iter_mut().find(|row| row.name == pod))
+            {
+                row.status.push_str("; claims enabled");
+            }
+        }
+        crate::worker_claims::ClaimsState::Quiescing { .. }
+        | crate::worker_claims::ClaimsState::QuiescingMetadataUnavailable => {
+            unhealthy.push(worker_claims.state.status_diagnosis());
+        }
+        crate::worker_claims::ClaimsState::Unknown => {
+            warnings.push(worker_claims.state.status_diagnosis());
+        }
+    }
 
-    Ok(ClusterStatusOutput::Status(Box::new(ClusterStatus {
+    let delivery = match delivery {
+        Some(report) => {
+            if report.known() && report.degraded {
+                unhealthy.push(report.detail.clone());
+            } else if !report.known() {
+                warnings.push(report.detail.clone());
+            }
+            report
+        }
+        None => crate::completion_outbox::Report::unknown(),
+    };
+
+    if upgrade.known_good_version.is_none() && helm_ok {
+        upgrade.known_good_version =
+            Some(field("CHART:", "")).filter(|version| !version.trim().is_empty());
+    }
+
+    let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
         release_state,
@@ -751,10 +945,25 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         ready,
         total,
         unhealthy,
+        warnings,
         pods_listed: ok,
         urls,
+        delivery,
         upgrade,
-    })))
+    }));
+    let json = crate::ui::CliOutput::to_json(&output);
+    if json["healthy"] != true {
+        return Err(crate::ui::ui().failed_report(
+            &output,
+            crate::exit::CliError::failure(format!(
+                "target release has not converged: {}",
+                json["pods"]["unhealthy"].as_array().map(|reasons| reasons.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default()
+            ))
+                .with_fix("inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`")
+                .into(),
+        ));
+    }
+    Ok(output)
 }
 
 /// Output of `cluster down`: the dry-run plan, an operator abort, or the removed
@@ -796,16 +1005,20 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     let cmds = down_commands(&opts.common);
     if opts.common.dry_run {
         return Ok(ClusterDownOutput::DryRun(crate::ui::DryRunPlan {
-            lines: cmds.iter().map(|cmd| cmd.display()).collect(),
+            lines: vec![
+                cmds[0].display(),
+                hook_cleanup_resume_command(&opts.common),
+                cmds[1].display(),
+            ],
         }));
     }
     ui.warn(&format!(
-        "this uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach), leaving any pre-existing namespaces untouched",
+        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, and shared controller namespaces are retained",
         opts.common.release, opts.common.namespace
     ));
     if !opts.yes
         && !confirm(&format!(
-            "This uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach). Continue? [y/N] ",
+            "This uninstalls release '{0}' in namespace '{1}', removes its Helm hook Jobs, and deletes only namespaces owned by the exact release/install-namespace pair; unowned or shared namespaces are retained. Continue? [y/N] ",
             opts.common.release, opts.common.namespace
         ))?
     {
@@ -823,7 +1036,10 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     let uninstall = &cmds[0];
     ui.plumbing(&format!("+ {}", uninstall.display()));
     let step = cl.step("uninstalling release");
-    let (ok, out, helm_err) = run_capture(uninstall).await?;
+    let (ok, out, helm_err) = match run_capture(uninstall).await {
+        Ok(captured) => captured,
+        Err(error) => (false, String::new(), format!("{error:#}")),
+    };
     let helm_outcome = if ok {
         step.done("removed");
         HelmOutcome::Removed
@@ -837,6 +1053,80 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     for line in out.lines().chain(helm_err.lines()) {
         ui.plumbing(line);
     }
+
+    // Failed Helm hooks may be retained even after uninstall. Remove only Jobs
+    // selected by this release's exact Helm labels and carrying `helm.sh/hook`.
+    let step = cl.step("removing Helm hook Jobs");
+    let mut hook_err = String::new();
+    let hook_outcome = match namespace_probe(&opts.common.namespace).await {
+        Ok(NamespaceProbe::Absent) => {
+            step.done("namespace absent");
+            HookOutcome::NoMatch
+        }
+        Err(error) => {
+            hook_err = format!("{error:#}");
+            step.fail("failed");
+            HookOutcome::Failed
+        }
+        Ok(NamespaceProbe::Present(_)) => {
+            let list = hook_jobs_cmd(&opts.common);
+            ui.plumbing(&format!("+ {}", list.display()));
+            match run_capture(&list).await {
+                Err(error) => {
+                    hook_err = format!("{error:#}");
+                    step.fail("failed");
+                    HookOutcome::Failed
+                }
+                Ok((false, _out, err)) => {
+                    hook_err = err;
+                    step.fail("failed");
+                    HookOutcome::Failed
+                }
+                Ok((true, out, _err)) => match parse_hook_job_names(&out, &opts.common) {
+                    Err(error) => {
+                        hook_err = format!("{error:#}");
+                        step.fail("failed");
+                        HookOutcome::Failed
+                    }
+                    Ok(names) if names.is_empty() => {
+                        step.done("no matching hooks");
+                        HookOutcome::NoMatch
+                    }
+                    Ok(names) => {
+                        let delete = hook_jobs_delete_cmd(&opts.common, &names);
+                        ui.plumbing(&format!("+ {}", delete.display()));
+                        match run_capture(&delete).await {
+                            Err(error) => {
+                                hook_err = format!("{error:#}");
+                                step.fail("failed");
+                                HookOutcome::Failed
+                            }
+                            Ok((false, out, err)) => {
+                                for line in out.lines().chain(err.lines()) {
+                                    ui.plumbing(line);
+                                }
+                                hook_err = err;
+                                step.fail("failed");
+                                HookOutcome::Failed
+                            }
+                            Ok((true, out, err)) => {
+                                for line in out.lines().chain(err.lines()) {
+                                    ui.plumbing(line);
+                                }
+                                if out.trim().is_empty() {
+                                    step.done("already absent");
+                                    HookOutcome::NoMatch
+                                } else {
+                                    step.done("removed");
+                                    HookOutcome::Removed
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    };
 
     // Namespace sweep (runtime artifacts Helm does not own). Runs
     // UNCONDITIONALLY: it is Helm-independent by design (#707) and is what
@@ -873,8 +1163,10 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     // error whose exit class and message follow from the outcomes plus stderr.
     teardown_result(
         helm_outcome,
+        hook_outcome,
         sweep_outcome,
         &helm_err,
+        &hook_err,
         &sweep_err,
         &opts.common,
     )
@@ -892,7 +1184,20 @@ pub struct HelmRevision {
     pub revision: u32,
     pub status: String,
     pub chart: String,
+    pub app_version: String,
     pub description: String,
+}
+
+impl HelmRevision {
+    /// Application version this Helm revision installed: `app_version` when
+    /// helm supplied it, otherwise the trailing version on `chart`.
+    pub fn application_version(&self) -> Option<String> {
+        let app = self.app_version.trim();
+        if !app.is_empty() {
+            return Some(crate::schema_window::normalize_app_version(app));
+        }
+        crate::schema_window::version_from_chart(&self.chart)
+    }
 }
 
 /// The revision statuses it is safe to roll back TO. Everything else
@@ -901,7 +1206,7 @@ pub struct HelmRevision {
 /// rolling back to it re-applies a manifest that was never known good.
 const ROLLBACK_ELIGIBLE_STATUSES: [&str; 2] = ["deployed", "superseded"];
 
-fn is_eligible_rollback_status(status: &str) -> bool {
+pub(crate) fn is_eligible_rollback_status(status: &str) -> bool {
     ROLLBACK_ELIGIBLE_STATUSES.contains(&status.trim().to_ascii_lowercase().as_str())
 }
 
@@ -1139,6 +1444,7 @@ pub fn parse_helm_history(json: &str) -> Result<Vec<HelmRevision>> {
             revision,
             status,
             chart: field("chart"),
+            app_version: field("app_version"),
             description: field("description"),
         });
     }
@@ -1178,6 +1484,27 @@ pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
+/// Read the live Alembic revision from the running API pod before Helm mutates.
+pub fn live_schema_revision_cmd(o: &CommonOpts) -> OpsCommand {
+    let deploy = chart_fullname(&o.release).resource("api");
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("exec"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain(format!("deploy/{deploy}")),
+            plain("-c"),
+            plain("api"),
+            plain("--"),
+            plain("alembic"),
+            plain("-c"),
+            plain("alembic.ini"),
+            plain("current"),
+        ],
+    )
+}
+
 /// `helm rollback` to an explicit revision. Always explicit: the whole point of
 /// the verb is that helm's own default target (the immediately preceding
 /// revision) is the wrong one on a failed/superseded history.
@@ -1206,12 +1533,16 @@ fn helm_rollback_cmd_to(o: &CommonOpts, revision: String) -> OpsCommand {
 }
 
 /// The commands `curie cluster rollback` runs (and prints under `--dry-run`):
-/// the history read that decides the target, then the rollback itself. A `None`
-/// revision is one the caller has not resolved yet, and stands in the argv as
-/// [`SELECTED_REVISION`].
+/// the history read that decides the target, the live-schema probe, then the
+/// rollback itself. A `None` revision is one the caller has not resolved yet,
+/// and stands in the argv as [`SELECTED_REVISION`].
 pub fn rollback_commands(o: &CommonOpts, revision: Option<u32>) -> Vec<OpsCommand> {
     let target = revision.map_or_else(|| SELECTED_REVISION.to_string(), |r| r.to_string());
-    vec![helm_history_cmd(o), helm_rollback_cmd_to(o, target)]
+    vec![
+        helm_history_cmd(o),
+        live_schema_revision_cmd(o),
+        helm_rollback_cmd_to(o, target),
+    ]
 }
 
 /// One printed plan line. `display()` everywhere, except that it shell-quotes
@@ -1357,6 +1688,60 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         None => select_rollback_revision(&history)?.require_eligible()?,
     };
 
+    if !opts.disable_schema_gate {
+        require_on_path("kubectl")?;
+        let target_row = history
+            .iter()
+            .find(|row| row.revision == choice.to_revision);
+        let target_app = target_row.and_then(HelmRevision::application_version);
+        let history_apps: Vec<String> = history
+            .iter()
+            .filter_map(HelmRevision::application_version)
+            .collect();
+        let probe = live_schema_revision_cmd(&opts.common);
+        ui.plumbing(&format!("+ {}", probe.display()));
+        let (ok, probe_out, probe_err) = run_capture(&probe).await?;
+        if !ok {
+            let detail = crate::schema_window::redact_probe_text(
+                probe_err
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("kubectl exec exited nonzero with no message"),
+            );
+            return Err(crate::exit::CliError::failure(format!(
+                "refusing rollback: could not read the live database revision from the API pod: {detail}"
+            ))
+            .with_fix(format!(
+                "confirm the API is running with `curie cluster status --release {} --namespace {}` and retry",
+                opts.common.release, opts.common.namespace
+            ))
+            .into());
+        }
+        let live =
+            crate::schema_window::parse_alembic_current_output(&probe_out).ok_or_else(|| {
+                crate::exit::CliError::failure(
+                    "refusing rollback: the API pod did not report a live database revision",
+                )
+                .with_fix("confirm the API is running with `curie cluster status` and retry")
+            })?;
+        let Some(target_app) = target_app else {
+            return Err(crate::exit::CliError::failure(format!(
+                "refusing rollback to Helm revision {}: no application version on that revision",
+                choice.to_revision
+            ))
+            .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
+            .into());
+        };
+        if let Err(refusal) =
+            crate::schema_window::check_target_schema(&target_app, &live, &history_apps)
+        {
+            return Err(crate::exit::CliError::failure(refusal.message)
+                .with_fix(refusal.fix)
+                .into());
+        }
+    }
+
     // Disclosed BEFORE the prompt, and on stderr like `cluster down` does it:
     // the operator confirms knowing both the target and what was passed over,
     // which is the difference this verb exists to make. It cannot go through
@@ -1445,11 +1830,17 @@ pub struct PodRow {
     pub name: String,
     pub ready: String,
     pub status: String,
+    pub mail_channel: Option<crate::mail_channel::Report>,
 }
 
 impl PodRow {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({"pod": self.name, "ready": self.ready, "status": self.status})
+        let mut row =
+            serde_json::json!({"pod": self.name, "ready": self.ready, "status": self.status});
+        if let Some(report) = &self.mail_channel {
+            row["mail_channel"] = serde_json::to_value(report).expect("mail_channel serializes");
+        }
+        row
     }
 }
 
@@ -1514,7 +1905,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
         let display_status = if terminating {
             "Terminating"
         } else if !reason.is_empty() {
-            reason
+            convergence::reason(reason)
         } else {
             phase
         };
@@ -1522,6 +1913,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
             name: name.clone(),
             ready: ready_col,
             status: display_status.to_string(),
+            mail_channel: None,
         });
         if phase == "Succeeded" || reason == "Completed" || terminating {
             continue;
@@ -2235,7 +2627,7 @@ pub enum SlackApiBase {
 /// `nameOverride`/`fullnameOverride` move it again. Guessing the name is the
 /// defect `release_secret_name` already avoids by selecting on labels, and this
 /// selects the same way for the same reason.
-fn worker_deployment_selector(release: &str) -> String {
+pub fn worker_deployment_selector(release: &str) -> String {
     component_selector(release, "worker")
 }
 
@@ -3284,6 +3676,19 @@ async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentD
     preferred_probe_outcome(api, worker)
 }
 
+/// The per-process memo behind [`release_fullname`]. One
+/// [`tokio::sync::OnceCell`] per `(namespace, release)`, handed out under a std
+/// mutex that is never held across an await.
+type ReleaseFullnameCache = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String),
+        std::sync::Arc<tokio::sync::OnceCell<ReleaseFullname>>,
+    >,
+>;
+
+static RELEASE_FULLNAME_CACHE: std::sync::LazyLock<ReleaseFullnameCache> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// The release's fullname: discovered from the cluster, falling back to the
 /// chart's no-override rule.
 ///
@@ -3307,17 +3712,53 @@ async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentD
 /// and `--dry-run` paths, which are contractually cluster-offline
 /// (`cli/tests/cluster_connection_transport.rs`). Under `--dry-run`, call
 /// [`chart_fullname`] directly and make no cluster call at all.
+///
+/// MEMOIZED for the lifetime of the process, keyed by `(namespace, release)`.
+/// A single verb resolves the same release's fullname from several places --
+/// `doctor` asks once through `discover_api_url` and again through
+/// `api_nodeport`, and `cluster status` needs it for two Service reads -- and
+/// each of those was a separate kubectl round trip for an answer the process
+/// already had. The [`tokio::sync::OnceCell`] also dedups CONCURRENT callers,
+/// so two probes joined into one stage issue one discovery between them rather
+/// than racing to make the same call twice.
+///
+/// Two consequences, both deliberate:
+///
+/// - The fallback warning is emitted ONCE per process instead of once per
+///   call. It says the rendered name could not be discovered, which is a fact
+///   about the run, not about the call site; repeating it per caller was noise.
+/// - Every outcome is cached, the [`chart_fullname`] fallback included. That is
+///   safe because no verb resolves a fullname both BEFORE and AFTER mutating
+///   the cluster within one process: `cluster up` and `cluster down` never call
+///   this (they name chart resources through the chart's own templates), so
+///   there is no window in which a cached miss could outlive the install that
+///   would have turned it into a hit.
 pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname {
-    match discover_release_fullname(namespace, release).await {
-        ComponentDiscovery::Found(fullname) => fullname,
-        outcome => {
-            let fallback = chart_fullname(release);
-            if let Some(warning) = outcome.fallback_warning(namespace, release, &fallback) {
-                crate::ui::ui().warn(&warning);
+    // The std mutex is held only long enough to hand back this key's cell --
+    // never across the await below, which is what would deadlock the runtime.
+    let cell = {
+        let mut cache = RELEASE_FULLNAME_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entry((namespace.to_string(), release.to_string()))
+            .or_default()
+            .clone()
+    };
+    cell.get_or_init(|| async {
+        match discover_release_fullname(namespace, release).await {
+            ComponentDiscovery::Found(fullname) => fullname,
+            outcome => {
+                let fallback = chart_fullname(release);
+                if let Some(warning) = outcome.fallback_warning(namespace, release, &fallback) {
+                    crate::ui::ui().warn(&warning);
+                }
+                fallback
             }
-            fallback
         }
-    }
+    })
+    .await
+    .clone()
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
@@ -3484,10 +3925,14 @@ pub async fn discover_api_url(namespace: &str, release: &str) -> Result<String> 
     // This function is only reached when no `--api-url` was supplied, so it is
     // already a cluster path: resolving the fullname here keeps the explicit
     // `--api-url` and `--dry-run` routes free of any kubectl call.
-    let fullname = release_fullname(namespace, release).await;
+    //
+    // The host lookup needs no fullname, so it runs alongside the resolution
+    // rather than behind it -- the same idiom as
+    // `cluster_observability_endpoints`. Only the Service reads below have to
+    // wait for the name.
+    let (fullname, host) = tokio::join!(release_fullname(namespace, release), resolve_node_host());
     let ui_svc = fullname.resource("ui");
     let api_svc = fullname.resource("api");
-    let host = resolve_node_host().await;
 
     if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, &fullname, "ui")).await {
         return ui_api_url_from_parts(&ui_json, host.as_deref());
@@ -3970,6 +4415,24 @@ mod tests {
 
     use crate::ops::testsupport::*;
 
+    fn complete_teardown(
+        helm: HelmOutcome,
+        sweep: SweepOutcome,
+        helm_err: &str,
+        sweep_err: &str,
+        o: &CommonOpts,
+    ) -> anyhow::Result<ClusterDownOutput> {
+        teardown_result(
+            helm,
+            HookOutcome::NoMatch,
+            sweep,
+            helm_err,
+            "",
+            sweep_err,
+            o,
+        )
+    }
+
     // #707 ownership-aware teardown. `down` deletes only the namespaces THIS
     // release created (carrying the release-scoped ownership label `up` stamped),
     // instead of the old hardcoded `curie agent-sandbox-system` literal sweep.
@@ -4228,35 +4691,59 @@ mod tests {
 
         // Happy path: helm removed, sweep clean -> nothing outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed
+            ),
             Vec::<TeardownStep>::new()
         );
         // Already-absent release, sweep clean -> still nothing outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Absent, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Absent,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed
+            ),
             Vec::<TeardownStep>::new()
         );
         // Fail-forward win: helm failed but the sweep removed the namespaces
         // (compute stopped); only the stale helm release record remains.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::Removed),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Removed
+            ),
             vec![HelmUninstall]
         );
         // Nothing could be removed; the API server is still unreachable.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::Failed),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Failed
+            ),
             vec![HelmUninstall, NamespaceSweep]
         );
         // Helm removed but the sweep failed -> only the sweep is outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::Failed),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::Failed
+            ),
             vec![NamespaceSweep]
         );
         // #768: a zero-match sweep (pre-existing namespace, never labeled by
         // #707) is a completed step, same as an actual removal -- there is
         // nothing left for THIS step to do, so it must not be outstanding.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Removed, SweepOutcome::NoMatch),
+            outstanding_steps(
+                HelmOutcome::Removed,
+                HookOutcome::NoMatch,
+                SweepOutcome::NoMatch
+            ),
             Vec::<TeardownStep>::new()
         );
         // #768: helm failed and the sweep matched nothing -> only the helm
@@ -4264,7 +4751,11 @@ mod tests {
         // but critically it did NOT stop any compute, unlike the Removed case
         // above.
         assert_eq!(
-            outstanding_steps(HelmOutcome::Failed, SweepOutcome::NoMatch),
+            outstanding_steps(
+                HelmOutcome::Failed,
+                HookOutcome::NoMatch,
+                SweepOutcome::NoMatch
+            ),
             vec![HelmUninstall]
         );
     }
@@ -4446,7 +4937,7 @@ mod tests {
     #[test]
     fn teardown_result_all_removed_is_success() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Removed, SweepOutcome::Removed, "", "", &o)
+        let res = complete_teardown(HelmOutcome::Removed, SweepOutcome::Removed, "", "", &o)
             .expect("a complete teardown is Ok");
         assert!(matches!(
             res,
@@ -4460,7 +4951,7 @@ mod tests {
     #[test]
     fn teardown_result_absent_release_is_success_absent() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Absent, SweepOutcome::Removed, "", "", &o)
+        let res = complete_teardown(HelmOutcome::Absent, SweepOutcome::Removed, "", "", &o)
             .expect("an already-absent release still completes");
         assert!(matches!(
             res,
@@ -4480,7 +4971,7 @@ mod tests {
         let helm_err =
             "Kubernetes cluster unreachable: Get \"https://h:6443/version\": net/http: TLS handshake timeout";
         let sweep_err = "Kubernetes cluster unreachable: connection refused";
-        let err = teardown_result(
+        let err = complete_teardown(
             HelmOutcome::Failed,
             SweepOutcome::Failed,
             helm_err,
@@ -4516,7 +5007,7 @@ mod tests {
     fn teardown_result_connectivity_helm_only_failed_surfaces_swept_and_helm_resume() {
         let o = common_distinct_release();
         let helm_err = "Kubernetes cluster unreachable: net/http: TLS handshake timeout";
-        let err = teardown_result(HelmOutcome::Failed, SweepOutcome::Removed, helm_err, "", &o)
+        let err = complete_teardown(HelmOutcome::Failed, SweepOutcome::Removed, helm_err, "", &o)
             .expect_err("a stale helm record is still an incomplete teardown");
 
         let (class, fix) = crate::exit::classify(&err);
@@ -4555,7 +5046,7 @@ mod tests {
     fn teardown_result_zero_match_sweep_never_claims_compute_was_removed() {
         let o = common_distinct_release();
         let helm_err = "Kubernetes cluster unreachable: net/http: TLS handshake timeout";
-        let err = teardown_result(HelmOutcome::Failed, SweepOutcome::NoMatch, helm_err, "", &o)
+        let err = complete_teardown(HelmOutcome::Failed, SweepOutcome::NoMatch, helm_err, "", &o)
             .expect_err("a stale helm record is still an incomplete teardown");
 
         let shown = err.to_string();
@@ -4595,7 +5086,7 @@ mod tests {
     #[test]
     fn teardown_result_zero_match_sweep_with_helm_removed_is_still_success() {
         let o = common_distinct_release();
-        let res = teardown_result(HelmOutcome::Removed, SweepOutcome::NoMatch, "", "", &o)
+        let res = complete_teardown(HelmOutcome::Removed, SweepOutcome::NoMatch, "", "", &o)
             .expect("a zero-match sweep alongside a clean helm uninstall is a complete teardown");
         assert!(matches!(
             res,
@@ -4614,7 +5105,7 @@ mod tests {
         let o = common_distinct_release();
         let forbidden =
             "Error: query: failed to query with labels: namespaces is forbidden: User cannot list resource \"namespaces\"";
-        let err = teardown_result(
+        let err = complete_teardown(
             HelmOutcome::Failed,
             SweepOutcome::Failed,
             forbidden,
@@ -4666,7 +5157,7 @@ mod tests {
             "Error: Kubernetes cluster unreachable: Get \"https://h:6443/version\": dial tcp 10.0.0.1:6443: connect: connection refused";
         let sweep_err =
             "Error: namespaces is forbidden: User \"sa\" cannot delete resource \"namespaces\" in API group";
-        let err = teardown_result(
+        let err = complete_teardown(
             HelmOutcome::Failed,
             SweepOutcome::Failed,
             helm_err,
@@ -4762,7 +5253,7 @@ mod tests {
     fn teardown_result_helm_failure_with_multibyte_stderr_does_not_panic() {
         let o = common_distinct_release();
         let helm_err = String::from_utf8_lossy(b"abcde\xe9fghij\n").into_owned();
-        let err = teardown_result(
+        let err = complete_teardown(
             HelmOutcome::Failed,
             SweepOutcome::Removed,
             &helm_err,

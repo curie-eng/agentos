@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import email.utils
 import hashlib
+import json
 import logging
 import secrets
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import Any
 
 from .agentmail import AgentMailClient, request
@@ -37,6 +41,10 @@ CAUSE_MAX_CHARS = 120
 REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
 
 
+class ProviderThreadDeletedError(RuntimeError):
+    """The provider definitively rejected the thread lookup with HTTP 404."""
+
+
 class MailAdapter:
     """One AgentMail inbox bridged to one Curie channel binding."""
 
@@ -52,12 +60,41 @@ class MailAdapter:
         self.ready = threading.Event()
         self.lock = self.state.lock
         self.owner = secrets.token_hex(16)
+        self.last_ingress_status: int | None = None
+        self.channel_token_rejected = False
         self.seen: OrderedDict[str, bool] = OrderedDict()
         for message_id in self.state.known_message_ids():
             self._mark_seen(message_id)
         # Opaque pagination is a discovery hint only. Durable pending ids, never
         # this cursor, are the source of truth across a restart.
         self.page_cursor: str | None = None
+
+    def status(self) -> dict[str, Any]:
+        """Report diagnostic claims only; the adapter cannot verify the signature."""
+        token = self.config.channel_token
+        exp = _token_expiry(token)
+        with self.lock:
+            rejected = self.channel_token_rejected
+            last_status = self.last_ingress_status
+        now = time.time()
+        state = "ok"
+        if not self.config.ingress_enabled:
+            state = "disabled"
+        elif not token:
+            state = "missing"
+        elif exp is None:
+            state = "invalid"
+        elif exp <= now:
+            state = "expired"
+        elif rejected:
+            state = "rejected"
+        elif exp <= now + 300:
+            state = "expiring"
+        return {
+            "status": "ready" if self.ready.is_set() else "starting",
+            "channel_token": {"present": bool(token), "exp": exp, "state": state},
+            "last_ingress_status": last_status,
+        }
 
     # -- startup and ingress ------------------------------------------------
 
@@ -415,6 +452,22 @@ class MailAdapter:
                 headers,
                 max_response_bytes=self.config.max_body_bytes,
             )
+            with self.lock:
+                self.last_ingress_status = result.status
+                was_rejected = self.channel_token_rejected
+                if result.status == 401:
+                    self.channel_token_rejected = True
+                elif result.status == 200:
+                    self.channel_token_rejected = False
+            if result.status == 401 and not was_rejected:
+                exp = _token_expiry(self.config.channel_token)
+                expires = datetime.fromtimestamp(exp, UTC).isoformat() if exp else "unknown"
+                logger.warning(
+                    "channel token rejected by the platform (exp %s); re-mint with "
+                    "POST /channels/token using the platform X-API-Key and install the "
+                    "replacement CURIE_CHANNEL_TOKEN, then restart the adapter",
+                    expires,
+                )
             if result.status == 0:
                 logger.warning("ingress transport failure on attempt=%d", attempt)
                 if attempt < self.config.ingress_attempts:
@@ -481,6 +534,22 @@ class MailAdapter:
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
         status, thread = self.client.get_thread(conversation_id)
+        if status == 404:
+            # Only the PROVIDER's own answer is deletion. `request` parses a JSON
+            # body and hands back the raw text when it is not JSON, so a 404
+            # carrying anything but an object came from something between us and
+            # AgentMail -- an edge or gateway 404 page, a stale route mid-deploy,
+            # a path that never reached the API. Believing one of those writes a
+            # PERMANENT tombstone (`delete_event`) after which no retry ever
+            # calls the provider again, and the reply is lost with the release
+            # otherwise healthy. Ambiguity retries; only a confirmed answer is
+            # terminal, which is the invariant CLAUDE.md already states.
+            if not isinstance(thread, dict):
+                logger.warning(
+                    "thread listing -> 404 with no provider body; durable witness unreadable"
+                )
+                return None
+            raise ProviderThreadDeletedError
         if status != 200 or not isinstance(thread, dict):
             logger.warning("thread listing -> %s; durable witness unreadable", status)
             return None
@@ -502,12 +571,25 @@ class MailAdapter:
             )
             return 200
         claim = self.state.claim_event(event_id, conversation_id, reply_ref, self.owner)
+        if claim == "deleted":
+            return 410
         if claim == "done":
             return 200
         if claim == "busy":
             return 503
         try:
-            carries = self.thread_carries(conversation_id, event_id)
+            try:
+                carries = self.thread_carries(conversation_id, event_id)
+            except ProviderThreadDeletedError:
+                exists, _text = self.state.reply_text(conversation_id, reply_ref)
+                if not exists:
+                    return 502
+                self.state.delete_event(event_id, conversation_id, reply_ref)
+                logger.warning(
+                    "reply terminal: thread deleted at provider; correlation=%s",
+                    _correlation(event_id),
+                )
+                return 410
             if carries is None:
                 return 502
             if carries:
@@ -579,3 +661,32 @@ def _retry_after_seconds(headers: dict[str, str]) -> float:
 def _correlation(value: str) -> str:
     """A stable one-way token for joining logs without exposing provider identifiers."""
     return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _token_expiry(token: str) -> int | None:
+    """Read an unverified exp from the platform's chn.payload.signature format.
+
+    This diagnoses expiry without giving the adapter a platform signing key.
+    Only the platform ingress response can establish credential acceptance.
+    """
+    if len(token) > 16_384:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != "chn" or not parts[2]:
+        return None
+    try:
+        payload = json.loads(
+            base64.b64decode(
+                parts[1] + "=" * (-len(parts[1]) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+        )
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
+    exp = payload.get("exp") if isinstance(payload, dict) else None
+    # bool is an int subclass, and timestamps outside datetime's range cannot
+    # be safely formatted in the operator diagnosis.
+    if isinstance(exp, int) and not isinstance(exp, bool) and 0 < exp < 253_402_300_800:
+        return exp
+    return None

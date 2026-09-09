@@ -95,12 +95,12 @@ from .behaviorpacks import (
 )
 from .binding import DECISION_ENV, GRANT_TOOL_ENV, RESUMED_KIND_ENV, BindingResolver
 from .config import WorkerConfig
-from .delivery_lease import DeliveryLease
+from .delivery_lease import DeliveryLease, LeaseLostError
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
 from .receipt import render_receipt
-from .reply_sink import ObservedReplySink, ReplySink, TargetRoute
+from .reply_sink import DeletedReplyTargetError, ObservedReplySink, ReplySink, TargetRoute
 from .runner_client import (
     RunnerClient,
     RunnerError,
@@ -683,6 +683,7 @@ class _ThrottledReply:
         no_edit: bool = False,
         best_effort: bool = False,
         on_ref: Callable[[str], None] | None = None,
+        on_final: Callable[[], None] | None = None,
     ) -> None:
         self._sink = ObservedReplySink(sink)
         self._target = target
@@ -690,6 +691,11 @@ class _ThrottledReply:
         # delivery paths edit the same message this streamer created. Only fires
         # on a placeholder-less turn, where the first emit posts rather than edits.
         self._on_ref = on_ref
+        # Told when the FINAL flush is attempted (#2433), mirroring ``on_ref``.
+        # ``stream`` and ``context`` deliberately never call it: a streamed
+        # fragment is a preview, not the answer, and one of #2433's three named
+        # shapes is the turn that streamed partial text and then raised.
+        self._on_final = on_final
         self._min_interval_s = min_interval_s
         self._no_edit = no_edit
         self._last = 0.0
@@ -754,6 +760,11 @@ class _ThrottledReply:
             logger.warning("context reply update failed: %s", type(exc).__name__)
 
     async def finalize(self, text: str) -> None:
+        # First statement, BEFORE the early return: an identical final means the
+        # last streamed edit already IS the answer, so it is delivered and must
+        # mark. Before the emit for the same reason ``_reply_for`` marks first.
+        if self._on_final is not None:
+            self._on_final()
         if text == self._last_text:
             return
         self._last_text = text
@@ -869,6 +880,17 @@ class Kernel:
         # deliberately NOT a cache across turns -- a later turn on the same
         # thread gets its own message, exactly as a Slack mention does.
         self._minted_refs: dict[str, str] = {}
+        # Event ids whose TERMINAL person-facing send was attempted during THIS
+        # delivery (#2433). An attempt counts even if it raised: an ambiguous
+        # delivery failure may still have landed remotely, and the fail-safe
+        # direction is to treat the person as already answered rather than
+        # overwrite the answer with a notice telling them to send it again.
+        # Booting edits and streaming previews deliberately never mark: the first
+        # is the placeholder saying work started, and a streamed fragment is not
+        # an answer. Bounded exactly as ``_minted_refs`` is -- every successful or
+        # cancelled turn clears its own entry in ``process_event``'s finally, and
+        # a FAILED one is cleared by the notice that reads it.
+        self._terminal_reply_attempted: set[str] = set()
 
     def _target_for(self, qevent: QueuedTurn) -> ReplyTarget:
         """This turn's reply target, including any ref minted during the turn.
@@ -907,6 +929,7 @@ class Kernel:
         text: str,
         *,
         best_effort_unreachable: bool = False,
+        terminal: bool = True,
     ) -> ReplyAck:
         """Deliver platform-authored text for this turn, adopting any minted ref.
 
@@ -918,10 +941,18 @@ class Kernel:
             route: This turn's egress route.
             text: The platform-authored text.
             best_effort_unreachable: Swallow an unreachable transport rather than raising.
+            terminal: Whether this text is the turn's RESULT for the person
+                (#2433). True for every caller that answers, drops, escalates or
+                notifies; False for the two booting edits and for the
+                not-started notice itself, none of which is a result.
 
         Returns:
             The adapter's acknowledgement.
         """
+        if terminal:
+            # Marked BEFORE the send, never after, so an exception from ``_reply``
+            # cannot skip the mark for text that may already be on the screen.
+            self._terminal_reply_attempted.add(qevent.event_id)
         ack = await self._reply(
             self._target_for(qevent),
             route,
@@ -930,6 +961,127 @@ class Kernel:
         )
         self._adopt_ref(qevent, ack)
         return ack
+
+    async def notify_turn_not_started(
+        self, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
+    ) -> None:
+        """Tell the person their turn failed and is waiting for its retry (#2433).
+
+        Called from the consumer's ``except`` branch, where a delivery whose
+        handler raised is left pending. The log there is the operator's surface
+        and it always worked; the person on the other end of the thread had none,
+        and sat on the dispatcher's placeholder until the delivery was
+        redelivered.
+
+        It fires REGARDLESS of ``slack_no_edit_streaming``. That flag's promise is
+        "the placeholder gets exactly one chat.update: the final". A turn that
+        never finished emits no final, so obeying it here would leave the
+        placeholder frozen, the reported bug reproduced inside its fix.
+
+        It is best-effort by construction: a Slack outage may not turn a pending
+        delivery into a failed one, so nothing here raises. ``CancelledError``
+        still propagates, because cooperative shutdown is not a notice failure.
+
+        A placeholder-less turn (CLI, job, hook) is skipped entirely: with nothing
+        to edit, ``_reply_for`` POSTS a new message and adopts the minted ref,
+        which would hand every such failure a spurious message it never had.
+
+        Args:
+            qevent: The queued turn whose delivery failed.
+            lease: This delivery's ownership fence, when the caller holds one.
+        """
+        event_id = qevent.event_id
+
+        # Popped FIRST so the entry cannot leak if a later guard returns early.
+        # This is the in-process half of the delivered-answer guard: some
+        # person-facing RESULT was already sent during this delivery, and the
+        # notice must not overwrite it with an invitation to resend.
+        attempted = event_id in self._terminal_reply_attempted
+        self._terminal_reply_attempted.discard(event_id)
+
+        if qevent.reply_handle.placeholder is None:
+            logger.debug(
+                "event %s has no placeholder to edit; no not-started notice",
+                event_id,
+            )
+            return
+
+        if attempted:
+            logger.warning(
+                "skipping the not-started notice for event %s: this delivery had "
+                "already sent the person a result, and an ambiguous send may still "
+                "have landed",
+                event_id,
+            )
+            return
+
+        try:
+            # The durable half. ``is_terminal``, not a bare done marker: a DONE
+            # outbox record proves the turn finished just as well and outlives the
+            # marker. ``_complete`` emits the reply BEFORE it settles, so a settle
+            # that applies in Valkey and then loses its response unwinds into the
+            # consumer's except branch with the answer already on the person's
+            # screen and the done marker already written.
+            already_terminal = await self._markers.is_terminal(event_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # FAIL CLOSED. The two errors are not symmetric: a notice skipped for
+            # a turn that did fail costs the person the seconds until the
+            # lease-expiry reclaim redelivers, which is the behaviour before this
+            # change; a notice sent for a turn that succeeded costs them the
+            # answer permanently.
+            logger.warning(
+                "terminality unreadable for event %s; skipping the not-started "
+                "notice rather than risk overwriting a delivered answer",
+                event_id,
+                exc_info=True,
+            )
+            return
+
+        if already_terminal:
+            logger.warning(
+                "event %s failed after settling terminally; leaving its delivered "
+                "reply in place rather than promising a retry that cannot happen",
+                event_id,
+            )
+            return
+
+        if lease is not None:
+            try:
+                # Re-checked at the emission boundary, AFTER the terminality read:
+                # a heartbeat can mark the lease lost while that read is pending,
+                # so a check taken only at the call site is already stale by the
+                # time the edit happens. An in-process event read, no Valkey call:
+                # ADR-0131 fences four verbs (ACK, dead-letter, clear record,
+                # terminal result) and this non-terminal edit is none of them, and
+                # a stale notice is self-correcting because the replacement's own
+                # booting edit overwrites it within milliseconds of its acquire.
+                lease.raise_if_lost()
+            except LeaseLostError:
+                logger.warning(
+                    "skipping the not-started notice for event %s: this owner lost "
+                    "the delivery lease, and the current owner speaks for the "
+                    "thread",
+                    event_id,
+                )
+                return
+
+        try:
+            await self._reply_for(
+                qevent,
+                _route_from_handle(qevent),
+                self._config.turn_not_started_text,
+                terminal=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "the not-started notice for event %s could not be delivered",
+                event_id,
+                exc_info=True,
+            )
 
     async def process_event(
         self, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
@@ -944,6 +1096,9 @@ class Kernel:
         """
 
         error: BaseException | None = None
+        # A redelivery must never inherit an earlier delivery's terminal-send mark
+        # from this process (#2433).
+        self._terminal_reply_attempted.discard(qevent.event_id)
         with operation_span(
             "curie.turn.process",
             kind=SpanKind.INTERNAL,
@@ -974,6 +1129,13 @@ class Kernel:
                     {"outcome": "classified_failure", "error.class": type(exc).__name__},
                 )
             finally:
+                if not isinstance(error, Exception):
+                    # Success and cooperative cancellation clear the mark; a
+                    # FAILED delivery deliberately leaves it, because the
+                    # consumer's except branch has not read it yet.
+                    # ``CancelledError`` is a ``BaseException``, so it clears here
+                    # too: a cancelled turn is a shutdown, not a lost answer.
+                    self._terminal_reply_attempted.discard(qevent.event_id)
                 outcome = _LIFECYCLE_OUTCOME.get()
                 if outcome is None:
                     # A normal early return is the already-terminal skip. An
@@ -1942,6 +2104,12 @@ class Kernel:
         """
         try:
             await self._sink.emit(record.event, route=record.route)
+        except DeletedReplyTargetError as exc:
+            if await self._markers.dead_letter_completion(
+                record, generation=generation, reason=exc.reason
+            ):
+                logger.warning("turn.completed dead-lettered: %s", exc.reason)
+            return False
         except Exception as exc:  # noqa: BLE001 - the turn is already durably done
             logger.warning(
                 "turn.completed delivery failed for %s (%s); the outbox record stands",
@@ -2229,7 +2397,9 @@ class Kernel:
         defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
         if not self._config.slack_no_edit_streaming and not defer_job_booting:
             try:
-                await self._reply_for(qevent, route, self._config.booting_text)
+                await self._reply_for(
+                    qevent, route, self._config.booting_text, terminal=False
+                )
             except Exception:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
@@ -2281,15 +2451,18 @@ class Kernel:
             )
             if self._is_approval_resume(qevent.event_id):
                 return TurnOutcome(terminal_ok=False, classification="runner-error")
+            # Quota accounting is operator data and stops at the log line
+            # above (#2434). The quota's name, the resource axis and the three
+            # usage numbers reached a customer Slack channel verbatim on
+            # 2026-09-06; they say nothing to the person who asked a question
+            # and they disclose cluster capacity to anyone who can talk to the
+            # bot. `rejection` is still fully logged for the operator.
             await self._reply_for(
                 qevent,
                 route,
                 (
-                    "This agent is at sandbox capacity. ResourceQuota "
-                    f"{rejection.quota_name} rejected {rejection.resource}: "
-                    f"requested {rejection.requested}, observed usage "
-                    f"{rejection.used}, hard limit {rejection.hard}. Try again "
-                    "after another conversation releases its sandbox."
+                    "This agent is at capacity right now. It frees up when "
+                    "another conversation finishes, so please try again shortly."
                 ),
             )
             return TurnOutcome(terminal_ok=True)
@@ -2379,7 +2552,9 @@ class Kernel:
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
                 # minted ref before streaming so every later update edits it.
-                await self._reply_for(qevent, route, self._config.booting_text)
+                await self._reply_for(
+                    qevent, route, self._config.booting_text, terminal=False
+                )
             except asyncio.CancelledError:
                 close_routed_turn()
                 raise
@@ -3689,6 +3864,7 @@ class Kernel:
             # plan-ratified, not an oversight.
             best_effort=self._is_approval_resume(qevent.event_id),
             on_ref=lambda ref: self._adopt_ref(qevent, ReplyAck(ref=ref)),
+            on_final=lambda: self._terminal_reply_attempted.add(qevent.event_id),
         )
         try:
             # ``async with`` releases the aiohttp response on every exit path

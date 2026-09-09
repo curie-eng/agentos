@@ -148,10 +148,34 @@ API), or when ingress is enabled with an empty allow-list.
 
 `GET /healthz` answers 200 with a fixed body and reveals nothing about the
 install. `GET /readyz` stays non-200 until SQLite has opened and the first-start
-prime or restart confirmation has completed. After startup it checks local state
-only: an AgentMail outage does not flap readiness. `POST` to either path is not
-special-cased; it requires the egress secret like every other POST, so a probe
-path cannot become an unauthenticated write.
+prime or restart confirmation has completed. It also returns 503 when ingress is
+enabled and the configured channel token is missing, malformed, expired, or was
+rejected with HTTP 401. Expiry is checked on every probe, including before any
+inbound mail. An AgentMail outage does not flap readiness. Liveness remains 200
+so an expired credential does not create a restart loop.
+
+`GET /statusz` returns safe diagnostic metadata: token presence, the unverified
+`exp` claim as Unix seconds, state (`ok`, `expiring` within five minutes,
+`expired`, `rejected`, `missing`, `invalid`, or `disabled`), and the last platform
+ingress HTTP status since process start. It never returns the token or its
+channel identity. The adapter cannot verify the signature: `ok` means the
+decoded expiry is in the future and no 401 has been observed, not proof that
+the platform will accept the token. A 401 latches rejection until a successful
+ingress response or process restart. `POST` to a probe path still requires the
+egress secret like every other POST.
+
+`curie cluster status --json` includes these diagnostics on the mail pod and
+reports unhealthy for an unusable token. `curie doctor --json` reports a mail
+channel check with expiry, last ingress status, and a recovery command. Both
+read the adapter through Kubernetes pod proxy access, so diagnostics remain
+reachable after readiness removes the pod from Service endpoints. Unavailable
+diagnostics report unknown instead of healthy.
+
+For recovery, run `curie cluster channel-token <agent> --kind email --address <inbox>`.
+That mints a replacement via `POST /channels/token`, writes it into the Secret
+key supplying `CURIE_CHANNEL_TOKEN`, rolls the mail-adapter Deployment, and
+prints `exp` without printing the token. `curie doctor` reports the same `exp`
+and names that verb as the fix. No platform signing key is given to the adapter.
 
 ## Operations notes
 
@@ -188,6 +212,23 @@ path cannot become an unauthenticated write.
 - **The `chn` token expires.** The adapter cannot re-mint it (that would need a
   platform key it must not hold). It persists the ingress 401 and keeps the mail
   pending; the operator re-mints the scoped token and rolls the pod.
+- **Logs are single-line JSON on stderr, and export is opt-in.** The adapter
+  bootstraps the shared `curie-telemetry` service logger at start, so its output
+  is one JSON object per record on stderr carrying `service.name:
+  curie-mail-adapter`, a severity, the module logger name and a redacted
+  message, rather than the plain text earlier versions printed -- expect a
+  log-shipper or `kubectl logs` grep written against the old format to need
+  updating. With no `OTEL_EXPORTER_OTLP_ENDPOINT` set, nothing is exported
+  anywhere and only that redacting stderr handler runs, which is the supported
+  local and air-gapped mode. With the chart's in-cluster collector deployed
+  (`otelCollector.deploy=true`) the chart both sets the OTLP env and opens the
+  adapter's egress policy to the collector. With `otelCollector.deploy=false`
+  and an external `otelCollector.endpoint`, the env is set but the adapter's own
+  egress policy has no peer for that address, so the operator must apply an
+  additional egress policy selecting the adapter or the exports are silently
+  dropped -- see the mail-adapter section of `charts/curie/README.md`. What is
+  exported is log records: the adapter authors no spans of its own yet, so a
+  trace search for it comes back empty even on a healthy export path.
 
 ### State, privacy, and recovery
 
@@ -225,3 +266,23 @@ AgentMail's API and the platform's channel ingress. Everything inside
 `curie_mail_adapter` runs for real, the egress server included, and the boot
 gates are driven through the real `python -m curie_mail_adapter` entry point in a
 subprocess.
+
+### Deleted provider threads
+
+A thread lookup returning HTTP 404 after admission is terminal for that reply
+only when the 404 carries the provider's own JSON body. A 404 whose body is not
+JSON came from an edge, gateway or stale route rather than AgentMail, and stays
+retryable as an unreadable witness (502): the receipt below is permanent, and a
+signal this ambiguous must never write one.
+The adapter durably records deletion, logs one warning with a hashed correlation,
+and returns HTTP 410 on the first and any duplicate completion, including after
+restart. The response body carries `{"detail":"thread deleted at provider"}`;
+HTTP 410 without that explicit classification remains retryable for other adapters.
+It never records the reply as delivered. The worker dead-letters the
+completion on the first definitive refusal (N = 1) with reason `thread deleted
+at provider`, atomically removing its owed completion from the pending index.
+The existing configured dead-letter stream and size cap apply. Earlier transient
+failures do not spend this terminal budget: provider 5xx and transport failures
+still return 502 and remain retryable. A missing local admission record also
+remains retryable. HTTP 410 applies only to completion delivery; other reply
+events and other error statuses keep their existing retry behavior.

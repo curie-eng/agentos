@@ -95,9 +95,20 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CONSUMER_HEARTBEAT_TTL_MS",
         "CURIE_CONSUMER_NAME",
         "CURIE_DEAD_LETTER_MAXLEN",
+        # Reclaim scan policy for the WORKER's own maintenance tick (#2433):
+        # how idle a pending row whose delivery lease has expired must be before
+        # the lease-expiry pass may transfer it. Read from the worker's env by
+        # WorkerConfig and consumed by both consumer lanes' DeliverySpec. Nothing
+        # about it is ever injected into a sandbox claim.
+        "CURIE_LEASE_EXPIRED_IDLE_MS",
         "CURIE_MAX_ATTEMPTS",
         "CURIE_MAX_DELIVERY",
         "CURIE_SLACK_NO_EDIT_STREAMING",
+        # The person-facing line the KERNEL delivers to a channel when a
+        # delivery's handler raised and the entry was left pending (#2433),
+        # exactly like CURIE_BOOTING_TEXT above. Read from the worker's env by
+        # WorkerConfig; never a sandbox boot key.
+        "CURIE_TURN_NOT_STARTED_TEXT",
         # The per-adapter EGRESS credentials (ADR-0096 D4.2), read from the
         # WORKER's env by ``build_reply_sink`` and presented to a channel
         # adapter as ``X-Curie-Adapter-Secret``. Never a sandbox boot key, and
@@ -262,6 +273,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
         "CURIE_HARNESS",
+        # runner-local SDK deny list (#2429); read by the runner from its own env
+        # via extraEnv, unset keeps every tool available. Not a boot contract key.
+        "CURIE_DISALLOWED_TOOLS",
         # Delivery budget and ownership lease (ADR-0131, #1971), read from the
         # WORKER's env by WorkerConfig. Never a sandbox boot key: they govern
         # how the worker paces and reclaims its own delivery loop, not
@@ -308,6 +322,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_UPGRADE_DRAIN_TIMEOUT_S",
         "CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S",
         "CURIE_UPGRADE_QUIESCE_TTL_S",
+        # Installation-scoped upgrade authority (#2374), read only by the
+        # WORKER process and its worker-image hook entrypoint. These identify
+        # which release owns a marker, fence hook revisions, and enable the
+        # one-upgrade legacy bridge; none is injected into a runner sandbox.
+        "CURIE_INSTALLATION_ID",
+        "CURIE_UPGRADE_REVISION",
+        "CURIE_UPGRADE_LEGACY_QUIESCE",
     }
 )
 

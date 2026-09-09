@@ -18,9 +18,10 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -265,6 +266,15 @@ class PartialMessageBoundary:
     event_type: str
 
 
+@dataclass(frozen=True, slots=True)
+class StreamedToolUseBoundary:
+    """Sanitized evidence that the provider began a tool call."""
+
+    call_id: str = field(repr=False)
+    tool_name: str
+    observed_time_ns: int
+
+
 class ModelSession(Protocol):
     """One long-lived model session the runner drives turn by turn."""
 
@@ -308,6 +318,7 @@ def build_options(
     cwd: str | None = None,
     web_search_enabled: bool = True,
     policy_disallowed_tools: Iterable[str] = (),
+    disallowed_tools: list[str] | tuple[str, ...] | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -337,7 +348,17 @@ def build_options(
     # install has always said and must keep saying.
     thinking_option: dict[str, Any] = {"thinking": cast("Any", thinking)} if thinking else {}
     cwd_option: dict[str, Any] = {"cwd": cwd} if cwd is not None else {}
-    disallowed_tools = sorted(set(policy_disallowed_tools))
+    # The explicit operator denylist is an ordered configuration surface. Keep
+    # its order stable, then append the policy projection deterministically.
+    # A set-only merge reordered CURIE_DISALLOWED_TOOLS and broke parity with
+    # the fake session; filtering the policy tail also deduplicates names that
+    # both sources deny without changing the operator's declared order.
+    explicit_disallowed = list(dict.fromkeys(disallowed_tools or ()))
+    explicit_names = set(explicit_disallowed)
+    disallowed_tools = [
+        *explicit_disallowed,
+        *sorted(set(policy_disallowed_tools) - explicit_names),
+    ]
     if not web_search_enabled:
         disallowed_tools = [
             "WebSearch",
@@ -400,11 +421,26 @@ class ClaudeAgentSession:
             async with contextlib.aclosing(response):
                 async for message in response:
                     if isinstance(message, StreamEvent):
-                        event_type = (
-                            message.event.get("type")
-                            if isinstance(message.event, dict)
-                            else None
-                        )
+                        event = message.event
+                        event_type = event.get("type") if isinstance(event, dict) else None
+                        if event_type == "content_block_start":
+                            content_block = event.get("content_block")
+                            if isinstance(content_block, dict):
+                                call_id = content_block.get("id")
+                                tool_name = content_block.get("name")
+                                if (
+                                    content_block.get("type") == "tool_use"
+                                    and isinstance(call_id, str)
+                                    and call_id
+                                    and isinstance(tool_name, str)
+                                    and tool_name
+                                ):
+                                    yield StreamedToolUseBoundary(
+                                        call_id=call_id,
+                                        tool_name=tool_name,
+                                        observed_time_ns=time.time_ns(),
+                                    )
+                                    continue
                         if event_type in _ALLOWED_PARTIAL_BOUNDARY_TYPES:
                             # Do not forward the StreamEvent object: its event body,
                             # uuid, SDK session id, and parent tool id are all

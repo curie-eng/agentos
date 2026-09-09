@@ -26,6 +26,12 @@ _TURN_OUTCOMES: Final = [
     "side_effect_halted",
     "idle",
     "interrupted",
+    # "deadline_halted" (#2278): the worker lifecycle's wall-clock delivery
+    # deadline (ADR-0131), distinct from model-spend ``budget_halted``.
+    # ``record_metric`` raises on an out-of-domain outcome, so omitting this
+    # value crashes terminal completion after the turn has already settled
+    # and leaves the stream entry pending.
+    "deadline_halted",
 ]
 
 
@@ -113,7 +119,7 @@ _SANDBOX_INVENTORY_ATTRIBUTES = {
 }
 _RUNNER_RPC_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["event", "steer", "interrupt", "reset", "status"],
+    "operation": ["event", "steer", "interrupt", "reset", "status", "timeout"],
     "role": ["client"],
     "outcome": ["success", "failure", "conflict", "timeout"],
 }
@@ -135,6 +141,16 @@ _APPROVAL_PENDING_ATTRIBUTES = {
     "service.name": ["curie-api"],
     "operation": ["observe"],
     "outcome": ["pending"],
+}
+_COMPLETION_OUTBOX_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "operation": ["observe"],
+    "outcome": ["inflight", "retry", "terminal"],
+}
+_COMPLETION_OUTBOX_AGE_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "operation": ["observe"],
+    "outcome": ["retry"],
 }
 _REPLY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
@@ -199,6 +215,7 @@ _HTTP_OPERATIONS = [
     "/git-flow/routing-check",
     "/github/webhook",
     "/health",
+    "/ready",
     "/hooks/{agent_id}/{hook}",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
@@ -352,6 +369,20 @@ _METRICS: dict[str, dict[str, Any]] = {
     ),
     "curie.approval.pending.age": _definition(
         "gauge", "s", "Age of the oldest pending approval.", False, _APPROVAL_PENDING_ATTRIBUTES
+    ),
+    "curie.completion.outbox": _definition(
+        "gauge",
+        "{completion}",
+        "Completion-outbox records by inflight, retry, or terminal-delivery state.",
+        False,
+        _COMPLETION_OUTBOX_ATTRIBUTES,
+    ),
+    "curie.completion.outbox.age": _definition(
+        "gauge",
+        "s",
+        "Age of the oldest owed completion still retrying delivery.",
+        False,
+        _COMPLETION_OUTBOX_AGE_ATTRIBUTES,
     ),
     "curie.reply.delivery": _definition(
         "counter", "{reply}", "Reply delivery outcomes.", True, _REPLY_ATTRIBUTES

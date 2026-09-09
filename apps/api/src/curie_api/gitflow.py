@@ -396,6 +396,26 @@ def log_push_outcome(result: WebhookResult, payload: dict[str, object], *, sourc
     )
 
 
+def _rejected(exc: deploy.ApprovalRoutesUnbound | deploy.BundleTooLarge) -> WebhookResult:
+    """The rejection envelope for the two refusals `process_push` shares with the API.
+
+    `approval_routes.unbound` (#2436) can fire at three sites -- the two bundle
+    attachments and the deployment itself -- and `bundle.too_large` (ADR-0059
+    decision 3) at four: the reuse path's `deploy.yaml` read, the revalidation
+    before deployment, and both route gates, which extract a STORED object to
+    learn what it declares and so inherit the caps question. One home for all of
+    them, reading the code and the message off the exception itself, so what an
+    operator greps for cannot come out different depending on which check got
+    there first. The message is the exception's own, identical to the one the
+    API returns as a 422 detail.
+    """
+
+    return WebhookResult(
+        status="rejected",
+        errors=[{"code": exc.code, "message": str(exc)}],
+    )
+
+
 async def process_push(
     session: AsyncSession,
     store: ObjectStore,
@@ -545,11 +565,7 @@ async def process_push(
                 # as `bundle.unsupported` instead would regress an
                 # operator-facing error contract as a side effect of a
                 # performance fix.
-                raise deploy.BundleTooLarge(
-                    f"stored bundle for version {prebuilt.id} fails the current "
-                    f"bundle size/ratio limits and must be rebuilt and "
-                    f"re-uploaded: {exc}"
-                ) from exc
+                raise deploy.BundleTooLarge.for_stored_bundle(prebuilt.id, exc) from exc
         else:
             archive = await run_in_threadpool(
                 clone_and_archive,
@@ -559,7 +575,9 @@ async def process_push(
                 repo_full_name=trusted_repo_full_name,
                 ref=ref,
             )
-            extension, content_type = deploy.validate_archive(archive, settings)
+            extension, content_type = await run_in_threadpool(
+                deploy.validate_archive, archive, settings
+            )
             targets = await run_in_threadpool(_read_targets, archive, settings)
     except InvalidRepoFullName as exc:
         return WebhookResult(
@@ -586,9 +604,7 @@ async def process_push(
         # The same code the `revalidate_stored_bundle` block below returns, so a
         # legacy over-cap bundle reports identically whichever of the two
         # bounds checks reaches it first.
-        return WebhookResult(
-            status="rejected", errors=[{"code": "bundle.too_large", "message": str(exc)}]
-        )
+        return _rejected(exc)
     except deploy.BundleInvalid as exc:
         return WebhookResult(status="rejected", errors=exc.errors)
 
@@ -618,7 +634,28 @@ async def process_push(
     # version must not enqueue a second job for the same version.
     bundle_built = version is None or version.bundle_ref is None
     if bundle_built:
+        # Bundle-once, bind-many (ADR-0091). A sibling agent in this repository
+        # may already hold this exact commit -- the dev push that ran minutes
+        # ago. Reuse its stored object rather than uploading the same bytes
+        # again: prod then promotes not merely an identical artifact but the
+        # SAME one, which is what makes "promote what you validated" a property
+        # of the schema rather than of discipline. Resolved before anything is
+        # written, because it decides WHICH object the route check below has to
+        # read, and the lookup needs no version row of this agent's own.
+        sibling = await _bundled_version_for_commit(
+            session, repo_agents, after, exclude_agent_id=agent.id
+        )
         if version is None:
+            # The row, and only the row, precedes the refusal below: it is the
+            # BUNDLE that must not be written yet (#2436). A bundleless row is
+            # inert -- `_bundled_version_for_commit` returns only bundled rows,
+            # the worker's boot join requires a `bundle_ref`
+            # (`curie_worker.binding`), and `bundle_built` above stays true for
+            # it -- so a refused push leaves exactly the residue a store that
+            # failed after its row committed already leaves, and a repaired
+            # redelivery still counts as a build. It is created here rather than
+            # after the check because the refusal has to NAME a version, and
+            # `deploy` builds the one message both envelopes render.
             version = await crud.create_version_row(
                 session,
                 agent.id,
@@ -626,16 +663,51 @@ async def process_push(
                 created_by=GIT_FLOW_CREATED_BY,
                 commit_sha=after,
             )
-        # Bundle-once, bind-many (ADR-0091). A sibling agent in this repository
-        # may already hold this exact commit -- the dev push that ran minutes
-        # ago. Reuse its stored object rather than uploading the same bytes
-        # again: prod then promotes not merely an identical artifact but the
-        # SAME one, which is what makes "promote what you validated" a property
-        # of the schema rather than of discipline.
-        sibling = await _bundled_version_for_commit(
-            session, repo_agents, after, exclude_agent_id=agent.id
-        )
+        # The declared/bound approval-route join on the ATTACHMENT (#2436), run
+        # on every delivery that builds a bundle and BEFORE that bundle is
+        # written -- not, as it first landed, only when an active deployment
+        # already referenced this version.
+        #
+        # WHY IT PRECEDES THE WRITE rather than being left to the deployment
+        # gate below. `bundle_built` is `version.bundle_ref is None`, and it is
+        # also what gates the eval fan-out: a version's eval-as-CI run happens
+        # exactly once, on the delivery that builds its bundle. Both writers
+        # here -- `crud.attach_bundle` and `deploy.store_bundle` -- commit
+        # immediately, so a refusal arriving after either of them spends that
+        # one chance: the operator binds the missing route, redelivers the same
+        # sha, `bundle_built` is now false because the bundle is already stored,
+        # the deployment succeeds, and no eval ever runs for that version.
+        # Refusing first leaves the version bundleless, so the repaired
+        # redelivery is still a build and still fans out its eval, exactly once.
+        #
+        # Running it unconditionally also subsumes the "only when this version
+        # is already live" form this gate first had: refusing whether or not an
+        # active deployment points at the version is strictly the stronger of
+        # the two, and it keeps an unbound bundle out of the object store rather
+        # than merely off a deployment.
+        #
+        # Each branch checks the object it ACTUALLY attaches, and the two can
+        # differ: the sibling branch attaches `sibling.bundle_ref`, which a
+        # bundleless sibling version may have received as an API-uploaded gated
+        # bundle while this delivery cloned the original, ungated commit.
+        # Checking the in-hand archive there would pass on the ungated bytes and
+        # then commit the gated reference. Neither branch re-clones; the stored
+        # sibling object or the bytes already in hand are read (#1211).
         if sibling is not None:
+            try:
+                await deploy.check_approval_route_bindings(
+                    store, sibling, agent.approval_routes, settings
+                )
+            except (deploy.BundleTooLarge, deploy.ApprovalRoutesUnbound) as exc:
+                # `bundle.too_large` is live here, not theoretical: the sibling
+                # object is a DIFFERENT object from the archive
+                # `validate_archive` cleared moments ago, and on this path
+                # nothing revalidates it -- `bundle_built` is true, so the
+                # `revalidate_stored_bundle` block below is skipped. This gate's
+                # extract is the only bounds check the attached object gets, so
+                # an over-cap legacy sibling is refused here and is not attached
+                # (ADR-0059 decision 3).
+                return _rejected(exc)
             version = await crud.attach_bundle(
                 session, version, str(sibling.bundle_ref), str(sibling.bundle_sha256)
             )
@@ -647,6 +719,12 @@ async def process_push(
             # branch above attaches it. So `archive` here is always freshly
             # cloned, and `validate_archive` has always supplied the pair.
             assert extension is not None and content_type is not None
+            try:
+                await deploy.check_routes_from_bytes(
+                    archive, agent.approval_routes, version.id, settings
+                )
+            except deploy.ApprovalRoutesUnbound as exc:
+                return _rejected(exc)
             await deploy.store_bundle(
                 store, session, agent.id, version, archive, extension, content_type
             )
@@ -674,10 +752,38 @@ async def process_push(
         try:
             await deploy.revalidate_stored_bundle(store, version, settings)
         except deploy.BundleTooLarge as exc:
-            return WebhookResult(
-                status="rejected",
-                errors=[{"code": "bundle.too_large", "message": str(exc)}],
+            return _rejected(exc)
+
+    # The declared/bound approval-route join at the moment the version becomes
+    # the thing that boots (#2436), the push-side twin of the 422 that
+    # `POST /deployments` returns. After the revalidation above, so an over-cap
+    # legacy bundle still reports `bundle.too_large` first (ADR-0059 decision 3),
+    # and after `resolve_target_agent`, so the map judged is the RESOLVED
+    # agent's own: one repository builds several agents (ADR-0091), so a prod
+    # promote is re-evaluated against the prod agent's bindings and never
+    # inherits the dev pass. Reads the stored object, never a re-clone (#1211).
+    #
+    # REUSE PATH ONLY. This is where a prod promote, and a redelivery of a
+    # version that already carries its bundle, are refused -- the deliveries
+    # that write no bundle of their own and so never reach the pre-write gate
+    # above. On the build path that gate has already judged the very object this
+    # delivery attached (the sibling object, or the archive `store_bundle`
+    # wrote), against this same resolved agent's map, so repeating the check
+    # here would fetch and extract those bytes a second time to reach the
+    # identical answer.
+    if not bundle_built:
+        try:
+            await deploy.check_approval_route_bindings(
+                store, version, agent.approval_routes, settings
             )
+        except (deploy.BundleTooLarge, deploy.ApprovalRoutesUnbound) as exc:
+            # `bundle.too_large` is unreachable here while
+            # `revalidate_stored_bundle` above guards the same bytes under the
+            # same caps, and is caught anyway so the ordering is a property of
+            # this block rather than of that one: it stays ahead of
+            # `approval_routes.unbound` on the reuse path (ADR-0059 decision 3)
+            # even if the revalidation is ever moved or narrowed.
+            return _rejected(exc)
 
     deployment = await crud.create_deployment_row(
         session,

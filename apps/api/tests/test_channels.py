@@ -1102,17 +1102,23 @@ def _other_routes() -> list[tuple[str, str]]:
     anyone remembering to extend a list.
 
     The exclusions are the routes that carry no platform-key dependency at
-    all: `/health` and `/config` are deliberately open (the UI reads config
-    before it has a key), `/github/webhook` authenticates by GitHub's HMAC
-    signature, and `POST /console/session` authenticates on the login code in
-    its body (ADR-0083), never on a header credential. Excluded rather than
+    all: `/health`, `/ready`, and `/config` are deliberately open (the UI reads
+    config before it has a key), `/github/webhook` authenticates by GitHub's
+    HMAC signature, and `POST /console/session` authenticates on the login code
+    in its body (ADR-0083), never on a header credential. Excluded rather than
     asserted, because each would answer for a reason that has nothing to do with
     this token. `POST /console/login-codes` is NOT excluded: it does carry the
     platform-key dependency, so the sweep still asserts it refuses a `chn`
     token.
     """
 
-    open_paths = {"/health", "/config", "/github/webhook", "/console/session"}
+    open_paths = {
+        "/health",
+        "/ready",
+        "/config",
+        "/github/webhook",
+        "/console/session",
+    }
     routes: list[tuple[str, str]] = []
     for route in _walk(create_app().routes):
         if route.path.startswith("/channels") or route.path in open_paths:

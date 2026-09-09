@@ -10,9 +10,45 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
 #[allow(unused_imports)]
-use super::{command::*, providers::*, verbs::*};
+use super::{command::*, convergence, providers::*, verbs::*};
+
+/// Typed retained values use the same protected file lifecycle as credentials.
+/// Debug and command rendering expose field names only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivateHelmValues(pub(super) serde_json::Value, BTreeMap<String, String>);
+
+impl PrivateHelmValues {
+    pub(super) fn keys(&self) -> Vec<String> {
+        [
+            "mailAdapter",
+            "worker.adapterCredentials",
+            "worker.adapterCredentialsExistingSecret",
+            "worker.adapterCredentialsExistingSecretKey",
+        ]
+        .into_iter()
+        .filter(|key| {
+            self.0
+                .pointer(&format!("/{}", key.replace('.', "/")))
+                .is_some()
+        })
+        .map(str::to_string)
+        .collect()
+    }
+}
+
+impl std::fmt::Debug for PrivateHelmValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateHelmValues")
+            .field("keys", &self.keys())
+            .finish()
+    }
+}
 
 pub struct UpOpts {
+    /// Existing mail lifecycle and paired worker credentials, with explicit
+    /// operator overrides removed. Populated by the one release-values read.
+    pub retained_mail_values: Option<PrivateHelmValues>,
+
     pub common: CommonOpts,
     pub chart: String,
     pub no_expose: bool,
@@ -97,7 +133,17 @@ impl UpOpts {
 /// Preserved the same way generated secrets are: read back from the release and
 /// re-supplied through the values file, never argv, so a bot token cannot leak
 /// into `ps` or shell history.
-const COMMS_MANAGED_KEYS: &[&str] = &["dispatcher.slack.appToken", "dispatcher.slack.botToken"];
+const COMMS_MANAGED_KEYS: &[&str] = &[
+    "dispatcher.slack.appToken",
+    "dispatcher.slack.botToken",
+    "dispatcher.slack.signingSecret",
+    "dispatcher.slack.appTokenExistingSecret",
+    "dispatcher.slack.appTokenExistingSecretKey",
+    "dispatcher.slack.botTokenExistingSecret",
+    "dispatcher.slack.botTokenExistingSecretKey",
+    "dispatcher.slack.signingSecretExistingSecret",
+    "dispatcher.slack.signingSecretExistingSecretKey",
+];
 
 /// The chart values `cluster github-app` records (ADR-0092), preserved across a
 /// plain `cluster up` for exactly the reason [`COMMS_MANAGED_KEYS`] is.
@@ -146,6 +192,10 @@ const REQUIRED_SECRETS: &[(&str, usize)] = &[
 /// bearer token, failing auth in a way that reads like a permissions problem
 /// rather than a missing one (#1109). Preserved, never invented.
 pub(crate) const GITHUB_TOKEN_KEY: &str = "api.githubToken";
+const GITHUB_TOKEN_REFERENCE_KEYS: &[&str] = &[
+    "api.githubTokenExistingSecret",
+    "api.githubTokenExistingSecretKey",
+];
 
 /// What `cluster up` does with [`GITHUB_TOKEN_KEY`] on this run.
 ///
@@ -374,14 +424,7 @@ fn resolve_comms_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
-    let overridden = operator_set_keys(operator_sets);
-    COMMS_MANAGED_KEYS
-        .iter()
-        .filter(|key| !overridden.contains(**key))
-        .filter_map(|key| {
-            preserved_value(existing, key).map(|current| ((*key).to_string(), current))
-        })
-        .collect()
+    resolve_credential_values(existing, operator_sets, COMMS_MANAGED_KEYS)
 }
 
 /// Re-supply the [`GITHUB_APP_MANAGED_KEYS`] a previous `cluster github-app` recorded.
@@ -393,14 +436,7 @@ fn resolve_github_app_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
-    let overridden = operator_set_keys(operator_sets);
-    GITHUB_APP_MANAGED_KEYS
-        .iter()
-        .filter(|key| !overridden.contains(**key))
-        .filter_map(|key| {
-            preserved_value(existing, key).map(|current| ((*key).to_string(), current))
-        })
-        .collect()
+    resolve_credential_values(existing, operator_sets, GITHUB_APP_MANAGED_KEYS)
 }
 
 /// Supply the sealing keypair (ADR-0094), generating one only when safe.
@@ -426,6 +462,7 @@ fn resolve_github_app_values(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SealingPrivateKeyDisposition {
     OperatorSet,
+    External,
     Deferred,
     Preserved,
     Generated,
@@ -439,7 +476,17 @@ fn sealing_private_key_disposition(
     if operator_set_keys(operator_sets).contains(crate::sealing::SEALING_PRIVATE_KEY) {
         return SealingPrivateKeyDisposition::OperatorSet;
     }
-    if preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY).is_some() {
+    if effective_existing_secret(existing, operator_sets, crate::sealing::SEALING_PRIVATE_KEY) {
+        return SealingPrivateKeyDisposition::External;
+    }
+    if resolve_credential_values(
+        existing,
+        operator_sets,
+        &[crate::sealing::SEALING_PRIVATE_KEY],
+    )
+    .iter()
+    .any(|(_, value)| !value.is_empty())
+    {
         return SealingPrivateKeyDisposition::Preserved;
     }
     if dry_run {
@@ -453,25 +500,11 @@ fn resolve_preserved_sealing_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
-    let overridden = operator_set_keys(operator_sets);
-    let mut resolved = Vec::new();
-
-    if !overridden.contains(crate::sealing::SEALING_PRIVATE_KEY) {
-        if let Some(current) = preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY) {
-            resolved.push((crate::sealing::SEALING_PRIVATE_KEY.to_string(), current));
-        }
-    }
-    if !overridden.contains(crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY) {
-        if let Some(previous) =
-            preserved_value(existing, crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY)
-        {
-            resolved.push((
-                crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY.to_string(),
-                previous,
-            ));
-        }
-    }
-    resolved
+    resolve_credential_values(
+        existing,
+        operator_sets,
+        crate::sealing::SEALING_MANAGED_KEYS,
+    )
 }
 
 fn resolve_sealing_values(
@@ -491,6 +524,159 @@ fn resolve_sealing_values(
         );
     }
     resolved
+}
+
+/// Preserve the installed mail surface as typed values: booleans, arrays and
+/// credential maps must not become strings when delivered through Helm -f.
+/// This family includes the paired worker credential source, because preserving
+/// only the adapter side can leave the channel unable to receive replies.
+fn resolve_retained_mail_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Result<Option<PrivateHelmValues>> {
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let mut retained = serde_json::json!({});
+    if let Some(mail) = existing.get("mailAdapter") {
+        retained["mailAdapter"] = mail.clone();
+    }
+    for key in [
+        "adapterCredentials",
+        "adapterCredentialsExistingSecret",
+        "adapterCredentialsExistingSecretKey",
+    ] {
+        if let Some(value) = existing.get("worker").and_then(|worker| worker.get(key)) {
+            retained["worker"][key] = value.clone();
+        }
+    }
+    let overridden = operator_set_keys(operator_sets);
+    let operator_values: BTreeMap<_, _> = operator_set_entries(operator_sets)
+        .into_iter()
+        .map(|(key, value)| (key.trim(), value))
+        .collect();
+    let replaces_inline = |inline: &str| {
+        operator_values.iter().any(|(key, value)| {
+            key_is_or_descends_from(key, inline)
+                && !value.is_empty()
+                && !(*key == inline
+                    && inline == "worker.adapterCredentials"
+                    && serde_json::from_str::<serde_json::Value>(value)
+                        .is_ok_and(|value| value.as_object().is_some_and(|map| map.is_empty())))
+        })
+    };
+    // An externally managed worker map is opaque: changing only the adapter's
+    // source cannot safely derive or replace its paired worker credential.
+    // Require an explicit paired decision instead of creating a silent 401.
+    let changes_adapter_source = replaces_inline("mailAdapter.egressSecret")
+        || operator_values
+            .get("mailAdapter.egressSecretExistingSecret")
+            .is_some_and(|value| {
+                Some(*value)
+                    != lookup_dotted(existing, "mailAdapter.egressSecretExistingSecret").as_deref()
+            })
+        || (lookup_dotted(existing, "mailAdapter.egressSecretExistingSecret")
+            .is_some_and(|value| !value.is_empty())
+            && operator_values
+                .get("mailAdapter.egressSecretExistingSecretKey")
+                .is_some_and(|value| {
+                    *value
+                        != lookup_dotted(existing, "mailAdapter.egressSecretExistingSecretKey")
+                            .as_deref()
+                            .unwrap_or("mailEgressSecret")
+                }));
+    let changes_worker_source = replaces_inline("worker.adapterCredentials")
+        || overridden.contains("worker.adapterCredentialsExistingSecret")
+        || overridden.contains("worker.adapterCredentialsExistingSecretKey");
+    if changes_adapter_source
+        && !changes_worker_source
+        && lookup_dotted(existing, "worker.adapterCredentialsExistingSecret")
+            .is_some_and(|value| !value.is_empty())
+    {
+        bail!(
+            "changing the mail egress credential source requires an explicit paired worker \
+             source decision: also set worker.adapterCredentialsExistingSecret (clear it \
+             to use the chart-derived inline pair), its ExistingSecretKey, or supply \
+             worker.adapterCredentials"
+        );
+    }
+    let mut cleared = BTreeMap::new();
+    for inline in [
+        "mailAdapter.agentmail.apiKey",
+        "mailAdapter.channelToken",
+        "mailAdapter.egressSecret",
+        "worker.adapterCredentials",
+    ] {
+        let reference = format!("{inline}ExistingSecret");
+        // A nonempty inline value replaces the external source. An empty inline
+        // clear leaves that source active; its explicit reference clear remains
+        // the operator's way to remove it. Active sources never replay stale
+        // inline copies left in Helm before token rotation.
+        let remove = if replaces_inline(inline) {
+            vec![reference.clone()]
+        } else if overridden.contains(&reference)
+            || lookup_dotted(&retained, &reference).is_some_and(|value| !value.is_empty())
+        {
+            vec![inline.to_string()]
+        } else {
+            vec![]
+        };
+        for path in remove {
+            let (parent, leaf) = path.rsplit_once('.').expect("credential path");
+            let pointer = format!("/{}", parent.replace('.', "/"));
+            if let Some(object) = retained
+                .pointer_mut(&pointer)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if let Some(removed) = object.remove(leaf) {
+                    let mut removed_leaves = BTreeMap::new();
+                    crate::installation::flatten_values(&removed, &path, &mut removed_leaves);
+                    cleared.extend(removed_leaves.into_keys().map(|key| (key, String::new())));
+                }
+            }
+        }
+    }
+    fn without_overrides(
+        value: &serde_json::Value,
+        path: &str,
+        overridden: &std::collections::HashSet<String>,
+    ) -> Option<serde_json::Value> {
+        if overridden
+            .iter()
+            .any(|key| key_is_or_descends_from(path, key))
+        {
+            return None;
+        }
+        match value {
+            serde_json::Value::Object(object) => {
+                let remaining: serde_json::Map<String, serde_json::Value> = object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        let child = if path.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{path}.{key}")
+                        };
+                        without_overrides(value, &child, overridden)
+                            .map(|value| (key.clone(), value))
+                    })
+                    .collect();
+                (!remaining.is_empty() || object.is_empty())
+                    .then_some(serde_json::Value::Object(remaining))
+            }
+            serde_json::Value::Array(_)
+                if overridden
+                    .iter()
+                    .any(|key| key_is_or_descends_from(key, path)) =>
+            {
+                None
+            }
+            _ => Some(value.clone()),
+        }
+    }
+    Ok(without_overrides(&retained, "", &overridden)
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+        .map(|document| PrivateHelmValues(document, cleared)))
 }
 
 /// Every value a plain `cluster up` must carry forward, in one place.
@@ -552,6 +738,25 @@ mod sealing_preservation_tests {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn comms_preservation_includes_existing_secret_refs() {
+        let existing = values(serde_json::json!({
+            "dispatcher": {"slack": {
+                "appTokenExistingSecret": "acme-credentials",
+                "appTokenExistingSecretKey": "appToken-custom"
+            }}
+        }));
+        let resolved = resolve_comms_values(Some(&existing), &[]);
+        assert_eq!(
+            get(&resolved, "dispatcher.slack.appTokenExistingSecret"),
+            Some("acme-credentials")
+        );
+        assert_eq!(
+            get(&resolved, "dispatcher.slack.appTokenExistingSecretKey"),
+            Some("appToken-custom")
+        );
     }
 
     /// The catastrophic case. A plain `cluster up` drops anything it does not
@@ -691,6 +896,12 @@ mod sealing_preservation_tests {
 /// The chart value holding the model credential. Named here so the secret
 /// classifier below cannot drift from the key `up_commands` actually masks.
 pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
+const MODEL_CREDENTIAL_REFERENCE_KEYS: &[&str] = &[
+    "agentSandbox.runner.credentialsExistingSecret",
+    "agentSandbox.runner.credentialsExistingSecretKey",
+];
+const CREATED_BY_LABEL: &str = "curietech.ai/created-by";
+const CREATED_IN_LABEL: &str = "curietech.ai/created-in";
 
 /// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
 /// present -- see `up_commands`, which pushes both inside one `if let`.
@@ -782,6 +993,36 @@ fn helm_set_string_entries(expression: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn resolve_credential_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    keys: &[&str],
+) -> Vec<(String, String)> {
+    let overridden = operator_set_keys(operator_sets);
+    keys.iter()
+        .filter_map(|key| {
+            if overridden.contains(*key) {
+                return None;
+            }
+            let inline = key
+                .strip_suffix("ExistingSecretKey")
+                .or_else(|| key.strip_suffix("ExistingSecret"))
+                .unwrap_or(key);
+            let inline_replaced = operator_set_entries(operator_sets)
+                .into_iter()
+                .rev()
+                .find(|(name, _)| name.trim() == inline)
+                .is_some_and(|(_, value)| !value.is_empty());
+            if (*key != inline && inline_replaced)
+                || (*key == inline && effective_existing_secret(existing, operator_sets, inline))
+            {
+                return preserved_value(existing, key).map(|_| ((*key).to_string(), String::new()));
+            }
+            preserved_value(existing, key).map(|value| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
 /// Carry the runner configuration recorded by a prior real model install into
 /// a plain rerun. Explicit inputs replace their recorded family.
 fn resolve_preserved_runner_identity_values(
@@ -796,7 +1037,31 @@ fn resolve_preserved_runner_identity_values(
         && opts.credentials.is_none()
         && !overridden.contains(MODEL_CREDENTIAL_KEY)
     {
-        opts.credentials = preserved_value(existing, MODEL_CREDENTIAL_KEY);
+        opts.credentials =
+            resolve_credential_values(existing, operator_sets, &[MODEL_CREDENTIAL_KEY])
+                .into_iter()
+                .next()
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_empty());
+    }
+
+    let mut references =
+        resolve_credential_values(existing, operator_sets, MODEL_CREDENTIAL_REFERENCE_KEYS);
+    // `--fake-model` supplies nothing; clearing the recorded BYO reference on
+    // that switch destroyed operator wiring (#2459). Preserve unless an
+    // explicit credential or local model replaces the family.
+    if opts.local_model.is_some() || opts.credentials.is_some() {
+        for (_, value) in &mut references {
+            value.clear();
+        }
+    }
+    opts.secrets.extend(references);
+    if opts.credentials.is_none() {
+        opts.secrets.extend(
+            resolve_credential_values(existing, operator_sets, &[MODEL_CREDENTIAL_KEY])
+                .into_iter()
+                .filter(|(_, value)| value.is_empty()),
+        );
     }
 
     if !opts.fake_model
@@ -968,6 +1233,13 @@ fn reindex_inferred_provider_egress(
     }
 }
 
+fn is_retained_mail_key(key: &str) -> bool {
+    key_is_or_descends_from(key, "mailAdapter")
+        || key_is_or_descends_from(key, "worker.adapterCredentials")
+        || key == "worker.adapterCredentialsExistingSecret"
+        || key == "worker.adapterCredentialsExistingSecretKey"
+}
+
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
@@ -993,10 +1265,13 @@ fn reindex_inferred_provider_egress(
 /// says it carries names and never secrets. `sealing_test` below asserts the
 /// two lists agree by construction rather than by a hand-kept fixture.
 pub fn is_preserved_by_up(key: &str) -> bool {
-    COMMS_MANAGED_KEYS.contains(&key)
+    is_retained_mail_key(key)
+        || COMMS_MANAGED_KEYS.contains(&key)
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || MODEL_CREDENTIAL_REFERENCE_KEYS.contains(&key)
+        || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
         || key == GVISOR_MODE_KEY
         || key == SLACK_TRUSTED_ORIGINS_KEY
 }
@@ -1612,6 +1887,21 @@ fn complete_up_opts_without_runner_egress(
     overlay_live: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    let sealing_source = format!("{}ExistingSecret", crate::sealing::SEALING_PRIVATE_KEY);
+    if preserved_value(existing, &sealing_source).is_some()
+        && final_operator_value(&opts, &sealing_source).is_some_and(str::is_empty)
+        && final_operator_value(&opts, crate::sealing::SEALING_PRIVATE_KEY)
+            .is_none_or(|value| value.is_empty())
+    {
+        return Err(crate::exit::CliError::usage(
+            "refusing to clear the active sealing private key source without an explicit replacement",
+        )
+        .with_fix(
+            "set sealing.privateKey to the replacement private key before clearing its source",
+        )
+        .into());
+    }
+    opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets)?;
     let migrated_owned;
     let existing = if let Some(values) = existing {
         let outcome = crate::config_migrate::migrate_installed_config(values.clone(), None)?;
@@ -1626,7 +1916,6 @@ fn complete_up_opts_without_runner_egress(
         stamp_target_schema(&mut opts);
         existing
     };
-    resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
@@ -1644,6 +1933,22 @@ fn complete_up_opts_without_runner_egress(
         // to the empty chart default (#1134, #1125). Preserve, never invent.
         opts.secrets
             .extend(resolve_preserved_values(existing, &operator_sets));
+    }
+    resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
+    let mut references =
+        resolve_credential_values(existing, &operator_sets, GITHUB_TOKEN_REFERENCE_KEYS);
+    if clear_github_token || github_token.is_some_and(|value| !value.is_empty()) {
+        for (_, value) in &mut references {
+            value.clear();
+        }
+    }
+    opts.secrets.extend(references);
+    if github_token.is_none_or(|value| value.is_empty()) {
+        opts.secrets.extend(
+            resolve_credential_values(existing, &operator_sets, &[GITHUB_TOKEN_KEY])
+                .into_iter()
+                .filter(|(_, value)| value.is_empty()),
+        );
     }
     opts.github_token =
         resolve_github_token(existing, &operator_sets, github_token, clear_github_token);
@@ -1681,6 +1986,29 @@ fn is_extra_env_value_key(key: &str) -> bool {
     key.contains(".extraEnv[") && (key.ends_with(".value") || key.contains(".valueFrom"))
 }
 
+/// Operator `--set` keys plus mail credential references the retained overlay
+/// already dropped. Next's live/secret overlay would otherwise re-pass a
+/// replaced `*ExistingSecret` and undo the inline replacement.
+fn overlay_overridden_keys(
+    opts: &UpOpts,
+    operator_sets: &[String],
+) -> std::collections::HashSet<String> {
+    let mut overridden = operator_set_keys(operator_sets);
+    if let Some(values) = &opts.retained_mail_values {
+        overridden.extend(values.1.keys().cloned());
+    }
+    for key in COMMS_MANAGED_KEYS
+        .iter()
+        .chain(GITHUB_APP_MANAGED_KEYS)
+        .chain(crate::sealing::SEALING_MANAGED_KEYS)
+        .chain(MODEL_CREDENTIAL_REFERENCE_KEYS)
+        .chain(GITHUB_TOKEN_REFERENCE_KEYS)
+    {
+        overridden.insert((*key).to_string());
+    }
+    overridden
+}
+
 /// Stamp first-class extraEnv successors and external Secret references from
 /// the migrated document. Shared by `cluster up` and `apply` so a legacy
 /// extraEnv entry is promoted even when `curie.yaml` does not mention it.
@@ -1689,7 +2017,7 @@ fn overlay_migration_results(
     values: &serde_json::Value,
     operator_sets: &[String],
 ) {
-    let overridden = operator_set_keys(operator_sets);
+    let overridden = overlay_overridden_keys(opts, operator_sets);
     for (_, helm_key) in crate::config_migrate::extra_env_successors() {
         if overridden.contains(*helm_key)
             || overridden
@@ -1711,7 +2039,7 @@ fn overlay_live_operator_values(
     values: &serde_json::Value,
     operator_sets: &[String],
 ) {
-    let overridden = operator_set_keys(operator_sets);
+    let overridden = overlay_overridden_keys(opts, operator_sets);
     overlay_json(opts, values, "", &overridden);
 }
 
@@ -1756,7 +2084,10 @@ fn overlay_secret_refs(
         } else {
             format!("{prefix}.{key}")
         };
-        if is_external_secret_ref_key(&path) && !overridden.contains(&path) {
+        if is_external_secret_ref_key(&path)
+            && !overridden.contains(&path)
+            && !is_retained_mail_key(&path)
+        {
             match child {
                 serde_json::Value::String(raw) if raw.is_empty() => {}
                 serde_json::Value::String(raw) => opts
@@ -1826,6 +2157,9 @@ fn overlay_json(
                 return;
             }
             if prefix == "config.schemaVersion" || prefix == "config.migratedFrom" {
+                return;
+            }
+            if is_retained_mail_key(prefix) {
                 return;
             }
             if overridden.contains(prefix)
@@ -2044,6 +2378,7 @@ enum DiffParticipation {
 
 #[derive(Clone, PartialEq, Eq)]
 enum PlannedHelmValues {
+    RetainedMail(PrivateHelmValues),
     Set {
         flag: HelmSetFlag,
         expression: String,
@@ -2059,6 +2394,16 @@ enum PlannedHelmValues {
 enum HelmSetFlag {
     Set,
     SetString,
+    SetJson,
+}
+
+fn typed_empty_worker_map_override(expression: &str) -> Option<String> {
+    let (key, value) = expression.split_once('=')?;
+    (key.trim() == "worker.adapterCredentials"
+        && (value.is_empty()
+            || serde_json::from_str::<serde_json::Value>(value)
+                .is_ok_and(|value| value.as_object().is_some_and(|map| map.is_empty()))))
+    .then(|| "worker.adapterCredentials={}".to_string())
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -2082,9 +2427,14 @@ impl UpValuePlan {
             .into_iter()
             .map(|(key, value)| (key.trim().to_string(), value.to_string()))
             .collect();
+        let typed = typed_empty_worker_map_override(&expression);
         self.entries.push(PlannedHelmValues::Set {
-            flag: HelmSetFlag::Set,
-            expression,
+            flag: if typed.is_some() {
+                HelmSetFlag::SetJson
+            } else {
+                HelmSetFlag::Set
+            },
+            expression: typed.unwrap_or(expression),
             effective,
         });
     }
@@ -2101,9 +2451,14 @@ impl UpValuePlan {
                 .map(|(key, value)| (key.trim().to_string(), value.to_string()))
                 .collect()
         };
+        let typed = typed_empty_worker_map_override(&expression);
         self.entries.push(PlannedHelmValues::Set {
-            flag: HelmSetFlag::SetString,
-            expression,
+            flag: if typed.is_some() {
+                HelmSetFlag::SetJson
+            } else {
+                HelmSetFlag::SetString
+            },
+            expression: typed.unwrap_or(expression),
             effective,
         });
     }
@@ -2118,12 +2473,16 @@ impl UpValuePlan {
     fn append_command_args(&self, args: &mut Vec<CmdArg>) {
         for entry in &self.entries {
             match entry {
+                PlannedHelmValues::RetainedMail(values) => {
+                    args.push(CmdArg::PrivateJsonValuesFile(values.clone()));
+                }
                 PlannedHelmValues::Set {
                     flag, expression, ..
                 } => {
                     args.push(plain(match flag {
                         HelmSetFlag::Set => "--set",
                         HelmSetFlag::SetString => "--set-string",
+                        HelmSetFlag::SetJson => "--set-json",
                     }));
                     args.push(CmdArg::HelmSetExpression(expression.clone()));
                 }
@@ -2138,6 +2497,14 @@ impl UpValuePlan {
         let mut values = BTreeMap::new();
         for entry in &self.entries {
             match entry {
+                PlannedHelmValues::RetainedMail(retained) => {
+                    values.extend(
+                        retained
+                            .1
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    );
+                }
                 PlannedHelmValues::Set { effective, .. } => {
                     values.extend(effective.iter().cloned());
                 }
@@ -2212,6 +2579,10 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
         );
     }
     plan.secret_file(o.secrets.clone(), DiffParticipation::Preserve);
+    if let Some(values) = &o.retained_mail_values {
+        plan.entries
+            .push(PlannedHelmValues::RetainedMail(values.clone()));
+    }
     if let Some(model) = &o.model {
         if explicit_runner_model(&o.operator_sets()).is_none() {
             plan.set(RUNNER_MODEL_KEY, model);
@@ -3619,6 +3990,12 @@ async fn run_prepared_up(
         inference.render(ui);
     }
     let operator_sets = opts.operator_sets();
+    if let Some(values) = &opts.retained_mail_values {
+        ui.note(&format!(
+            "preserving {} mail value(s) recorded by the release",
+            values.keys().len()
+        ));
+    }
     let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
     if !preserved.is_empty() {
         let sealing_values = preserved
@@ -3656,8 +4033,9 @@ async fn run_prepared_up(
             SealingPrivateKeyDisposition::Deferred => {
                 ui.note("a live run discovers sealing state and preserves an existing private key or generates one when absent; skipped here to keep --dry-run offline");
             }
-            SealingPrivateKeyDisposition::OperatorSet | SealingPrivateKeyDisposition::Preserved => {
-            }
+            SealingPrivateKeyDisposition::OperatorSet
+            | SealingPrivateKeyDisposition::Preserved
+            | SealingPrivateKeyDisposition::External => {}
         }
         if existing.is_none() && !opts.common.dry_run {
             let generated_required_secrets = opts
@@ -3714,7 +4092,9 @@ async fn run_prepared_up(
             // recorded; on a fresh install (or an existing release that never
             // had one) there is nothing to remove, so the wording must not
             // claim there was.
-            if preserved_value(existing.as_ref(), GITHUB_TOKEN_KEY).is_some() {
+            if preserved_value(existing.as_ref(), GITHUB_TOKEN_KEY).is_some()
+                || effective_existing_secret(existing.as_ref(), &[], GITHUB_TOKEN_KEY)
+            {
                 // This is an incident-response verb, not a revocation: the
                 // running API keeps the old token until it restarts, and the
                 // token stays valid at GitHub until revoked there directly.
@@ -3735,6 +4115,14 @@ async fn run_prepared_up(
             } else {
                 ui.note("preserving the GitHub credential recorded by an earlier cluster up; pass --github-token to change it or --clear-github-token to remove it");
             }
+        }
+        GithubTokenPlan::Untouched
+            if opts
+                .secrets
+                .iter()
+                .any(|(key, value)| key == GITHUB_TOKEN_REFERENCE_KEYS[0] && !value.is_empty()) =>
+        {
+            ui.note("preserving the GitHub credential reference recorded by the release; pass --github-token to replace it or --clear-github-token to remove it");
         }
         GithubTokenPlan::Untouched => {
             // Distinct wording: an empty value with nothing recorded preserves
@@ -3792,6 +4180,7 @@ async fn run_prepared_up(
     }
     if !opts.common.dry_run {
         require_on_path("kubectl")?;
+        establish_primary_namespace_ownership(&opts.common).await?;
     }
     let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
     for ns in owned_namespaces {
@@ -3824,7 +4213,7 @@ async fn run_prepared_up(
                     && !matches!(value.trim(), "" | "[]")
             });
     for (warn, msg) in model_egress_status_lines(
-        opts.credentials.is_some(),
+        model_credential_source_is_set(&opts),
         opts.local_model.is_some(),
         opts.fake_model,
         &opts.allow_egress_host,
@@ -3847,9 +4236,15 @@ async fn run_prepared_up(
         ));
     }
     if opts.common.dry_run {
-        return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan {
-            lines: cmds.iter().map(|cmd| cmd.display()).collect(),
-        }));
+        let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        lines.push("# After Helm and ownership stamping, verify convergence for at most 300 seconds; repeat observations every 2 seconds while rollout is pending.".to_owned());
+        lines.push(convergence::DRY_RUN_NOTE.to_owned());
+        lines.extend(
+            convergence::dry_run_commands(&opts.common)
+                .iter()
+                .map(OpsCommand::display),
+        );
+        return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     let release_namespace_existed_before_install = ownership_candidates
         .iter()
@@ -3873,7 +4268,7 @@ async fn run_prepared_up(
     let label = format!("installing release {}", opts.common.release);
     for cmd in &cmds {
         if let Some(job) = gvisor_preflight_job.as_deref() {
-            let outcome = run_install_with_gvisor_observer(
+            let outcome = match run_install_with_gvisor_observer(
                 &cl,
                 &label,
                 "installed",
@@ -3882,7 +4277,13 @@ async fn run_prepared_up(
                 job,
                 release_namespace_existed_before_install,
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Err(convergence::installation_failure(&opts.common, error).await)
+                }
+            };
             match outcome {
                 GvisorInstallOutcome::Installed => {}
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
@@ -3903,11 +4304,18 @@ async fn run_prepared_up(
                     step.warn("retrying");
                     value_plan.set(GVISOR_MODE_KEY, "off");
                     ClusterUpInference::GvisorOff.render(ui);
+                    if let Err(error) =
+                        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common).await
+                    {
+                        return Err(convergence::installation_failure(&opts.common, error).await);
+                    }
                     let retry = up_commands_with_plan(&opts, &value_plan)
                         .into_iter()
                         .next()
                         .expect("cluster up always has one Helm command");
-                    run_step(&cl, &label, "installed", &retry).await?;
+                    if let Err(error) = run_step(&cl, &label, "installed", &retry).await {
+                        return Err(convergence::installation_failure(&opts.common, error).await);
+                    }
                 }
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
                     step.fail("failed");
@@ -3920,7 +4328,9 @@ async fn run_prepared_up(
                 }
             }
         } else {
-            run_step(&cl, &label, "installed", cmd).await?;
+            if let Err(error) = run_step(&cl, &label, "installed", cmd).await {
+                return Err(convergence::installation_failure(&opts.common, error).await);
+            }
         }
     }
 
@@ -3947,6 +4357,12 @@ async fn run_prepared_up(
         }
     }
 
+    let step = cl.step("waiting for exact target workload convergence");
+    if let Err(error) = convergence::wait(&opts.common).await {
+        step.fail("not converged");
+        return Err(error);
+    }
+    step.done("converged");
     Ok(ClusterUpOutput::Up {
         namespace: opts.common.namespace.clone(),
         release: opts.common.release.clone(),
@@ -3959,9 +4375,206 @@ mod tests {
 
     use crate::ops::testsupport::*;
 
+    fn mail_upgrade_opts(existing: &serde_json::Value, set: Vec<String>) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                retained_mail_values: None,
+                common: common(),
+                chart: "charts/curie".into(),
+                no_expose: true,
+                set,
+                set_string: vec![],
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+                secrets: vec![],
+                github_token: GithubTokenPlan::Untouched,
+                dev: true,
+            },
+            Some(existing),
+            None,
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    fn retained_mail_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "mailAdapter": {
+                "deploy": true,
+                "inbox": "mail@example.com",
+                "allowedSenders": ["operator@example.com"],
+                "pollIntervalSeconds": 37,
+                "persistence": {"existingClaim": "acme-mail-state"},
+                "agentmail": {
+                    "apiKeyExistingSecret": "acme-mail-credentials",
+                    "apiKeyExistingSecretKey": "provider-key",
+                    "httpsCidrs": ["203.0.113.8/32"]
+                },
+                "channelTokenExistingSecret": "acme-mail-credentials",
+                "channelTokenExistingSecretKey": "channel-key",
+                "egressSecretExistingSecret": "acme-mail-credentials",
+                "egressSecretExistingSecretKey": "egress-key"
+            },
+            "worker": {
+                "adapterCredentialsExistingSecret": "acme-mail-credentials",
+                "adapterCredentialsExistingSecretKey": "worker-map"
+            }
+        })
+    }
+
+    fn materialized_mail_values(opts: &UpOpts) -> serde_json::Value {
+        let commands = up_commands(opts);
+        let command = &commands[0];
+        let (materialized, _guards) = command.materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        for pair in argv.windows(2).filter(|pair| pair[0] == "-f") {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&pair[1]).unwrap()).unwrap();
+            if value.get("mailAdapter").is_some() {
+                return value;
+            }
+        }
+        panic!("plain cluster up dropped the installed mail values");
+    }
+
+    #[test]
+    fn plain_up_preserves_mail_lifecycle_and_external_secret_pairs() {
+        let existing = retained_mail_fixture();
+        let opts = mail_upgrade_opts(&existing, vec![]);
+        let actual = materialized_mail_values(&opts);
+        assert_eq!(
+            actual, existing,
+            "mail and worker credential state must survive unchanged"
+        );
+        let mut leaves = BTreeMap::new();
+        crate::installation::flatten_values(&actual, "", &mut leaves);
+        for key in leaves.keys() {
+            assert!(is_preserved_by_up(key), "diff disagrees with up for {key}");
+        }
+        let shown = up_commands(&opts)[0].display();
+        for private in ["mail@example.com", "acme-mail-credentials", "provider-key"] {
+            assert!(
+                !shown.contains(private),
+                "private retained mail values leaked"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_mail_command_and_debug_hide_dynamic_keys_and_inline_secrets() {
+        let mut existing = retained_mail_fixture();
+        existing["worker"]["adapterCredentials"] = serde_json::json!({
+            "private-adapter-identity": "private-inline-credential"
+        });
+        existing["worker"]
+            .as_object_mut()
+            .unwrap()
+            .remove("adapterCredentialsExistingSecret");
+        existing["worker"]
+            .as_object_mut()
+            .unwrap()
+            .remove("adapterCredentialsExistingSecretKey");
+        existing["mailAdapter"]["podAnnotations"] = serde_json::json!({
+            "private.example.com/identity": "private-annotation-value"
+        });
+        let opts = mail_upgrade_opts(&existing, vec![]);
+        let command = &up_commands(&opts)[0];
+        let display = command.display();
+        let debug = format!("{command:?}");
+        let (materialized, _guards) = command.materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        for private in [
+            "private-adapter-identity",
+            "private-inline-credential",
+            "private.example.com/identity",
+            "private-annotation-value",
+        ] {
+            for surface in [&display, &debug, &argv] {
+                assert!(!surface.contains(private), "retained mail metadata leaked");
+            }
+        }
+        assert_eq!(materialized_mail_values(&opts), existing);
+    }
+
+    #[test]
+    fn plain_mail_upgrade_never_replays_inline_copies_behind_external_sources() {
+        let expected = retained_mail_fixture();
+        let mut existing = expected.clone();
+        existing["mailAdapter"]["channelToken"] = "stale-channel-token".into();
+        existing["mailAdapter"]["egressSecret"] = "stale-egress-secret".into();
+        existing["mailAdapter"]["agentmail"]["apiKey"] = "stale-provider-key".into();
+        existing["worker"]["adapterCredentials"] =
+            serde_json::json!({"mail-adapter": "stale-egress-secret"});
+        let opts = mail_upgrade_opts(&existing, vec![]);
+        assert_eq!(materialized_mail_values(&opts), expected);
+    }
+
+    #[test]
+    fn explicit_mail_disable_and_secret_clear_override_retained_values() {
+        let mut existing = retained_mail_fixture();
+        existing["mailAdapter"]["channelToken"] = "obsolete-inline-token".into();
+        let opts = mail_upgrade_opts(
+            &existing,
+            vec![
+                "mailAdapter.deploy=false".into(),
+                "mailAdapter.channelTokenExistingSecret=".into(),
+                "mailAdapter.allowedSenders={}".into(),
+            ],
+        );
+        let actual = materialized_mail_values(&opts);
+        assert!(actual["mailAdapter"].get("deploy").is_none());
+        assert!(actual["mailAdapter"].get("allowedSenders").is_none());
+        assert!(
+            actual["mailAdapter"].get("channelToken").is_none(),
+            "clearing an external reference cannot resurrect an obsolete inline token"
+        );
+        assert!(actual["mailAdapter"]
+            .get("channelTokenExistingSecret")
+            .is_none());
+        assert_eq!(actual["mailAdapter"]["pollIntervalSeconds"], 37);
+        let effective = up_value_plan(&opts).effective_values();
+        assert_eq!(
+            effective.get("mailAdapter.deploy").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn explicit_inline_mail_credential_replaces_the_external_reference() {
+        let opts = mail_upgrade_opts(
+            &retained_mail_fixture(),
+            vec!["mailAdapter.channelToken=new-inline-token".into()],
+        );
+        let actual = materialized_mail_values(&opts);
+        assert!(actual["mailAdapter"]
+            .get("channelTokenExistingSecret")
+            .is_none());
+        assert_eq!(
+            actual["mailAdapter"]["channelTokenExistingSecretKey"],
+            "channel-key"
+        );
+        let command = &up_commands(&opts)[0];
+        let shown = command.display();
+        assert!(
+            !shown.contains("channelTokenExistingSecret="),
+            "migration overlay must not resurrect the replaced external reference: {shown}"
+        );
+        assert_eq!(
+            actual["worker"]["adapterCredentialsExistingSecretKey"],
+            "worker-map"
+        );
+    }
+
     #[test]
     fn up_defaults_expose_ui_and_langfuse() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4005,6 +4618,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4059,6 +4673,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4114,6 +4729,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4182,6 +4798,7 @@ mod tests {
                 resolved_egress_cidrs: vec![],
                 chart: "charts/curie".into(),
                 secrets: vec![],
+                retained_mail_values: None,
                 dev: false,
                 no_expose: true,
                 set: vec![],
@@ -4210,16 +4827,18 @@ mod tests {
                 .map(String::as_str),
             Some("120")
         );
+        let secret = |key: &str| {
+            opts.secrets
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
         assert_eq!(
-            effective
-                .get("dispatcher.slack.botTokenExistingSecret")
-                .map(String::as_str),
+            secret("dispatcher.slack.botTokenExistingSecret"),
             Some("acme-slack")
         );
         assert_eq!(
-            effective
-                .get("dispatcher.slack.botTokenExistingSecretKey")
-                .map(String::as_str),
+            secret("dispatcher.slack.botTokenExistingSecretKey"),
             Some("botToken")
         );
         assert!(
@@ -4257,6 +4876,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4302,6 +4922,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4347,6 +4968,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4393,6 +5015,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4448,6 +5071,7 @@ mod tests {
         ] {
             let opts = complete_up_opts_without_runner_egress(
                 UpOpts {
+                    retained_mail_values: None,
                     common: common(),
                     github_token: GithubTokenPlan::Untouched,
                     allow_egress_host: vec![],
@@ -4500,6 +5124,7 @@ mod tests {
     #[test]
     fn up_no_expose_drops_the_nodeport_sets() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4524,6 +5149,7 @@ mod tests {
     #[test]
     fn up_passthrough_set_is_appended_verbatim() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4552,6 +5178,7 @@ mod tests {
         // No credential and not --fake-model: a plain install with no real-model
         // or egress sets (the fake model stays on, egress stays fail-closed).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4579,6 +5206,7 @@ mod tests {
         // --fake-model resolves to no credential, so the argv is the sealed
         // install even when the caller had a credential in the environment.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4603,6 +5231,7 @@ mod tests {
     #[test]
     fn up_with_credentials_enables_real_model_and_masks() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4710,6 +5339,7 @@ mod tests {
     #[test]
     fn up_local_model_adds_inference_sets() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4734,6 +5364,7 @@ mod tests {
     #[test]
     fn up_without_local_model_omits_inference_sets() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4759,6 +5390,7 @@ mod tests {
     fn up_defaults_runner_model_from_env() {
         // CURIE_MODEL set, no explicit --set: inject the runner model (#361).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4786,6 +5418,7 @@ mod tests {
     fn up_without_env_model_omits_runner_model_set() {
         // No CURIE_MODEL: inject nothing, the chart default stands (#361).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4811,6 +5444,7 @@ mod tests {
         // CURIE_MODEL set AND an explicit matching --set: the operator's set
         // already carries it, so no duplicate injection (#361).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4842,6 +5476,7 @@ mod tests {
         // `--set` must be detected so `up` does not inject a redundant
         // `--set agentSandbox.runner.model=<model>` on top of it (#361).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4869,6 +5504,7 @@ mod tests {
     #[test]
     fn up_opens_web_egress_after_model() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec!["anthropic".into()],
@@ -4907,6 +5543,7 @@ mod tests {
     #[test]
     fn up_web_egress_without_model_uses_index_zero() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4942,6 +5579,7 @@ mod tests {
     #[test]
     fn up_web_egress_multiple_cidrs_contiguous() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec!["anthropic".into()],
@@ -4976,6 +5614,7 @@ mod tests {
     #[test]
     fn up_no_web_egress_stays_sealed() {
         let sealed_cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4996,6 +5635,7 @@ mod tests {
         assert!(!sealed_line.contains("allowedEgress"), "{sealed_line}");
 
         let model_cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -5215,6 +5855,7 @@ mod tests {
         // live credential, so it must land in the private -f file like any other
         // secret and never appear in argv or the printed line.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -5404,6 +6045,7 @@ mod tests {
                 resolved_egress_cidrs: vec![],
                 chart: "charts/curie".into(),
                 secrets: vec![],
+                retained_mail_values: None,
                 dev: true,
                 no_expose: true,
                 set,
@@ -5558,6 +6200,7 @@ mod tests {
         // Success criterion: a missing secret's generated value lands in the
         // private -f values file, never in the executed argv / process table.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -5614,6 +6257,7 @@ mod tests {
         // The pure builder with no supplied secrets (the --dev path, and every
         // pre-#196 argv test) emits no secret values file.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -5640,6 +6284,7 @@ mod tests {
         // to helm (issue #195). Without it the sealed chart generates strong
         // random values and the dev/e2e stack would not match compose.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -5668,6 +6313,7 @@ mod tests {
         // The default (non-dev) path must NOT opt into the published defaults;
         // the sealed chart generates strong per-release credentials there.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -5718,6 +6364,7 @@ mod tests {
         // Resolved provider CIDRs take the first slots (in order), then declared
         // web destinations continue contiguously -- one array, no gaps.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             model: None,
@@ -5768,6 +6415,7 @@ mod tests {
         // unconditional Anthropic carve-out is removed entirely (#362). The
         // sandbox stays sealed and the model is unreachable by design.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             model: None,
@@ -5801,6 +6449,7 @@ mod tests {
         // Existing behavior preserved: with no credential and no provider host,
         // a declared web destination still occupies index [0].
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             model: None,
@@ -6089,6 +6738,7 @@ mod tests {
         // Between them these two pin the read DECISION and the argv it feeds; the
         // live evidence is the E2E's `--dev` arm.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
             allow_egress_host: vec![],
@@ -6340,6 +6990,7 @@ mod tests {
         // `operator_sets` chains `--set` THEN `--set-string`, and a key the
         // operator supplied only through the latter must exempt the run too.
         let opts = UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -6475,6 +7126,7 @@ mod tests {
         // credential, so both keys must survive to their own file and neither
         // may reach argv.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
             set_string: vec![],
@@ -6760,4 +7412,814 @@ mod tests {
             "the conflict guard matches the key trimmed on both ends"
         );
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NamespaceRecord {
+    labels: BTreeMap<String, String>,
+    uid: String,
+    resource_version: String,
+    terminating: bool,
+}
+
+pub(crate) enum NamespaceProbe {
+    Absent,
+    Present(NamespaceRecord),
+}
+
+/// Whether the aborted gVisor preflight attempt left a Helm release that must
+/// be removed before the `security.gvisor.mode=off` retry.
+///
+/// A history with no `deployed`/`superseded` revision never reached a
+/// known-good install. Retrying with `helm upgrade --install` is then an
+/// *upgrade*, which fires the pre-upgrade drain hook against Secrets the
+/// cancelled revision never rendered (#2347). An empty history (Helm has not
+/// recorded the release yet) is the same case: uninstall is a no-op if the
+/// release is already absent.
+///
+/// A history that already contains a known-good revision is an in-place
+/// upgrade of a real install and must be left intact.
+fn should_discard_failed_gvisor_install(history: &[HelmRevision]) -> bool {
+    !history
+        .iter()
+        .any(|row| is_eligible_rollback_status(&row.status))
+}
+
+/// Remove a never-deployed failed revision left by the aborted first Helm
+/// attempt so the gVisor-off retry is a clean install (#2347).
+async fn discard_failed_gvisor_install_if_never_deployed(
+    cl: &crate::ui::Checklist,
+    common: &CommonOpts,
+) -> Result<()> {
+    let ui = crate::ui::ui();
+    let history_cmd = helm_history_cmd(common);
+    ui.plumbing(&format!("+ {}", history_cmd.display()));
+    let (ok, out, err) = run_capture(&history_cmd).await?;
+    let history = if !ok {
+        if helm_release_is_absent(&err) || helm_release_is_absent(&out) {
+            Vec::new()
+        } else {
+            return Err(crate::exit::CliError::failure(format!(
+                "could not read helm history for release {} in namespace {} before the gVisor retry: {}",
+                common.release,
+                common.namespace,
+                err.trim()
+            ))
+            .with_fix(format!(
+                "inspect `helm history {} -n {}` and rerun `curie cluster up`",
+                common.release, common.namespace
+            ))
+            .into());
+        }
+    } else if out.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse_helm_history(&out)?
+    };
+    if !should_discard_failed_gvisor_install(&history) {
+        return Ok(());
+    }
+
+    let cmds = down_commands(common);
+    let uninstall = &cmds[0];
+    ui.plumbing(&format!("+ {}", uninstall.display()));
+    let step = cl.step("discarding failed Helm revision");
+    let (ok, out, err) = run_capture(uninstall).await?;
+    for line in out.lines().chain(err.lines()) {
+        ui.plumbing(line);
+    }
+    if ok {
+        step.done("removed");
+        Ok(())
+    } else if err.contains("not found") || out.contains("not found") {
+        step.done("already absent");
+        Ok(())
+    } else {
+        step.fail("failed");
+        Err(crate::exit::CliError::failure(format!(
+            "helm uninstall of the failed gVisor preflight revision failed: {}",
+            err.trim()
+        ))
+        .with_fix(format!(
+            "helm uninstall {} -n {} && curie cluster up --set security.gvisor.mode=off",
+            common.release, common.namespace
+        ))
+        .into())
+    }
+}
+
+pub(crate) async fn namespace_probe(namespace: &str) -> Result<NamespaceProbe> {
+    let (ok, out, err) = run_capture(&namespace_get_cmd(namespace)).await?;
+    if !ok {
+        bail!(
+            "could not inspect namespace `{namespace}`: {}",
+            failure_reason(&err)
+        );
+    }
+    parse_namespace_probe(namespace, &out)
+}
+
+async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
+    match namespace_probe(&o.namespace).await? {
+        NamespaceProbe::Absent => {
+            let manifest = namespace_manifest(&o.namespace, &o.release)?;
+            let command = namespace_create_cmd();
+            let (ok, _out, err) = run_capture_with_stdin(&command, &manifest).await?;
+            if !ok {
+                bail!(
+                    "could not atomically create owned namespace `{}`: {}; inspect the namespace and retry",
+                    o.namespace,
+                    failure_reason(&err)
+                );
+            }
+        }
+        NamespaceProbe::Present(record) => {
+            if record.terminating {
+                bail!(
+                    "namespace `{}` is terminating and cannot be used for an install",
+                    o.namespace
+                );
+            }
+            let created_by = record.labels.get(CREATED_BY_LABEL);
+            let created_in = record.labels.get(CREATED_IN_LABEL);
+            if created_by.map(String::as_str) == Some(o.release.as_str())
+                && created_in.map(String::as_str) == Some(o.namespace.as_str())
+            {
+                return Ok(());
+            }
+            if created_by.is_some() || created_in.is_some() {
+                let by = created_by.map(String::as_str).unwrap_or("<missing>");
+                let install = created_in.map(String::as_str).unwrap_or("<missing>");
+                bail!(
+                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it",
+                    o.namespace
+                );
+            }
+            if o.namespace == CONTROLLER_DEPLOYMENT_NAMESPACE {
+                bail!(
+                    "pre-existing shared controller namespace `{}` is never eligible for adoption",
+                    o.namespace
+                );
+            }
+            if !labels_allow_empty_adoption(&record.labels, &o.namespace) {
+                let keys = record.labels.keys().cloned().collect::<Vec<_>>().join(", ");
+                bail!(
+                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted",
+                    o.namespace
+                );
+            }
+            verify_namespace_is_empty(&o.namespace).await?;
+            let command = namespace_adoption_cmd(&o.namespace, &o.release, &record)?;
+            let (ok, _out, err) = run_capture(&command).await?;
+            if !ok {
+                bail!(
+                    "could not adopt namespace `{}` with its UID/resourceVersion guard: {}; the object may have been modified, inspect it and retry",
+                    o.namespace,
+                    failure_reason(&err)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn namespace_adoption_cmd(
+    namespace: &str,
+    release: &str,
+    record: &NamespaceRecord,
+) -> Result<OpsCommand> {
+    let mut labels = record.labels.clone();
+    labels.insert(CREATED_BY_LABEL.to_string(), release.to_string());
+    labels.insert(CREATED_IN_LABEL.to_string(), namespace.to_string());
+    let patch = serde_json::to_string(&serde_json::json!([
+        {"op": "test", "path": "/metadata/uid", "value": record.uid.clone()},
+        {"op": "test", "path": "/metadata/resourceVersion", "value": record.resource_version.clone()},
+        {"op": "add", "path": "/metadata/labels", "value": labels},
+    ]))
+    .context("serializing the guarded Namespace ownership patch")?;
+    Ok(OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("patch"),
+            plain("namespace"),
+            plain(namespace),
+            plain("--type=json"),
+            plain("-p"),
+            plain(patch),
+        ],
+    ))
+}
+
+fn namespace_create_cmd() -> OpsCommand {
+    OpsCommand::new("kubectl", vec![plain("create"), plain("-f"), plain("-")])
+}
+
+fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain(resource),
+            plain("-n"),
+            plain(namespace),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn namespace_manifest(namespace: &str, release: &str) -> Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": namespace,
+            "labels": ownership_labels(release, namespace),
+        },
+    }))
+    .context("serializing the owned Namespace manifest")
+}
+
+fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe> {
+    if output.trim().is_empty() {
+        return Ok(NamespaceProbe::Absent);
+    }
+    let document: serde_json::Value = serde_json::from_str(output)
+        .with_context(|| format!("parsing Namespace `{namespace}` returned by kubectl"))?;
+    if document.get("kind").and_then(serde_json::Value::as_str) != Some("Namespace") {
+        bail!("kubectl returned a non-Namespace object while inspecting namespace `{namespace}`");
+    }
+    let metadata = document
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .with_context(|| format!("Namespace `{namespace}` has no metadata object"))?;
+    if metadata.get("name").and_then(serde_json::Value::as_str) != Some(namespace) {
+        bail!("kubectl returned metadata for a different namespace while inspecting `{namespace}`");
+    }
+    let terminating = metadata
+        .get("deletionTimestamp")
+        .is_some_and(|value| !value.is_null());
+    let labels = match metadata.get("labels") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .with_context(|| format!("Namespace `{namespace}` has malformed labels"))?,
+    };
+    let uid = metadata
+        .get("uid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("Namespace `{namespace}` metadata has no UID"))?
+        .to_string();
+    let resource_version = metadata
+        .get("resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("Namespace `{namespace}` metadata has no resourceVersion"))?
+        .to_string();
+    Ok(NamespaceProbe::Present(NamespaceRecord {
+        labels,
+        uid,
+        resource_version,
+        terminating,
+    }))
+}
+
+fn namespaced_resources_cmd() -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("api-resources"),
+            plain("--namespaced=true"),
+            plain("--verbs=list"),
+            plain("-o"),
+            plain("name"),
+        ],
+    )
+}
+
+fn apiservices_cmd() -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("apiservices.apiregistration.k8s.io"),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn default_object_metadata(
+    value: &serde_json::Value,
+    namespace: &str,
+    name: &str,
+    allowed_annotations: &[&str],
+) -> bool {
+    let Some(metadata) = value.as_object() else {
+        return false;
+    };
+    if metadata.get("name").and_then(serde_json::Value::as_str) != Some(name)
+        || metadata
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            != Some(namespace)
+    {
+        return false;
+    }
+    if metadata
+        .get("labels")
+        .is_some_and(|labels| !empty_json_value(labels))
+        || metadata
+            .get("ownerReferences")
+            .is_some_and(|owners| !empty_json_value(owners))
+        || metadata
+            .get("finalizers")
+            .is_some_and(|finalizers| !empty_json_value(finalizers))
+    {
+        return false;
+    }
+    if let Some(annotations) = metadata.get("annotations") {
+        let Some(annotations) = annotations.as_object() else {
+            return false;
+        };
+        if annotations
+            .keys()
+            .any(|key| !allowed_annotations.iter().any(|allowed| key == *allowed))
+        {
+            return false;
+        }
+    }
+    const SERVER_METADATA: &[&str] = &[
+        "name",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "managedFields",
+        "selfLink",
+        "generateName",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ];
+    metadata
+        .keys()
+        .all(|key| SERVER_METADATA.contains(&key.as_str()))
+}
+
+fn empty_json_value(value: &serde_json::Value) -> bool {
+    value.is_null()
+        || value.as_array().is_some_and(|items| items.is_empty())
+        || value.as_object().is_some_and(|object| object.is_empty())
+}
+
+fn is_default_service_account(item: &serde_json::Value, namespace: &str) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    if item.get("apiVersion").and_then(serde_json::Value::as_str) != Some("v1")
+        || item.get("kind").and_then(serde_json::Value::as_str) != Some("ServiceAccount")
+        || !item
+            .get("metadata")
+            .is_some_and(|metadata| default_object_metadata(metadata, namespace, "default", &[]))
+    {
+        return false;
+    }
+    object.iter().all(|(key, value)| {
+        matches!(key.as_str(), "apiVersion" | "kind" | "metadata") || empty_json_value(value)
+    })
+}
+
+fn is_root_ca_config_map(item: &serde_json::Value, namespace: &str) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    if item.get("apiVersion").and_then(serde_json::Value::as_str) != Some("v1")
+        || item.get("kind").and_then(serde_json::Value::as_str) != Some("ConfigMap")
+        || !item.get("metadata").is_some_and(|metadata| {
+            default_object_metadata(
+                metadata,
+                namespace,
+                "kube-root-ca.crt",
+                &["kubernetes.io/description"],
+            )
+        })
+    {
+        return false;
+    }
+    let Some(data) = item.get("data").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if data.len() != 1
+        || data
+            .get("ca.crt")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    object.iter().all(|(key, value)| {
+        matches!(key.as_str(), "apiVersion" | "kind" | "metadata" | "data")
+            || empty_json_value(value)
+    })
+}
+
+fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &str) -> bool {
+    labels.is_empty()
+        || (labels.len() == 1
+            && labels
+                .get("kubernetes.io/metadata.name")
+                .map(String::as_str)
+                == Some(namespace))
+}
+
+async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
+    verify_remote_apiservices_available(namespace).await?;
+    let (ok, discovered, err) = run_capture(&namespaced_resources_cmd()).await?;
+    if !ok {
+        bail!(
+            "could not discover the namespaced API inventory before adopting `{namespace}`: {}",
+            failure_reason(&err)
+        );
+    }
+    let resources: BTreeSet<&str> = discovered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if resources.is_empty() {
+        bail!("namespaced API discovery returned no resources; refusing to adopt `{namespace}`");
+    }
+
+    let mut foreign: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for resource in resources {
+        let (ok, output, err) = run_capture(&namespace_inventory_cmd(namespace, resource)).await?;
+        if !ok {
+            bail!(
+                "could not inventory `{resource}` in namespace `{namespace}`: {}",
+                failure_reason(&err)
+            );
+        }
+        let document: serde_json::Value = serde_json::from_str(&output).with_context(|| {
+            format!("parsing the `{resource}` inventory in namespace `{namespace}`")
+        })?;
+        let items = document
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| {
+                format!("the `{resource}` inventory in namespace `{namespace}` has no items array")
+            })?;
+        for item in items {
+            if is_default_service_account(item, namespace) || is_root_ca_config_map(item, namespace)
+            {
+                continue;
+            }
+            let kind = item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(resource)
+                .to_string();
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>")
+                .to_string();
+            foreign.entry(kind).or_default().push(name);
+        }
+    }
+    if !foreign.is_empty() {
+        let detail = foreign
+            .into_iter()
+            .map(|(kind, mut names)| {
+                names.sort();
+                format!("{kind} ({}): {}", names.len(), names.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "namespace `{namespace}` contains non-default objects and cannot be adopted: {detail}"
+        );
+    }
+    Ok(())
+}
+
+async fn verify_remote_apiservices_available(namespace: &str) -> Result<()> {
+    let (ok, output, err) = run_capture(&apiservices_cmd()).await?;
+    if !ok {
+        bail!(
+            "could not read APIService availability before adopting `{namespace}`: {}",
+            failure_reason(&err)
+        );
+    }
+    let document: serde_json::Value =
+        serde_json::from_str(&output).context("parsing APIService availability inventory")?;
+    if document
+        .get("apiVersion")
+        .and_then(serde_json::Value::as_str)
+        != Some("v1")
+        || document.get("kind").and_then(serde_json::Value::as_str) != Some("List")
+    {
+        bail!("APIService availability inventory has an unexpected object shape");
+    }
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("APIService availability inventory has no items array")?;
+    for item in items {
+        if item.get("apiVersion").and_then(serde_json::Value::as_str)
+            != Some("apiregistration.k8s.io/v1")
+            || item.get("kind").and_then(serde_json::Value::as_str) != Some("APIService")
+        {
+            bail!("APIService availability inventory contains a malformed item");
+        }
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("APIService availability inventory contains an item without a name")?;
+        let spec = item
+            .get("spec")
+            .and_then(serde_json::Value::as_object)
+            .with_context(|| format!("APIService `{name}` has no spec object"))?;
+        let service = match spec.get("service") {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(service) => service.as_object().with_context(|| {
+                format!("remote APIService `{name}` has a malformed service reference")
+            })?,
+        };
+        if service
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .is_none()
+            || service
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            bail!("remote APIService `{name}` has an incomplete service reference");
+        }
+        let available = item
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition.get("type").and_then(serde_json::Value::as_str) == Some("Available")
+                        && condition.get("status").and_then(serde_json::Value::as_str)
+                            == Some("True")
+                })
+            });
+        if !available {
+            bail!(
+                "remote APIService `{name}` is not Available=True; APIService availability must be complete before adopting namespace `{namespace}`"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn combine_install_and_bookkeeping_errors(
+    install_error: anyhow::Error,
+    bookkeeping: Result<()>,
+    o: &CommonOpts,
+) -> anyhow::Error {
+    let Err(bookkeeping_error) = bookkeeping else {
+        return install_error;
+    };
+    let common = ns_common(o, CONTROLLER_DEPLOYMENT_NAMESPACE, false);
+    let stamp = ownership_label_commands(&common, &o.namespace, false)
+        .into_iter()
+        .next()
+        .expect("the create-only controller stamp has one command")
+        .display();
+    let fix = format!(
+        "inspect namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}`; if this release created it, run `{stamp}`, then correct the Helm failure and retry `curie cluster up`"
+    );
+    crate::exit::CliError::failure(format!(
+        "{install_error}; namespace ownership bookkeeping is also incomplete ({bookkeeping_error}); {fix}"
+    ))
+    .with_fix(fix)
+    .into()
+}
+
+/// Preserve the existing create-only rule for the shared controller namespace.
+/// It is never adopted: only an object absent before Helm and present afterward
+/// is stamped, exactly as #707 required before the primary namespace moved to
+/// atomic pre-Helm creation.
+#[allow(dead_code)]
+async fn stamp_created_controller_namespace(o: &CommonOpts, existed_before: bool) -> Result<()> {
+    if existed_before || o.namespace == CONTROLLER_DEPLOYMENT_NAMESPACE {
+        return Ok(());
+    }
+    let exists_after = namespace_exists(CONTROLLER_DEPLOYMENT_NAMESPACE).await?;
+    if !should_stamp_ownership(false, exists_after) {
+        return Ok(());
+    }
+    let common = ns_common(o, CONTROLLER_DEPLOYMENT_NAMESPACE, false);
+    let command = ownership_label_commands(&common, &o.namespace, false)
+        .into_iter()
+        .next()
+        .expect("a newly created controller namespace has one ownership command");
+    crate::ui::ui().plumbing(&format!("+ {}", command.display()));
+    let (ok, _out, err) = run_capture(&command).await?;
+    if !ok {
+        bail!(
+            "could not record create-only ownership for namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}`: {}",
+            failure_reason(&err)
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn hook_jobs_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("jobs"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-l"),
+            plain(format!(
+                "app.kubernetes.io/instance={},app.kubernetes.io/managed-by=Helm",
+                o.release
+            )),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+pub(crate) fn hook_jobs_delete_cmd(o: &CommonOpts, names: &[String]) -> OpsCommand {
+    let mut args = vec![plain("delete"), plain("job")];
+    args.extend(names.iter().cloned().map(plain));
+    args.extend([
+        plain("-n"),
+        plain(&o.namespace),
+        plain("--ignore-not-found"),
+    ]);
+    OpsCommand::new("kubectl", args)
+}
+
+pub(crate) fn parse_hook_job_names(output: &str, o: &CommonOpts) -> Result<Vec<String>> {
+    let document: serde_json::Value =
+        serde_json::from_str(output).context("parsing the Helm hook Job inventory")?;
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("the Helm hook Job inventory has no items array")?;
+    let mut names = BTreeSet::new();
+    for item in items {
+        let metadata = item
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .context("a selected Job has no metadata object")?;
+        let labels = metadata
+            .get("labels")
+            .and_then(serde_json::Value::as_object)
+            .context("a selected Job has no labels object")?;
+        if labels
+            .get("app.kubernetes.io/instance")
+            .and_then(serde_json::Value::as_str)
+            != Some(o.release.as_str())
+            || labels
+                .get("app.kubernetes.io/managed-by")
+                .and_then(serde_json::Value::as_str)
+                != Some("Helm")
+        {
+            bail!("the Job inventory returned an object outside the exact release/Helm selector");
+        }
+        let annotations = metadata
+            .get("annotations")
+            .and_then(serde_json::Value::as_object);
+        let is_hook = annotations
+            .and_then(|annotations| annotations.get("helm.sh/hook"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|hook| !hook.is_empty());
+        if !is_hook {
+            continue;
+        }
+        let annotation_matches = |key: &str, expected: &str| -> Result<bool> {
+            let Some(value) = annotations.and_then(|annotations| annotations.get(key)) else {
+                return Ok(true);
+            };
+            let value = value
+                .as_str()
+                .with_context(|| format!("a selected Helm hook Job has malformed `{key}`"))?;
+            Ok(value == expected)
+        };
+        if !annotation_matches("meta.helm.sh/release-name", &o.release)?
+            || !annotation_matches("meta.helm.sh/release-namespace", &o.namespace)?
+        {
+            continue;
+        }
+        if metadata
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            != Some(o.namespace.as_str())
+        {
+            bail!("a selected Helm hook Job reported a different or missing namespace");
+        }
+        let name = metadata
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("a selected Helm hook Job has no name")?;
+        names.insert(name.to_string());
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// Copy-pasteable equivalent of the dynamic hook cleanup. The selector first
+/// narrows to this release's Helm-managed Jobs; the go-template then emits only
+/// objects carrying Helm's hook annotation. Kubernetes object names cannot
+/// contain shell whitespace, so the bounded `for` loop preserves each name.
+pub(crate) fn hook_cleanup_resume_command(o: &CommonOpts) -> String {
+    let selector = format!(
+        "app.kubernetes.io/instance={},app.kubernetes.io/managed-by=Helm",
+        o.release
+    );
+    let release = serde_json::to_string(&o.release)
+        .expect("a release name always serializes as a Go-template string");
+    let namespace = serde_json::to_string(&o.namespace)
+        .expect("a namespace always serializes as a Go-template string");
+    let mut template = String::from(
+        r#"go-template={{range .items}}{{$hook := ""}}{{$releaseNamePresent := false}}{{$releaseName := ""}}{{$releaseNamespacePresent := false}}{{$releaseNamespace := ""}}{{range $key, $value := .metadata.annotations}}{{if eq $key "helm.sh/hook"}}{{$hook = $value}}{{end}}{{if eq $key "meta.helm.sh/release-name"}}{{$releaseNamePresent = true}}{{$releaseName = $value}}{{end}}{{if eq $key "meta.helm.sh/release-namespace"}}{{$releaseNamespacePresent = true}}{{$releaseNamespace = $value}}{{end}}{{end}}{{if and $hook (or (not $releaseNamePresent) (eq $releaseName "#,
+    );
+    template.push_str(&release);
+    template.push_str(r#")) (or (not $releaseNamespacePresent) (eq $releaseNamespace "#);
+    template.push_str(&namespace);
+    template.push_str(r#"))}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}"#);
+    let get = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("jobs"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-l"),
+            plain(selector),
+            plain("-o"),
+            plain(template),
+        ],
+    )
+    .display();
+    format!(
+        "hooks=$({get}); hook_status=$?; if [ \"$hook_status\" -eq 0 ]; then for job in $hooks; do kubectl delete job \"$job\" -n {} --ignore-not-found || hook_status=$?; done; fi; [ \"$hook_status\" -eq 0 ]",
+        shell_quote(&o.namespace)
+    )
+}
+
+fn ownership_labels(release: &str, install_namespace: &str) -> serde_json::Value {
+    let mut labels = serde_json::Map::new();
+    labels.insert(
+        CREATED_BY_LABEL.to_string(),
+        serde_json::Value::String(release.to_string()),
+    );
+    labels.insert(
+        CREATED_IN_LABEL.to_string(),
+        serde_json::Value::String(install_namespace.to_string()),
+    );
+    serde_json::Value::Object(labels)
+}
+
+fn model_credential_source_is_set(opts: &UpOpts) -> bool {
+    opts.credentials.is_some()
+        || final_operator_value(opts, MODEL_CREDENTIAL_REFERENCE_KEYS[0])
+            .is_some_and(|value| !value.is_empty())
+        // The `opts.secrets` entry may be a reference this run PRESERVED rather
+        // than one anybody supplied for it (#2459). Counting a preserved value
+        // as a credential source would make the caller pin `fakeModel=false`
+        // off the very value it just carried forward, so `--fake-model` would
+        // silently install the real model.
+        //
+        // Only this lane is suppressed. An operator `--set` (the lane above)
+        // and an explicit credential still win over `--fake-model` exactly as
+        // they did before: an operator naming a credential secret and asking
+        // for a fake model in one command is a contradiction, and which side
+        // wins there is not this fix's decision to change.
+        || (!opts.fake_model
+            && opts.secrets.iter().any(|(key, value)| {
+                key == MODEL_CREDENTIAL_REFERENCE_KEYS[0] && !value.is_empty()
+            }))
+}
+
+fn effective_existing_secret(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    inline: &str,
+) -> bool {
+    let reference = format!("{inline}ExistingSecret");
+    if let Some((_, value)) = operator_set_entries(operator_sets)
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key.trim() == reference)
+    {
+        return !value.is_empty();
+    }
+    preserved_value(existing, &reference).is_some()
 }

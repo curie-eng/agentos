@@ -102,6 +102,12 @@ class DeliverySpec:
     logger: logging.Logger
     dead_letter_log: str
     dead_letter_fail_log: str
+    # The idle threshold for the lease-expiry reclaim pass (ADR-0131, #2433).
+    # ``None`` means the lane opted out and the pass is inert, which is also what
+    # a base-only consumer with no lease store gets for free. Last in the
+    # dataclass because it is the first defaulted field; both lanes construct
+    # ``DeliverySpec`` with keyword arguments only, so appending is safe.
+    lease_expired_idle_ms: int | None = None
 
 
 class ConsumerLivenessExpired(RuntimeError):
@@ -339,6 +345,27 @@ class StreamConsumer:
         """Tasks whose handlers own PEL entries in this generation."""
 
         return set()
+
+    def _transfer_capacity(self) -> int | None:
+        """How many rows the lease-expiry pass may claim this tick, or None.
+
+        ``None``, the base default, means unbounded, which is what a base-only
+        consumer with no local dispatch accounting can honestly report.
+
+        Why a bound exists at all (#2433): every row this pass claims sits
+        XCLAIMed but UNLEASED until its dispatched handler acquires the delivery
+        lease. A lane whose dispatch can BLOCK (the runs semaphore, the eval
+        inline await) therefore parks claimed-but-unowned rows for the whole
+        wait, where every other replica reads them as expired-lease candidates.
+        Claiming only what can be dispatched now also routes the surplus to a
+        replica that has capacity, which is the behavior a saturated node should
+        have.
+
+        Consulted ONLY by ``_select_lease_expired_entries``. The proven-dead
+        transfer path is deliberately unbounded and unchanged.
+        """
+
+        return None
 
     def _reset_generation_resources(self) -> None:
         """Subclass hook for semaphore/accounting reset after forced teardown."""
@@ -641,6 +668,37 @@ class StreamConsumer:
                 exc_info=True,
             )
             return True
+
+    async def _has_delivery_state(self, entry_id: str) -> bool:
+        """Was a delivery lease ever granted for this entry?
+
+        The mirror image of :meth:`_lease_is_live`'s posture. That one fails
+        closed as OWNED; this one fails closed as ABSENT, meaning "no evidence".
+        Both answers refuse the claim, which is the point: failing open here
+        would let one Valkey blip manufacture a duplicate dispatch of a turn
+        somebody may still be running.
+
+        Absence is what keeps the mixed-version rule true (#2433). A pre-lease or
+        pre-marker consumer's pending entry carries no evidence a lease was ever
+        granted, so "the lease is gone" cannot be told apart from "there never
+        was one", and such an entry stays on the unchanged XAUTOCLAIM backstop.
+        With no lease store configured there is no evidence to read either.
+        """
+        if self._leases is None:
+            return False
+        try:
+            return await self._leases.has_state(
+                self._spec.stream, self._spec.group, entry_id
+            )
+        except Exception:
+            self._spec.logger.warning(
+                "delivery state unreadable for entry %s on stream %s; treating it "
+                "as ABSENT and leaving it on the backstop",
+                entry_id,
+                self._spec.stream,
+                exc_info=True,
+            )
+            return False
 
     @asynccontextmanager
     async def _delivery_lease(
@@ -1263,50 +1321,169 @@ class StreamConsumer:
             )
             if not rows:
                 break
-            claim_ids: list[str] = []
-            for row in rows:
-                entry_id = str(row["message_id"])
-                if entry_id in self._inflight_ids or entry_id in over_cap:
-                    continue
-                if await self._lease_is_live(entry_id):
-                    continue
-                delivered = int(row["times_delivered"])
-                if delivered >= self._spec.max_delivery:
-                    over_cap.add(entry_id)
-                    try:
-                        await self._dead_letter(
-                            entry_id,
-                            await self._entry_fields(entry_id),
-                            reason=self._spec.over_cap_reason,
-                            delivery_count=delivered,
-                        )
-                    except Exception:
-                        self._spec.logger.exception(
-                            self._spec.dead_letter_fail_log,
-                            entry_id,
-                        )
-                    continue
-                claim_ids.append(entry_id)
-
-            if claim_ids:
-                claimed = await self._redis.xclaim(
-                    self._spec.stream,
-                    self._spec.group,
-                    self._spec.consumer,
-                    0,
-                    claim_ids,
-                )
-                for entry_id, fields in cast("list[StreamEntry]", claimed or []):
-                    if entry_id in self._inflight_ids or entry_id in over_cap:
-                        continue
-                    # Re-checked after the XCLAIM: the window between the filter
-                    # above and the claim is exactly long enough for a
-                    # replacement to acquire the lease.
-                    if await self._lease_is_live(entry_id):
-                        continue
-                    selected.append((entry_id, dict(fields)))
+            # ``min_idle_ms=None`` means compare-and-claim against each row's own
+            # observed idle. Never 0: a stalled claim here must lose to a pass
+            # that already took the row. See ``_claim_pending_page``.
+            selected.extend(
+                await self._claim_pending_page(rows, over_cap, min_idle_ms=None)
+            )
             if len(rows) < page_size:
                 break
+            cursor = f"({rows[-1]['message_id']}"
+        return selected
+
+    async def _claim_pending_page(
+        self,
+        rows: list[Any],
+        over_cap: set[str],
+        *,
+        min_idle_ms: int | None,
+        require_delivery_state: bool = False,
+        budget: int | None = None,
+    ) -> list[StreamEntry]:
+        """Transfer one page of pending rows, enforcing cap before XCLAIM.
+
+        The ONE transfer primitive, shared by the proven-dead path and the
+        lease-expiry pass, so ADR-0039's rules (the pre-claim delivery count, the
+        cap at ``>=``, the ``_inflight_ids`` skip ahead of the cap, the lease
+        re-read after the claim) live in one place instead of drifting in two.
+
+        The claim's min-idle is ALWAYS the idle the caller observed for the row,
+        never 0 (#2433). ``min_idle_ms=None`` means each row's own
+        ``time_since_delivered`` from the pre-claim XPENDING read, which is what
+        the proven-dead path and local recovery pass; an int means that value for
+        every row on the page, which is what the lease-expiry pass passes, equal
+        to its own scan filter. That makes XCLAIM an atomic compare-and-claim on
+        the row's idle clock: any competing transfer resets that clock to about
+        zero the instant it wins, so a stalled caller's claim simply returns
+        nothing rather than stealing a row another pass already took. An empty
+        return is the intended outcome of losing that race, not an error.
+
+        Caller holds ``_reclaim_lock``. At/over-cap entries are dead-lettered
+        directly without XCLAIM's delivery-count increment. ``budget``, when set,
+        stops the page once that many rows have been selected; the rest are left
+        pending with no XCLAIM at all, so a replica with capacity picks them up.
+        """
+
+        selected: list[StreamEntry] = []
+        for row in rows:
+            entry_id = str(row["message_id"])
+            if entry_id in self._inflight_ids or entry_id in over_cap:
+                continue
+            if budget is not None and len(selected) >= budget:
+                break
+            if await self._lease_is_live(entry_id):
+                continue
+            if require_delivery_state and not await self._has_delivery_state(entry_id):
+                continue
+            delivered = int(row["times_delivered"])
+            if delivered >= self._spec.max_delivery:
+                over_cap.add(entry_id)
+                try:
+                    await self._dead_letter(
+                        entry_id,
+                        await self._entry_fields(entry_id),
+                        reason=self._spec.over_cap_reason,
+                        delivery_count=delivered,
+                    )
+                except Exception:
+                    self._spec.logger.exception(
+                        self._spec.dead_letter_fail_log,
+                        entry_id,
+                    )
+                continue
+            idle_for_row = (
+                min_idle_ms
+                if min_idle_ms is not None
+                # Floored to 1: a just-delivered row's own
+                # ``time_since_delivered`` can read 0, and XCLAIM with min-idle
+                # 0 always matches regardless of ownership, which would break
+                # the compare-and-claim guarantee above.
+                else max(1, int(row["time_since_delivered"]))
+            )
+            claimed = await self._redis.xclaim(
+                self._spec.stream,
+                self._spec.group,
+                self._spec.consumer,
+                idle_for_row,
+                [entry_id],
+            )
+            for claimed_id, fields in cast("list[StreamEntry]", claimed or []):
+                if claimed_id in self._inflight_ids or claimed_id in over_cap:
+                    continue
+                # Re-checked after the XCLAIM: the window between the filter
+                # above and the claim is exactly long enough for a
+                # replacement to acquire the lease.
+                if await self._lease_is_live(claimed_id):
+                    continue
+                selected.append((claimed_id, dict(fields)))
+        return selected
+
+    async def _select_lease_expired_entries(
+        self, over_cap: set[str], *, already_selected: int = 0
+    ) -> list[StreamEntry]:
+        """Transfer rows whose delivery lease has expired, including a live peer's.
+
+        Caller holds ``_reclaim_lock``. The rule is ADR-0131's: "a replacement may
+        transfer a delivery only after the lease has expired." The failure it
+        closes (#2433) is a LIVE consumer's own PEL row: a handler that raised
+        released its lease and left the entry pending, and no prompt path looks at
+        a peer that is not dead, so before this pass such an entry waited out the
+        900 second XAUTOCLAIM backstop.
+
+        Inert without a lease store or without a configured threshold, so a
+        base-only consumer keeps its pre-ADR-0131 behavior exactly.
+        """
+
+        idle_ms = self._spec.lease_expired_idle_ms
+        if self._leases is None or idle_ms is None:
+            return []
+        # Claim only what this process can dispatch NOW. Everything claimed here
+        # sits XCLAIMed but UNLEASED until its handler acquires the delivery
+        # lease, and the runs lane's ``_dispatch`` waits on a semaphore before it
+        # even gets that far, so an unbounded pass on a saturated node parks rows
+        # a peer will legitimately compare-and-claim one lease TTL later.
+        # ``already_selected`` is what the proven-dead pass already took this same
+        # tick: nothing is dispatched until every pass has finished selecting, so
+        # without it a concurrency-one consumer would still see a free slot here.
+        # ``None`` capacity means unbounded (the base default).
+        capacity = self._transfer_capacity()
+        budget = None if capacity is None else max(0, capacity - already_selected)
+        if budget is not None and budget <= 0:
+            return []
+
+        selected: list[StreamEntry] = []
+        page_size = self._spec.cap_scan_page
+        cursor = "-"
+        while not self._should_stop():
+            rows = await self._redis.xpending_range(
+                self._spec.stream,
+                self._spec.group,
+                min=cursor,
+                max="+",
+                count=page_size,
+                idle=idle_ms,
+            )
+            if not rows:
+                break
+            # Compare-and-claim: the min-idle handed to XCLAIM is exactly the IDLE
+            # this scan filtered on, so a row any competing transfer path already
+            # took (which reset its idle to about zero) no longer matches and this
+            # pass simply does not win it. Never 0.
+            claimed = await self._claim_pending_page(
+                rows,
+                over_cap,
+                min_idle_ms=idle_ms,
+                require_delivery_state=True,
+                budget=None if budget is None else budget - len(selected),
+            )
+            selected.extend(claimed)
+            if budget is not None and len(selected) >= budget:
+                break
+            if len(rows) < page_size:
+                break
+            # Exclusive lower bound: a single page would leave the tail unscanned
+            # at backlog scale.
             cursor = f"({rows[-1]['message_id']}"
         return selected
 
@@ -1339,6 +1516,11 @@ class StreamConsumer:
     async def _prompt_reclaim_once(self) -> int:
         """Observe capable peers and promptly recover only proven-dead owners."""
 
+        if await self._claims_paused():
+            # A prompt transfer is a new claim just as surely as XREADGROUP is.
+            # Return before liveness observation, pending selection, arbitration,
+            # or XCLAIM so a drain cannot charge or move a peer's delivery.
+            return 0
         return await self._reclaim_dead_consumers()
 
     async def _prompt_reclaim_loop(self) -> None:
@@ -1366,11 +1548,31 @@ class StreamConsumer:
 
         The prompt capable-peer path shares this selection lock, while unknown
         peers retain this 15-minute compatibility backstop unchanged.
+
+        Between the proven-dead pass and that backstop runs the lease-expiry pass
+        (#2433), which recovers a row whose delivery lease has expired, including
+        a LIVE consumer's own, long before the backstop. It is hosted here rather
+        than on the faster prompt cadence so it inherits the upgrade-drain gate
+        and can reuse the ``over_cap`` set this tick already produced.
         """
+        if await self._claims_paused():
+            # Runs already skips this entire maintenance tick at its outer loop.
+            # Keep the shared entrypoint guarded too so eval and direct callers
+            # return before cap scans, dead-letter writes, or any transfer.
+            return 0
         selected: list[StreamEntry] = []
         async with self._reclaim_lock:
             over_cap = await self._dead_letter_over_cap()
             selected.extend(await self._select_dead_consumer_entries(over_cap))
+            # ``already_selected`` is load-bearing rather than tidiness: nothing is
+            # dispatched until every pass has finished selecting, so omitting it
+            # lets a concurrency-one consumer claim a second row that then waits
+            # behind the first.
+            selected.extend(
+                await self._select_lease_expired_entries(
+                    over_cap, already_selected=len(selected)
+                )
+            )
             cursor: str = "0-0"
             while not self._should_stop():
                 raw = await self._redis.xautoclaim(

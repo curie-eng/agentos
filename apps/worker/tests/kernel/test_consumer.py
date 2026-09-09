@@ -1464,6 +1464,66 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
     asyncio.run(go())
 
 
+def test_sadd_of_bare_eval_conversation_id_does_not_release_scoped_sandbox(
+    make_harness,
+) -> None:
+    """#2259 negative: after ADR-0096 the worker keys sandboxes as
+    quote(kind):quote(channel):quote(conversation_id). SADDing the bare
+    ``eval:`` conversation_id (what cluster eval used to queue) is a no-op
+    drain: lookup misses, the sandbox keeps its ResourceQuota slot.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="hi", status=DONE)]
+            event = _qevent("eval-case-1", thread="eval:1720000000.000100")
+            await h.kernel.process_event(event)
+            scoped = kernel_module._thread_key_for(event)
+            assert h.substrate.lookup(scoped) is not None
+            assert scoped == "slack:C1:eval%3A1720000000.000100"
+
+            await h.async_redis.sadd(THREAD_RESET_SET, event.conversation_id)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+            nxt = _qevent("follow-up", thread="tNext", event_id="eval-wrong-key")
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(nxt))
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, to_stream_fields(nxt))
+
+            assert h.substrate.lookup(scoped) is not None, (
+                "a THREAD_RESET_SET member that is not the scoped thread key "
+                "must not release the eval sandbox"
+            )
+
+    asyncio.run(go())
+
+
+def test_sadd_of_scoped_eval_isolate_key_releases_the_sandbox(make_harness) -> None:
+    """#2259: the CLI must SADD the same percent-encoded triple the worker
+    claimed, including the ``eval:`` conversation_id whose colon encodes.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="hi", status=DONE)]
+            event = _qevent("eval-case-1", thread="eval:1720000000.000100")
+            await h.kernel.process_event(event)
+            scoped = kernel_module._thread_key_for(event)
+            assert h.substrate.lookup(scoped) is not None
+
+            await h.async_redis.sadd(THREAD_RESET_SET, scoped)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+            nxt = _qevent("eval-case-2", thread="eval:1720000000.000200", event_id="eval-scoped")
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(nxt))
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, to_stream_fields(nxt))
+
+            assert h.substrate.lookup(scoped) is None
+
+    asyncio.run(go())
+
+
 def test_maintenance_tick_drains_pending_thread_reset_requests(make_harness) -> None:
     """#713: an operator-requested thread reset (the API SADDs the thread_key
     into THREAD_RESET_SET) is picked up and applied by the maintenance tick,

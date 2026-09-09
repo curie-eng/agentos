@@ -34,7 +34,8 @@ use crate::chat::{
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{
-    self, connect, diagnostics, eval_case_turn, queue_thread_reset, synthetic_turn, xadd,
+    self, connect, diagnostics, eval_case_turn, queue_thread_reset, synthetic_turn,
+    thread_key_for_turn, xadd,
 };
 use crate::state::{save_turn, TurnContext, TurnVerb};
 
@@ -1180,6 +1181,47 @@ async fn bounded_diagnostics(
         })
 }
 
+/// Observe the claim gate for the same tier the message targets. The local
+/// message surface has no compose-file flag, so it follows the fixed local
+/// lifecycle file and project used by `curie local up`.
+async fn observe_message_claims(
+    opts: &MessageOpts,
+    verb: TurnVerb,
+) -> crate::worker_claims::ClaimsState {
+    match verb {
+        TurnVerb::Local => {
+            crate::worker_claims::observe_local(crate::local::DEFAULT_COMPOSE_FILE).await
+        }
+        TurnVerb::Cluster => {
+            crate::worker_claims::observe_cluster(&opts.namespace, &opts.release)
+                .await
+                .state
+        }
+    }
+}
+
+/// A known marker is useful before the first reply poll: print it on stderr and
+/// attach it to the active checklist step without exposing any subprocess text.
+fn report_initial_claim_wait(
+    ui: &crate::ui::Ui,
+    step: &crate::ui::Step,
+    state: &crate::worker_claims::ClaimsState,
+) {
+    if let Some(reason) = state.wait_reason() {
+        ui.note(&reason);
+        step.tick_detail(&reason);
+    }
+}
+
+/// Keep the existing diagnostics slot and prepend only the authored current
+/// marker reason. No claim reason leaves the old diagnostics byte shape alone.
+fn diagnostics_with_claim_wait(diagnostics: String, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("  {reason}\n{diagnostics}"),
+        None => diagnostics,
+    }
+}
+
 const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
 const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
 const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
@@ -1734,6 +1776,8 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+    report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let outcome = {
         let mut observe_update = |text: &str| {
@@ -1847,12 +1891,20 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             // next `local message` can bind successfully right away regardless of
             // how long anything after this line takes (#751).
             drop(stub);
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+            let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
             let diag = if ui.json() {
+                if let Some(reason) = latest_reason.as_deref() {
+                    ui.note(reason);
+                }
                 None
             } else {
-                Some(bounded_diagnostics(&mut conn, &opts.stream, &stream_id).await)
+                Some(diagnostics_with_claim_wait(
+                    bounded_diagnostics(&mut conn, &opts.stream, &stream_id).await,
+                    latest_reason.as_deref(),
+                ))
             };
             ui.emit(&MessageOutcomeOutput::TimedOut {
                 diagnostics: diag,
@@ -2973,6 +3025,8 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+    report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let observed = {
         let mut observe_update = |text: &str| {
@@ -3066,12 +3120,20 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         }
         Outcome::TimedOut => {
             step.fail(&format!("timed out after {}s", opts.timeout_secs));
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+            let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
             let diag = if ui.json() {
+                if let Some(reason) = latest_reason.as_deref() {
+                    ui.note(reason);
+                }
                 None
             } else {
-                Some(bounded_diagnostics(&mut conn, &opts.stream, &stream_id).await)
+                Some(diagnostics_with_claim_wait(
+                    bounded_diagnostics(&mut conn, &opts.stream, &stream_id).await,
+                    latest_reason.as_deref(),
+                ))
             };
             ui.emit(&MessageOutcomeOutput::TimedOut {
                 diagnostics: diag,
@@ -3384,8 +3446,11 @@ async fn run_eval_turns(
                     &placeholder_ts,
                     Some(reply_endpoint),
                 );
-                let conversation_id = event.conversation_id.clone();
-                eval_threads.push(conversation_id.clone());
+                // The worker claims under quote(kind):quote(channel):quote(conversation_id),
+                // not the bare eval-prefixed conversation_id. SADD the scoped key
+                // or the drain is a no-op and the sandbox keeps its quota slot (#2259).
+                let thread_key = thread_key_for_turn(&event);
+                eval_threads.push(thread_key.clone());
                 let started = Instant::now();
                 let stream_id = xadd(conn, &opts.stream, &event).await?;
                 let mut observe_update = |_: &str| {};
@@ -3402,7 +3467,7 @@ async fn run_eval_turns(
                 // Release this sample's sandbox on every completed/red/timed-out
                 // path so a three-case suite run twice cannot pin eight
                 // curie-thread-* claims against the default ResourceQuota (#1534).
-                queue_thread_reset(conn, &conversation_id).await?;
+                queue_thread_reset(conn, &thread_key).await?;
                 let elapsed = started.elapsed().as_secs_f64();
                 let output = match &outcome {
                     Outcome::Replied(reply) => reply.clone(),
@@ -3450,8 +3515,8 @@ async fn run_eval_turns(
     let result = run.await;
     // Suite error/cancel: still queue every case we enqueued, including the
     // in-flight one, so an abandoned retry cannot bind a late sandbox.
-    for conversation_id in &eval_threads {
-        let _ = queue_thread_reset(conn, conversation_id).await;
+    for thread_key in &eval_threads {
+        let _ = queue_thread_reset(conn, thread_key).await;
     }
     bar.finish();
     result
@@ -4784,11 +4849,15 @@ mod tests {
             "each eval case must mint through eval_case_turn so the enqueued conversation_id is isolated"
         );
         assert!(
-            src.contains("queue_thread_reset(conn, &conversation_id)"),
-            "each eval case must queue its isolated conversation_id for sandbox release"
+            src.contains("thread_key_for_turn(&event)"),
+            "each eval case must SADD the worker's scoped thread key, not the bare conversation_id"
         );
         assert!(
-            src.contains("for conversation_id in &eval_threads"),
+            src.contains("queue_thread_reset(conn, &thread_key)"),
+            "each eval case must queue its scoped thread key for sandbox release"
+        );
+        assert!(
+            src.contains("for thread_key in &eval_threads"),
             "suite error/cancel must still queue every enqueued eval thread"
         );
     }

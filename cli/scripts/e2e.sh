@@ -316,16 +316,45 @@ if TRY_KEEP_COLLISION_OUTPUT="$(
         CURIE_CONFIG_DIR="$TRY_KEEP_CONFIG_DIR" \
         "$BIN" try --keep </dev/null 2>&1
 )"; then
-    printf '%s\n' "$TRY_KEEP_COLLISION_OUTPUT"
+    printf '%s\n' "$TRY_KEEP_COLLISION_OUTPUT" | sed 's/^/  /'
     echo "error: curie try --keep overwrote an existing curie-demo project." >&2
     exit 1
 fi
-printf '%s\n' "$TRY_KEEP_COLLISION_OUTPUT"
+printf '%s\n' "$TRY_KEEP_COLLISION_OUTPUT" | sed 's/^/  /'
 if [[ "$(sha256sum "$TRY_KEEP_MANIFEST" | awk '{print $1}')" != "$TRY_KEEP_MANIFEST_SHA256" ]]; then
     echo "error: refused curie try --keep altered the existing plugin manifest." >&2
     exit 1
 fi
 echo "confirmed: a second --keep refuses and preserves the graduated plugin manifest"
+
+echo
+echo "=== curie try --keep (refuse an unowned nonempty directory) ==="
+TRY_UNOWNED_ROOT="$WORKDIR/try-unowned"
+TRY_UNOWNED_CONFIG_DIR="$TRY_UNOWNED_ROOT/config"
+TRY_UNOWNED_PROJECT="$TRY_UNOWNED_ROOT/curie-demo"
+mkdir -p "$TRY_UNOWNED_CONFIG_DIR" "$TRY_UNOWNED_PROJECT"
+printf '%s\n' "user notes" > "$TRY_UNOWNED_PROJECT/notes.txt"
+TRY_UNOWNED_SHA256="$(sha256sum "$TRY_UNOWNED_PROJECT/notes.txt" | awk '{print $1}')"
+if TRY_UNOWNED_OUTPUT="$(
+    cd "$TRY_UNOWNED_ROOT"
+    env "${TRY_ENV_UNSET[@]}" \
+        CURIE_CONFIG_DIR="$TRY_UNOWNED_CONFIG_DIR" \
+        "$BIN" try --keep </dev/null 2>&1
+)"; then
+    printf '%s\n' "$TRY_UNOWNED_OUTPUT" | sed 's/^/  /'
+    echo "error: curie try --keep wrote into an unowned nonempty directory." >&2
+    exit 1
+fi
+printf '%s\n' "$TRY_UNOWNED_OUTPUT" | sed 's/^/  /'
+if [[ "$(sha256sum "$TRY_UNOWNED_PROJECT/notes.txt" | awk '{print $1}')" != "$TRY_UNOWNED_SHA256" ]]; then
+    echo "error: refused curie try --keep altered the user's file." >&2
+    exit 1
+fi
+if [[ -e "$TRY_UNOWNED_PROJECT/.claude-plugin/plugin.json" ]]; then
+    echo "error: refused curie try --keep created a plugin manifest in the unowned directory." >&2
+    exit 1
+fi
+echo "confirmed: try --keep refuses an unowned nonempty directory and leaves user files untouched"
 
 echo
 echo "=== Resolve the bundle under test ==="

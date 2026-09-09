@@ -10510,6 +10510,34 @@
         ]
       }
     },
+    "/ready": {
+      "get": {
+        "operationId": "ready_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Ready Ready Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "503": {
+            "description": "Database is unavailable"
+          }
+        },
+        "summary": "Ready",
+        "tags": [
+          "health"
+        ]
+      }
+    },
     "/v1/internal/cluster-message-replies/{reply_ref}": {
       "post": {
         "operationId": "append_cluster_message_reply_v1_internal_cluster_message_replies__reply_ref__post",

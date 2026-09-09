@@ -235,6 +235,33 @@ pub fn scaffold(dir: &Path, name: &str) -> Result<Vec<PathBuf>> {
     write_bundle(dir, files)
 }
 
+/// Refuse to create a generated demo directory over an existing nonempty tree.
+///
+/// `write_bundle` still refuses named scaffold targets so `init --adopt` can
+/// write alongside surviving files. `curie try --keep` is not adopt: a second
+/// stage or rerun must not recreate `./curie-demo` over a previous generated
+/// bundle or a user's files (#2423). Missing and empty directories are owned
+/// by this stage and may be filled.
+pub(crate) fn refuse_unowned_nonempty_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    if !dir.is_dir() {
+        bail!("refusing to recreate {}: not a directory", dir.display());
+    }
+    let empty = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .next()
+        .is_none();
+    if !empty {
+        bail!(
+            "refusing to recreate {}: directory exists and is not empty",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Write a bundle's files with the shared collision-refusal discipline: refuse
 /// if ANY target (or a stray root `plugin.json`) already exists, leaving every
 /// existing file untouched and creating nothing on collision. Both the weather
@@ -710,6 +737,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         scaffold(dir.path(), "deal-desk").unwrap();
         assert!(scaffold(dir.path(), "deal-desk").is_err());
+    }
+
+    #[test]
+    fn refuse_unowned_nonempty_dir_allows_missing_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("curie-demo");
+        refuse_unowned_nonempty_dir(&missing).unwrap();
+        std::fs::create_dir(&missing).unwrap();
+        refuse_unowned_nonempty_dir(&missing).unwrap();
+    }
+
+    #[test]
+    fn refuse_unowned_nonempty_dir_rejects_user_files_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let demo = dir.path().join("curie-demo");
+        std::fs::create_dir(&demo).unwrap();
+        let notes = demo.join("notes.txt");
+        std::fs::write(&notes, "user notes\n").unwrap();
+        let err = refuse_unowned_nonempty_dir(&demo).unwrap_err().to_string();
+        assert!(err.contains("not empty"), "{err}");
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "user notes\n");
+        assert!(!demo.join(".claude-plugin/plugin.json").exists());
     }
 
     #[test]

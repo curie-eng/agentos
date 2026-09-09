@@ -39,7 +39,14 @@ pub const SEALING_PREVIOUS_PRIVATE_KEY: &str = "sealing.previousPrivateKey";
 /// credential in every agent repository becoming permanently unreadable. It is
 /// the same bug with a far worse blast radius, so the keys ride the same
 /// preservation path the other generated secrets do.
-pub const SEALING_MANAGED_KEYS: &[&str] = &[SEALING_PRIVATE_KEY, SEALING_PREVIOUS_PRIVATE_KEY];
+pub const SEALING_MANAGED_KEYS: &[&str] = &[
+    SEALING_PRIVATE_KEY,
+    SEALING_PREVIOUS_PRIVATE_KEY,
+    "sealing.privateKeyExistingSecret",
+    "sealing.privateKeyExistingSecretKey",
+    "sealing.previousPrivateKeyExistingSecret",
+    "sealing.previousPrivateKeyExistingSecretKey",
+];
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD

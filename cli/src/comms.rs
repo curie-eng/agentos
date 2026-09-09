@@ -62,6 +62,10 @@ pub fn connect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
             plain(&opts.common.namespace),
             plain("--reuse-values"),
             plain("--set"),
+            plain("dispatcher.slack.appTokenExistingSecret="),
+            plain("--set"),
+            plain("dispatcher.slack.botTokenExistingSecret="),
+            plain("--set"),
             secret_set("dispatcher.slack.appToken", &opts.app_token),
             plain("--set"),
             secret_set("dispatcher.slack.botToken", &opts.bot_token),
@@ -81,6 +85,10 @@ pub fn disconnect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
             plain("-n"),
             plain(&opts.common.namespace),
             plain("--reuse-values"),
+            plain("--set"),
+            plain("dispatcher.slack.appTokenExistingSecret="),
+            plain("--set"),
+            plain("dispatcher.slack.botTokenExistingSecret="),
             plain("--set"),
             plain("dispatcher.slack.appToken="),
             plain("--set"),
@@ -588,6 +596,8 @@ mod tests {
         assert_eq!(
             cmds[0].display(),
             "helm upgrade curie charts/curie -n curie --reuse-values \
+             --set dispatcher.slack.appTokenExistingSecret= \
+             --set dispatcher.slack.botTokenExistingSecret= \
              --set 'dispatcher.slack.appToken=xapp-123***' \
              --set 'dispatcher.slack.botToken=xoxb-123***' \
              --set worker.slackApiBaseUrl="
@@ -673,11 +683,30 @@ mod tests {
         assert_eq!(
             line,
             "helm upgrade curie charts/curie -n curie --reuse-values \
+             --set dispatcher.slack.appTokenExistingSecret= \
+             --set dispatcher.slack.botTokenExistingSecret= \
              --set dispatcher.slack.appToken= --set dispatcher.slack.botToken="
         );
         assert!(!line.contains("worker.slackApiBaseUrl"), "{line}");
         assert!(!line.contains("xapp-"), "{line}");
         assert!(!line.contains("xoxb-"), "{line}");
+    }
+
+    #[test]
+    fn comms_source_changes_clear_recorded_byo_tokens() {
+        let opts = CommsOpts {
+            common: common(),
+            chart: "charts/curie".into(),
+            app_token: "xapp-EXAMPLE".into(),
+            bot_token: "xoxb-EXAMPLE".into(),
+            disconnect: false,
+        };
+        for command in [connect_commands(&opts), disconnect_commands(&opts)] {
+            let args = command[0].argv();
+            for path in ["appToken", "botToken"] {
+                assert!(args.contains(&format!("dispatcher.slack.{path}ExistingSecret=")));
+            }
+        }
     }
 
     #[test]

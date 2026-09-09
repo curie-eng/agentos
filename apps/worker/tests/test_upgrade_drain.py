@@ -29,12 +29,19 @@ import ast
 import asyncio
 import contextlib
 import importlib
+import json
+import os
 import re
+import socket
+import subprocess
+import sys
 from collections.abc import AsyncIterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+import redis.asyncio
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -46,7 +53,7 @@ from curie_test_support.valkey import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.upgrade_drain import UpgradeDrainGate, main, run_gate
+from curie_worker.upgrade_drain import UpgradeDrainGate, _client, main, run_gate
 from redis.asyncio import Redis as AsyncRedis
 from redis.exceptions import ResponseError
 
@@ -121,6 +128,81 @@ async def _pending(client: AsyncRedis, config: WorkerConfig, consumer: str) -> s
     return str(entry_id)
 
 
+def _legacy_quiesce_key(config: WorkerConfig) -> str:
+    """The pre-#2374 key, named explicitly for mixed-version assertions."""
+    return f"{config.key_prefix}:upgrade:quiesce"
+
+
+def _scoped_quiesce_key(config: WorkerConfig, installation_id: str) -> str:
+    return f"{config.key_prefix}:upgrade:quiesce:{installation_id}"
+
+
+def _module_env(config: WorkerConfig) -> dict[str, str]:
+    """Only public connection/config values needed by the hook subprocess."""
+    installation_id = str(getattr(config, "installation_id", "install-status"))
+    revision = getattr(config, "upgrade_revision", 10)
+    legacy = bool(getattr(config, "upgrade_legacy_quiesce", False))
+    return {
+        **os.environ,
+        "VALKEY_HOST": config.valkey_host,
+        "VALKEY_PORT": str(config.valkey_port),
+        "VALKEY_PASSWORD": config.valkey_password,
+        "VALKEY_DB": str(config.valkey_db),
+        "VALKEY_TLS": "true" if config.valkey_tls else "false",
+        "KEY_PREFIX": config.key_prefix,
+        "CURIE_STREAM": config.stream,
+        "CURIE_CONSUMER_GROUP": config.consumer_group,
+        "CURIE_EVAL_STREAM": config.eval_stream,
+        "CURIE_EVAL_CONSUMER_GROUP": config.eval_consumer_group,
+        "CURIE_INSTALLATION_ID": installation_id,
+        "CURIE_UPGRADE_REVISION": "" if revision is None else str(revision),
+        "CURIE_UPGRADE_LEGACY_QUIESCE": "true" if legacy else "false",
+        "CURIE_UPGRADE_DRAIN_TIMEOUT_S": str(config.upgrade_drain_timeout_s),
+        "CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S": str(
+            config.upgrade_drain_poll_interval_s
+        ),
+        "CURIE_UPGRADE_QUIESCE_TTL_S": str(config.upgrade_quiesce_ttl_s),
+    }
+
+
+def _configure_module_env(
+    monkeypatch: pytest.MonkeyPatch, config: WorkerConfig
+) -> None:
+    for name, value in _module_env(config).items():
+        if name in {
+            "VALKEY_HOST",
+            "VALKEY_PORT",
+            "VALKEY_PASSWORD",
+            "VALKEY_DB",
+            "VALKEY_TLS",
+            "KEY_PREFIX",
+            "CURIE_STREAM",
+            "CURIE_CONSUMER_GROUP",
+            "CURIE_EVAL_STREAM",
+            "CURIE_EVAL_CONSUMER_GROUP",
+            "CURIE_INSTALLATION_ID",
+            "CURIE_UPGRADE_REVISION",
+            "CURIE_UPGRADE_LEGACY_QUIESCE",
+            "CURIE_UPGRADE_DRAIN_TIMEOUT_S",
+            "CURIE_UPGRADE_DRAIN_POLL_INTERVAL_S",
+            "CURIE_UPGRADE_QUIESCE_TTL_S",
+        }:
+            monkeypatch.setenv(name, value)
+
+
+def _status_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: WorkerConfig,
+) -> tuple[dict[str, object], str]:
+    _configure_module_env(monkeypatch, config)
+    assert main(["--mode", "status", "--json"]) == 0
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert len(lines) == 1, f"status must write one JSON object, got {lines!r}"
+    return json.loads(lines[0]), captured.err
+
+
 # --- the quiesce flag ---------------------------------------------------------
 
 
@@ -170,6 +252,397 @@ def test_clear_quiesce_is_idempotent(names) -> None:  # noqa: ANN001
             assert await gate.is_quiescing() is False
 
     asyncio.run(go())
+
+
+def test_scoped_marker_isolates_installations_and_has_a_finite_ttl(
+    names,
+) -> None:  # noqa: ANN001
+    """A leftover hook can pause only the installation whose ID it carries."""
+
+    async def go() -> None:
+        first = _config(
+            names,
+            installation_id="install-first",
+            upgrade_revision=9,
+            upgrade_legacy_quiesce=False,
+        )
+        second = _config(
+            names,
+            installation_id="install-second",
+            upgrade_revision=9,
+            upgrade_legacy_quiesce=False,
+        )
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        first_key = _scoped_quiesce_key(first, "install-first")
+        second_key = _scoped_quiesce_key(second, "install-second")
+        legacy_key = _legacy_quiesce_key(first)
+        try:
+            await client.delete(first_key, second_key, legacy_key)
+            await UpgradeDrainGate(client, first).request_quiesce()
+
+            assert await UpgradeDrainGate(client, first).is_quiescing() is True
+            assert await UpgradeDrainGate(client, second).is_quiescing() is False
+            assert await client.exists(first_key)
+            assert not await client.exists(second_key)
+            assert not await client.exists(legacy_key), (
+                "a current install touched the global compatibility key"
+            )
+            ttl_ms = await client.pttl(first_key)
+            assert 0 < ttl_ms <= int(_QUIESCE_TTL_S * 1000)
+        finally:
+            await client.delete(first_key, second_key, legacy_key)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_marker_json_fences_numeric_revisions_and_retains_same_revision_since(
+    names,
+) -> None:  # noqa: ANN001
+    """Revision 10 outranks 9; retries by one owner preserve authorship time."""
+
+    async def go() -> None:
+        revision_9 = _config(
+            names,
+            installation_id="install-fenced",
+            upgrade_revision=9,
+            upgrade_legacy_quiesce=False,
+        )
+        revision_10 = _config(
+            names,
+            installation_id="install-fenced",
+            upgrade_revision=10,
+            upgrade_legacy_quiesce=False,
+        )
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        key = _scoped_quiesce_key(revision_9, "install-fenced")
+        gate_9 = UpgradeDrainGate(client, revision_9)
+        gate_10 = UpgradeDrainGate(client, revision_10)
+        try:
+            await client.delete(key, _legacy_quiesce_key(revision_9))
+            await gate_9.request_quiesce()
+            first_raw = await client.get(key)
+            assert first_raw is not None
+            first = json.loads(first_raw)
+            assert first["revision"] == 9
+            assert isinstance(first["revision"], int)
+            parsed_since = datetime.fromisoformat(first["since"])
+            assert parsed_since.tzinfo is not None
+
+            await asyncio.sleep(0.02)
+            await gate_9.request_quiesce()
+            assert await client.get(key) == first_raw, (
+                "a same-revision retry rewrote the original since timestamp"
+            )
+
+            await gate_10.request_quiesce()
+            revision_10_raw = await client.get(key)
+            assert revision_10_raw is not None
+            assert json.loads(revision_10_raw)["revision"] == 10
+
+            await gate_9.request_quiesce()
+            assert await client.get(key) == revision_10_raw, (
+                "numeric revision 9 replaced the newer revision 10 marker"
+            )
+            await gate_9.clear_quiesce()
+            assert await client.get(key) == revision_10_raw, (
+                "a delayed revision 9 release cleared revision 10"
+            )
+            await gate_10.clear_quiesce()
+            assert not await client.exists(key)
+        finally:
+            await client.delete(key, _legacy_quiesce_key(revision_9))
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_current_marker_never_reads_writes_or_clears_the_global_key(
+    names,
+) -> None:  # noqa: ANN001
+    async def go() -> None:
+        config = _config(
+            names,
+            installation_id="install-current",
+            upgrade_revision=10,
+            upgrade_legacy_quiesce=False,
+        )
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        gate = UpgradeDrainGate(client, config)
+        legacy_key = _legacy_quiesce_key(config)
+        scoped_key = _scoped_quiesce_key(config, "install-current")
+        legacy_value = json.dumps(
+            {"since": "2026-09-08T00:00:00+00:00", "revision": 77},
+            separators=(",", ":"),
+        )
+        try:
+            await client.delete(legacy_key, scoped_key)
+            await client.set(legacy_key, legacy_value, ex=30)
+
+            assert await gate.is_quiescing() is False
+            await gate.request_quiesce()
+            assert await client.get(legacy_key) == legacy_value
+            assert await client.exists(scoped_key)
+            await gate.clear_quiesce()
+            assert await client.get(legacy_key) == legacy_value
+            assert not await client.exists(scoped_key)
+        finally:
+            await client.delete(legacy_key, scoped_key)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_first_mixed_version_upgrade_atomically_writes_and_clears_both_keys(
+    names,
+) -> None:  # noqa: ANN001
+    async def go() -> None:
+        config = _config(
+            names,
+            installation_id="install-adopted",
+            upgrade_revision=9,
+            upgrade_legacy_quiesce=True,
+        )
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        gate = UpgradeDrainGate(client, config)
+        legacy_key = _legacy_quiesce_key(config)
+        scoped_key = _scoped_quiesce_key(config, "install-adopted")
+        try:
+            await client.delete(legacy_key, scoped_key)
+            await gate.request_quiesce()
+            legacy_raw, scoped_raw = await client.mget(legacy_key, scoped_key)
+            assert legacy_raw is not None
+            assert scoped_raw is not None
+            assert scoped_raw == legacy_raw, (
+                "the compatibility bridge did not author one marker on both keys"
+            )
+            assert json.loads(scoped_raw)["revision"] == 9
+            assert await client.ttl(legacy_key) > 0
+            assert await client.ttl(scoped_key) > 0
+
+            await gate.clear_quiesce()
+            assert await client.mget(legacy_key, scoped_key) == [None, None]
+        finally:
+            await client.delete(legacy_key, scoped_key)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_refused_mixed_version_upgrade_clears_both_owned_markers(
+    names,
+) -> None:  # noqa: ANN001
+    """A pre-fix worker sees claims enabled again when the new hook refuses."""
+
+    async def go() -> None:
+        config = _config(
+            names,
+            installation_id="install-adopted",
+            upgrade_revision=9,
+            upgrade_legacy_quiesce=True,
+        )
+        legacy_config = _config(names, installation_id="")
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        legacy_key = _legacy_quiesce_key(config)
+        scoped_key = _scoped_quiesce_key(config, "install-adopted")
+        try:
+            await client.delete(legacy_key, scoped_key)
+            entry_id = await _pending(client, config, "replica-pre-fix")
+            store = DeliveryLeaseStore(client, config)
+            await store.acquire(
+                config.stream,
+                config.consumer_group,
+                entry_id,
+                consumer="replica-pre-fix",
+            )
+
+            assert await run_gate(config, mode="drain") == 1
+            assert await client.mget(legacy_key, scoped_key) == [None, None]
+            assert await UpgradeDrainGate(client, legacy_config).is_quiescing() is False
+        finally:
+            await client.delete(legacy_key, scoped_key)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_status_writes_one_safe_json_object_for_absent_owned_and_malformed_markers(
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # noqa: ANN001
+    """Existence is pause authority even when marker metadata is unreadable."""
+
+    config = _config(
+        names,
+        installation_id="install-status",
+        upgrade_revision=10,
+        upgrade_legacy_quiesce=False,
+    )
+    key = _scoped_quiesce_key(config, "install-status")
+
+    async def arrange(value: str | None) -> None:
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        try:
+            await client.delete(key, _legacy_quiesce_key(config))
+            if value is None:
+                return
+            if value == "owned":
+                await UpgradeDrainGate(client, config).request_quiesce()
+            else:
+                await client.set(key, value, ex=30)
+                assert await UpgradeDrainGate(client, config).is_quiescing() is True
+        finally:
+            await client.aclose()
+
+    try:
+        asyncio.run(arrange(None))
+        status, stderr = _status_json(monkeypatch, capsys, config)
+        assert status == {
+            "state": "claims_enabled",
+            "since": None,
+            "revision": None,
+        }
+        assert "install-status" not in stderr
+
+        asyncio.run(arrange("owned"))
+        status, stderr = _status_json(monkeypatch, capsys, config)
+        assert status["state"] == "quiescing"
+        assert status["revision"] == 10
+        assert isinstance(status["since"], str)
+        since = status["since"]
+        assert isinstance(since, str)
+        assert datetime.fromisoformat(since).tzinfo is not None
+        assert "install-status" not in json.dumps(status)
+        assert "install-status" not in stderr
+
+        asyncio.run(arrange("not-json"))
+        status, stderr = _status_json(monkeypatch, capsys, config)
+        assert status == {"state": "quiescing", "since": None, "revision": None}
+        assert "install-status" not in stderr
+    finally:
+        async def cleanup() -> None:
+            client: AsyncRedis = AsyncRedis(
+                host=_VALKEY_HOST,
+                port=_VALKEY_PORT,
+                password=_VALKEY_PW or None,
+                decode_responses=True,
+            )
+            try:
+                await client.delete(key, _legacy_quiesce_key(config))
+            finally:
+                await client.aclose()
+
+        asyncio.run(cleanup())
+
+
+def test_status_reports_unknown_when_the_marker_cannot_be_read(
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # noqa: ANN001
+    config = _config(
+        names,
+        installation_id="install-status",
+        upgrade_revision=10,
+        upgrade_legacy_quiesce=False,
+    )
+    with socket.socket() as unreachable:
+        unreachable.bind(("127.0.0.1", 0))
+        port = int(unreachable.getsockname()[1])
+        unreadable = config.model_copy(
+            update={"valkey_host": "127.0.0.1", "valkey_port": port}
+        )
+        status, stderr = _status_json(monkeypatch, capsys, unreadable)
+
+    assert status == {"state": "unknown", "since": None, "revision": None}
+    assert "install-status" not in stderr
+    if _VALKEY_PW:
+        assert _VALKEY_PW not in stderr
+
+
+@pytest.mark.parametrize("mode", ["drain", "release"])
+def test_unobserved_installation_refuses_mutating_modes_before_connecting(
+    names,
+    mode: str,
+) -> None:  # noqa: ANN001
+    """Client-only upgrade lookup failure must not mutate either hook path.
+
+    The bound-but-not-listening port makes Valkey deliberately unreachable. A
+    return code of 1 plus the authored refusal proves the identity guard ran;
+    argparse's pre-fix unknown-option exit is 2 and cannot satisfy this test.
+    """
+    config = _config(
+        names,
+        installation_id="install-unobserved",
+        upgrade_revision=10,
+        upgrade_legacy_quiesce=True,
+    )
+    with socket.socket() as unreachable:
+        unreachable.bind(("127.0.0.1", 0))
+        env = _module_env(
+            config.model_copy(
+                update={
+                    "valkey_host": "127.0.0.1",
+                    "valkey_port": int(unreachable.getsockname()[1]),
+                }
+            )
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "curie_worker.upgrade_drain",
+                "--mode",
+                mode,
+                "--installation-id-observed=false",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=env,
+        )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert "installation ID was not observed" in completed.stderr
+    assert "refus" in completed.stderr.lower()
+    assert "usage:" not in completed.stderr.lower()
+    assert "connection" not in completed.stderr.lower()
+    assert "traceback" not in completed.stderr.lower()
+    if _VALKEY_PW:
+        assert _VALKEY_PW not in completed.stderr
 
 
 # --- what counts as unsafe in-flight work ------------------------------------
@@ -475,7 +948,7 @@ def test_the_chart_hooks_invoke_a_module_and_modes_this_package_actually_has() -
     ]
     assert commands, f"no container command found in {_CHART_HOOK}"
     for command in commands:
-        interpreter, dash_m, module, mode_flag, mode = command
+        interpreter, dash_m, module, mode_flag, mode, *_hook_args = command
         assert (interpreter, dash_m, mode_flag) == ("python", "-m", "--mode"), command
         importlib.import_module(module)
         # The mode reaches argparse, whose `choices` is the real contract; an
@@ -497,3 +970,35 @@ def test_an_unknown_mode_is_refused_rather_than_silently_draining() -> None:
         assert exit_code.code == 2
     else:
         raise AssertionError("an unknown --mode was accepted")
+
+
+# --- _client TLS selection (#2315) -------------------------------------------
+#
+# Construction performs no I/O (no assertion here touches real Valkey), so
+# this is hermetic: the seam under test is redis-py's own pool selection, the
+# same shape run.py's _valkey_kwargs tests use.
+
+
+def _drain_config(**overrides: object) -> WorkerConfig:
+    base: dict[str, object] = {
+        "valkey_host": _VALKEY_HOST,
+        "valkey_port": _VALKEY_PORT,
+        "valkey_password": _VALKEY_PW,
+    }
+    base.update(overrides)
+    return WorkerConfig(**base)
+
+
+def test_client_selects_the_plain_connection_by_default() -> None:
+    client = _client(_drain_config())
+    assert (
+        client.connection_pool.connection_class is redis.asyncio.connection.Connection
+    )
+
+
+def test_client_selects_ssl_connection_when_tls_is_set() -> None:
+    client = _client(_drain_config(valkey_tls=True))
+    assert (
+        client.connection_pool.connection_class
+        is redis.asyncio.connection.SSLConnection
+    )

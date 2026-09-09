@@ -7,9 +7,20 @@ import socket
 import threading
 import urllib.parse
 from collections.abc import Callable
+from http.client import HTTPResponse
 
 import pytest
-from _support import INBOX, MailState, completed, get, post_bytes, post_event, update, wait_until
+from _support import (
+    EGRESS_SECRET,
+    INBOX,
+    MailState,
+    completed,
+    get,
+    post_bytes,
+    post_event,
+    update,
+    wait_until,
+)
 from curie_mail_adapter.adapter import MailAdapter
 from curie_mail_adapter.egress import MAX_CONCURRENT_REQUESTS
 
@@ -143,11 +154,27 @@ def test_chunked_authenticated_body_is_rejected(
 ) -> None:
     _seed(mail, adapter)
 
-    status, _ = post_bytes(
-        egress_url,
-        json.dumps(update("must not land")).encode(),
-        headers={"Transfer-Encoding": "chunked"},
+    parsed = urllib.parse.urlsplit(egress_url)
+    # Transfer-Encoding is refused before a body is read.  Do not add unread
+    # bytes merely to exercise that header-level guard: closing on them can
+    # reset the response this test is meant to observe.
+    request = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: adapter\r\n"
+        + f"X-Curie-Adapter-Secret: {EGRESS_SECRET}\r\n".encode()
+        + b"Transfer-Encoding: chunked\r\n\r\n"
     )
+    try:
+        with socket.create_connection(
+            (parsed.hostname or "127.0.0.1", parsed.port), timeout=10
+        ) as connection:
+            connection.sendall(request)
+            response = HTTPResponse(connection)
+            response.begin()
+            status = response.status
+            response.read()
+    except OSError as error:
+        pytest.fail(f"chunked request transport failed before a response: {error}")
 
-    assert 400 <= status < 500
+    assert status == 400
     assert mail.replies == []

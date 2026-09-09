@@ -34,6 +34,7 @@ fn revision(revision: u32, status: &str) -> HelmRevision {
         revision,
         status: status.to_string(),
         chart: "curie-0.7.3".to_string(),
+        app_version: "0.7.3".to_string(),
         description: "Upgrade complete".to_string(),
     }
 }
@@ -224,6 +225,7 @@ fn parse_helm_history_reads_a_real_helm_payload() {
 
     assert_eq!(history.len(), 3);
     assert_eq!(history[1].status, "failed");
+    assert_eq!(history[0].app_version, "0.7.3");
     assert!(history[1].description.contains("gvisor"));
     assert_eq!(eligible(&history).to_revision, 19);
 }
@@ -292,6 +294,7 @@ fn rollback_opts(revision: Option<u32>, allow_failed_revision: bool) -> Rollback
         allow_failed_revision,
         // Always: an unanswered prompt would hang the test binary.
         yes: true,
+        disable_schema_gate: false,
     }
 }
 
@@ -305,15 +308,15 @@ async fn rollback_hands_helm_the_selected_revision() {
     fs::write(
         &history_json,
         r#"[
-          {"revision":13,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-          {"revision":14,"status":"failed","chart":"curie-0.7.3","description":"RuntimeClass \"gvisor\" not found"},
-          {"revision":15,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-          {"revision":16,"status":"failed","chart":"curie-0.7.3","description":"RuntimeClass \"gvisor\" not found"},
-          {"revision":17,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-          {"revision":18,"status":"failed","chart":"curie-0.7.3","description":"RuntimeClass \"gvisor\" not found"},
-          {"revision":19,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-          {"revision":20,"status":"failed","chart":"curie-0.7.3","description":"RuntimeClass \"gvisor\" not found"},
-          {"revision":21,"status":"deployed","chart":"curie-0.7.3","description":"Upgrade complete"}
+          {"revision":13,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":14,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6","description":"RuntimeClass \"gvisor\" not found"},
+          {"revision":15,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":16,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6","description":"RuntimeClass \"gvisor\" not found"},
+          {"revision":17,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":18,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6","description":"RuntimeClass \"gvisor\" not found"},
+          {"revision":19,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":20,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6","description":"RuntimeClass \"gvisor\" not found"},
+          {"revision":21,"status":"deployed","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"}
         ]"#,
     )
     .expect("write fake history");
@@ -333,6 +336,7 @@ async fn rollback_hands_helm_the_selected_revision() {
          *) echo \"unexpected helm verb: $1\" >&2; exit 1 ;;\n\
          esac\n",
     );
+    write_exec(dir.path(), "kubectl", "#!/bin/sh\necho '0039 (head)'\n");
     prepend_path(dir.path());
 
     // ----- The default path: no --revision -----
@@ -626,6 +630,7 @@ fn fake_helm_dir(history_json: &str) -> tempfile::TempDir {
             history = history.display(),
         ),
     );
+    write_exec(dir.path(), "kubectl", "#!/bin/sh\necho '0039 (head)'\n");
     dir
 }
 
@@ -661,9 +666,9 @@ fn the_bare_helm_claim_is_made_only_when_the_skipped_revision_is_the_one_helm_wo
     // Auto-select on the issue's history: 20 is skipped AND is 21 - 1.
     let dir = fake_helm_dir(
         r#"[
-          {"revision":19,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-          {"revision":20,"status":"failed","chart":"curie-0.7.3","description":"RuntimeClass \"gvisor\" not found"},
-          {"revision":21,"status":"deployed","chart":"curie-0.7.3","description":"Upgrade complete"}
+          {"revision":19,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":20,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6","description":"RuntimeClass \"gvisor\" not found"},
+          {"revision":21,"status":"deployed","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"}
         ]"#,
     );
     let out = run_rollback(dir.path(), &["--yes"]);
@@ -678,11 +683,11 @@ fn the_bare_helm_claim_is_made_only_when_the_skipped_revision_is_the_one_helm_wo
     // helm's own target would have been 20 -- which is superseded and fine.
     let dir = fake_helm_dir(
         r#"[
-          {"revision":17,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-          {"revision":18,"status":"failed","chart":"curie-0.7.3","description":"RuntimeClass \"gvisor\" not found"},
-          {"revision":19,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-          {"revision":20,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-          {"revision":21,"status":"deployed","chart":"curie-0.7.3","description":"Upgrade complete"}
+          {"revision":17,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":18,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6","description":"RuntimeClass \"gvisor\" not found"},
+          {"revision":19,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":20,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":21,"status":"deployed","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"}
         ]"#,
     );
     let out = run_rollback(dir.path(), &["--yes", "--revision", "17"]);
@@ -710,9 +715,9 @@ fn the_bare_helm_claim_is_made_only_when_the_skipped_revision_is_the_one_helm_wo
 #[test]
 fn dry_run_names_the_plan_and_runs_no_helm_command_at_all() {
     let history = r#"[
-      {"revision":19,"status":"superseded","chart":"curie-0.7.3","description":"Upgrade complete"},
-      {"revision":20,"status":"failed","chart":"curie-0.7.3","description":"RuntimeClass \"gvisor\" not found"},
-      {"revision":21,"status":"deployed","chart":"curie-0.7.3","description":"Upgrade complete"}
+      {"revision":19,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+      {"revision":20,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6","description":"RuntimeClass \"gvisor\" not found"},
+      {"revision":21,"status":"deployed","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"}
     ]"#;
 
     // ----- No --revision: the target is a function of a history it has not read -----
@@ -731,6 +736,10 @@ fn dry_run_names_the_plan_and_runs_no_helm_command_at_all() {
     assert!(
         plan.contains("helm rollback prod-release <selected-revision> -n agent-ns"),
         "with no --revision the plan cannot name a revision it never read: {plan}"
+    );
+    assert!(
+        plan.contains("kubectl exec") && plan.contains("alembic"),
+        "the plan must name the live-schema probe that runs before helm mutates: {plan}"
     );
     assert_eq!(
         helm_log(dir.path()),

@@ -47,10 +47,15 @@ write-capable and is classified conservatively. Publication's dedicated approval
 and the state tools remain independent.
 
 **Permission gate.** Configuration marks a tool approval-required, and the runner denies
-the call through the SDK's `can_use_tool` callback before it runs. The denied call never
-executes. Two sources name gated tools and they are unioned, never subtracted: the
-bundle manifest's `approvalPolicy`, and the `CURIE_APPROVAL_REQUIRED_TOOLS` operator
-override.
+the call through its unscoped `PreToolUse` hook, with the SDK's `can_use_tool` callback as
+the second line, before it runs. The denied call never executes. Two sources name gated
+tools and they are unioned, never subtracted: the bundle manifest's `approvalPolicy`, and
+the `CURIE_APPROVAL_REQUIRED_TOOLS` operator override. For the platform's own
+`publish_changes` tool the runner additionally records every call it sees on the model
+stream (#2294): if neither SDK layer recorded the call, the in-sandbox tool body runs and
+returns its defensive error (it carries no publication authority), the stream record still
+parks the turn awaiting approval, and a publication call that left no record ends the turn
+as a `publication-unrecorded` classified failure rather than a clean `done`.
 
 ## Declaring routes in the bundle
 
@@ -151,6 +156,19 @@ posted to the requesting channel. Silently widening a request to whoever happens
 in the requesting channel is exactly the failure the gate exists to prevent, so the
 platform refuses rather than guesses.
 
+Since #2436, that same gap is also closed a step earlier, at configuration time. A route
+the bundle declares with no entry in the agent's `approval_routes` now refuses the write
+that would make it live: `POST /deployments` returns 422, a git push deploy or promote is
+rejected with code `approval_routes.unbound`, and a bundle uploaded onto a version an
+active deployment already references is refused too. The refusal names the unbound
+route(s) alongside the ones that are bound. A bound route no bundle declares is still
+accepted, so pre-binding ahead of a bundle bump remains supported. The check tests only
+whether a binding is present, not whether it is valid; the worker's request-time
+escalation above stays the backstop for a binding removed or corrupted after this check
+ran. An `approval_routes` write, including `--clear-routes` or an empty routes file, that
+would drop a route declared by any active deployment of the agent, in either environment,
+is refused on the same terms.
+
 Bind one from the CLI rather than by hand. A write REPLACES the whole map, so name
 every route it should keep:
 
@@ -164,10 +182,16 @@ The strict `--routes-from` JSON uses the complete binding shape shown above and 
 way to declare a notification, including the `endpoint` and `adapter` required for a
 non-Slack target. `--route-resolution` and `--route-approvers` can override resolution and
 authority from that file; the latter takes `users:U0123ABCD,W0456DEFG` or `group:S0123ABCD`.
-`--clear-routes` removes every binding. A `--routes-from` file containing `{}` clears every
-binding too, the same as `--clear-routes`. The retired `--route` flag and `channel` JSON key
-are not accepted. Nothing is written unless every entry parses, so a typo cannot leave a
-half-written map behind.
+`--clear-routes` removes every binding, but only when no active deployment for the agent
+declares one of the routes being removed; otherwise the write is refused, naming those
+routes. A `--routes-from` file containing `{}` clears every binding too, the same as
+`--clear-routes`, and is refused on the same terms. To clear a gated agent's routes, first
+end every still-active deployment whose bundle declares one of them (`DELETE
+/deployments/{id}`), then clear. Deploying a version that declares no gates is not enough:
+deployments append rather than stop earlier ones, so an older active deployment still
+declares the route and the preflight still refuses. The retired `--route` flag and
+`channel` JSON key are not accepted. Nothing is written unless every entry parses, so a
+typo cannot leave a half-written map behind.
 
 ## Who may resolve
 
@@ -344,7 +368,8 @@ case, the requesting channel is the card location.
 | `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check the API `SLACK_BOT_TOKEN`, its `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |
-| Agent says a request is pending, no card anywhere | The named route is not bound for this agent, so the turn escalated instead of posting. Add the binding. |
+| Agent says a request is pending, no card anywhere | The named route is not bound for this agent, so the turn escalated instead of posting. Since #2436 this case is now caught before deploy for a newly declared route; the escalation remains the backstop for a binding removed after deployment. Add the binding. |
+| `422`, or a rejected push with code `approval_routes.unbound` | The bundle declares an approval route with no entry in this agent's `approval_routes`. Bind every route the bundle declares, then redeploy. |
 | Notification arrived, but it has no buttons | Expected: notification is visibility-only. Use its approval ID and go to the configured approval channel to find the verified Slack resolution card; the ping deliberately does not disclose that channel's identifier. |
 | Card resolved, but the agent never continued | The skill has no instruction for the `[approval resolved]` prefix. |
 

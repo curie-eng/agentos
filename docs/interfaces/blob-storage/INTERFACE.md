@@ -67,7 +67,8 @@ Cloudflare R2) needs no code, only env/settings:
 - **Operations used** (`apps/api/src/curie_api/storage.py::BundleStore`): `head_bucket`, `create_bucket`,
   `head_object`, `put_object` (with `Body`, `ContentType`), `get_object` (reads
   `obj["Body"].read()`). The current S3 backing uses exactly these five calls, path-style;
-  a non-S3 backend instead honors the port's five method contract, not these wire calls.
+  a non-S3 backend instead honors the port's four-method contract (`ensure_bucket` /
+  `exists` / `put` / `get`), not these wire calls.
 
 ## Implementations today
 
@@ -75,7 +76,7 @@ One backend (S3/RustFS) behind the port, reached by one boto3 builder and three
 AWS CLI shell sites:
 
 - **`ObjectStore` port** — `apps/api/src/curie_api/storage.py` (`Protocol`: the
-  five ops + the write-once contract). Consumers (`deps`/`gitflow`/`deploy`) type
+  four ops `ensure_bucket` / `exists` / `put` / `get` + the write-once contract). Consumers (`deps`/`gitflow`/`deploy`) type
   against it, so a second backend is a drop-in.
 - **API writer** — `apps/api/src/curie_api/storage.py::BundleStore`, the S3/RustFS backing
   (async-offloaded boto3); client built by the shared `build_s3_client` factory.
@@ -129,7 +130,7 @@ refuses the clear-the-key-while-`rustfs.deploy`-is-true combination at render, s
 the in-chart RustFS has no web-identity path. The Python side then has to translate
 that omission into `None` rather than an empty string, because botocore treats the
 empty string as an explicit credential. Both halves are behavior a second backend must
-reproduce, and neither is expressible in the five-method Protocol. See
+reproduce, and neither is expressible in the four-method Protocol. See
 `charts/curie/README.md` ("Key-free object store auth") for the operator-facing shape,
 including why the instance role and IMDS are deliberately unavailable.
 

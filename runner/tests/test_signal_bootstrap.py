@@ -18,6 +18,7 @@ from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner import __main__ as boot
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
+from curie_runner.history import ConversationReplay
 from curie_runner.session import SessionRunner
 from curie_telemetry import bootstrap_service_telemetry, configure_meter_provider
 from curie_telemetry.bootstrap import ServiceTelemetry
@@ -43,8 +44,19 @@ def _wire_process_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CURIE_FAKE_MODEL", "1")
     monkeypatch.setattr(RunnerConfig, "from_env", lambda _env: config)
     monkeypatch.setattr(boot, "_resolve_harness", lambda _name: object())
-    monkeypatch.setattr(boot, "_load_memory", lambda _config: (object(), None))
-    monkeypatch.setattr(boot, "_load_history", lambda _config: (object(), None))
+
+    async def _fake_fetches(
+        _config: object, _fake_model: bool, _sdk_env: object
+    ) -> boot._BootFetches:
+        return boot._BootFetches(
+            memory_store=object(),  # type: ignore[arg-type]
+            memory_preamble=None,
+            history_store=object(),  # type: ignore[arg-type]
+            conversation_replay=ConversationReplay(),
+            mcp_capability=None,
+        )
+
+    monkeypatch.setattr(boot, "_load_boot_fetches", _fake_fetches)
     monkeypatch.setattr(boot, "build_runner", lambda *_args, **_kwargs: _Runner())
     monkeypatch.setattr(
         boot,

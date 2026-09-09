@@ -133,6 +133,16 @@ Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
 curie cluster up
 ```
 
+This is a full Helm upgrade. It carries forward the recorded generated secrets,
+sealing keys, Slack tokens, GitHub App and token, runner model and credential,
+gVisor mode, worker extra environment, trusted Slack origins, runner egress,
+and the installed `mailAdapter.*` values with the worker's paired adapter
+credential map or external Secret reference. Other values must be supplied again.
+Explicit `--set` and `--set-string` inputs override retained values. Retained mail
+values use a private temporary values file; the command shows field names only.
+The offline `--dry-run` does not read an installed release, so it cannot display
+that release's retained values.
+
 | Flag / env var | What it does |
 |---|---|
 | `--chart <path-or-tgz>` | Install from a local chart instead of the pinned release asset (for chart development). |
@@ -193,6 +203,23 @@ as false. Missing, malformed, unreadable, or incomplete ownership does not
 authorize reuse and blocks the install. An explicit true value that contradicts
 the detected owner is a usage error.
 
+Before Helm runs, Curie establishes ownership of the primary install namespace
+with both the release and install-namespace labels. An absent namespace is
+created atomically with those labels. An existing namespace already owned by
+that pair is reused; an unlabeled primary namespace is adopted only after a
+safe inventory proves it is empty apart from the default ServiceAccount and
+`kube-root-ca.crt` ConfigMap. A pre-existing unlabeled namespace containing
+other objects, or a foreign, partially owned, or otherwise conflicting
+namespace, is refused with a reason. The shared
+`agent-sandbox-system` namespace keeps its create-only behavior and is never
+adopted. The inventory is a point-in-time observation. The adoption patch
+compares the Namespace UID and metadata resource version, but creation of a
+namespaced object does not change that resource version, so the patch does not
+serialize other writers; keep an unowned namespace unused by other writers
+through adoption. An unavailable remote APIService registration, or inability
+to read APIService availability, blocks empty-namespace adoption. A terminating
+namespace is readable but is refused for `cluster up`.
+
 The first gVisor preflight keeps the chart default. Only the exact admission
 result `RuntimeClass "gvisor" not found` authorizes
 `security.gvisor.mode=off` and one retry. That first attempt renders as
@@ -208,6 +235,20 @@ cluster facts.
 ```bash
 curie cluster status
 ```
+
+A release that has not converged returns exit code 1 with its status report and
+rollout reasons. `--json` retains the same report object with `healthy: false`.
+The check compares the installed Helm target with live workload generations,
+replica counts and serving pod images; an `Available` condition alone is insufficient.
+
+A diagnosis the command could not MAKE is a warning, not a failure. When the
+mail adapter is deployed but its `/statusz` cannot be read -- the pod proxy is
+unreachable, the pod is restarting, the adapter predates that endpoint -- the
+mail channel token reads as unknown, which prints a warning and appears under
+`warnings` in `--json`, leaving the exit code and `healthy` alone. A token that
+was read and found expired, rejected, missing or invalid is still a failure. The
+probe follows `mailAdapter.deploy`, so a release with the adapter off is not
+probed at all.
 
 Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
@@ -256,13 +297,20 @@ curie cluster down
 | `--yes` | Skip the confirmation prompt. |
 
 `curie cluster down` safely removes everything this release created, and
-only what it created -- other things on the cluster are untouched,
-including pre-existing namespaces and the Agent Sandbox CRDs.
+only what it created. It first uninstalls the Helm release, then removes
+release-labeled Helm hook Jobs from the release namespace, and finally sweeps
+only namespaces bearing this release's ownership pair. Hook cleanup still runs
+when the namespace is retained or Helm uninstall reports a failure. An
+unlabeled or foreign namespace is retained with a warning, and retained Agent
+Sandbox CRDs and the pre-existing shared controller namespace are untouched.
+During namespace termination, `cluster down` can still inspect the namespace
+and remove matching retained hook Jobs.
 
-A release is identified by its name AND the namespace it was installed
-into, so if you run a second install of Curie on the same cluster (which
-normally means two releases sharing the default name `curie` in different
-namespaces), tearing one down never touches the other's namespaces.
+A release is identified by its name AND the namespace it was installed into,
+and namespace cleanup requires both ownership labels. If you run a second
+install of Curie on the same cluster (which normally means two releases
+sharing the default name `curie` in different namespaces), tearing one down
+never touches the other's namespaces.
 
 It's also safe to re-run if something goes wrong. If the underlying
 uninstall fails (say, a brief Kubernetes API-server hiccup), teardown doesn't just
@@ -303,6 +351,14 @@ So this verb reads the history first, skips every revision whose status is not
 `deployed` or `superseded`, and rolls back to the newest one that is. It prints
 which revisions it passed over, so you can see exactly what a bare
 `helm rollback` would have landed on instead.
+
+Status is not the whole story. Every API pod still runs `alembic upgrade head`
+at startup, so an older image refuses a live database revision it does not
+know. After the status filter, `cluster rollback` reads the live revision from
+the running API pod and refuses a target whose declared schema range does not
+include it, before Helm mutates the release. The refusal names the
+compatibility boundary and the newest safe fail-forward application version.
+It does not print database contents or credentials. See issue #2296.
 
 If you know which revision you want, `--revision <n>` takes it. A revision that
 isn't in the history is refused, and so is one Helm never finished applying --
@@ -488,6 +544,20 @@ There is no `curie cluster comms --email` yet, so email is wired with a private
 Helm values file. The mail adapter ships off by default
 ([`apps/mail-adapter`](../apps/mail-adapter)).
 
+After email is configured, a plain `curie cluster up` preserves its recorded
+settings, PVC configuration, and all three credential references together with
+`worker.adapterCredentialsExistingSecret` and its key. Inline credentials on
+older installs are also retained through the protected values-file path. An
+explicit `--set mailAdapter.deploy=false` disables it; clearing an external
+credential reference does not restore a stale inline credential. A nonempty
+inline credential replaces its retained external reference; an empty inline
+clear leaves the external source active. An empty worker credential map also
+leaves its external source active. Changing the adapter's egress source while
+the worker uses an external credential map requires an explicit paired worker
+source decision; the CLI refuses an unpaired change before Helm runs. Restating
+the worker's Secret name or key acknowledges a pairing updated inside that
+Secret. The CLI checks this explicit decision, not equality of opaque credentials.
+
 Two platform-side steps come first, in this order:
 
 1. **Bind the agent** to `{"kind": "email", "address": "<the inbox address>"}` with a
@@ -510,9 +580,16 @@ Two platform-side steps come first, in this order:
 
    The `adapter` value must equal `mailAdapter.adapterSlug`, because the worker looks
    its egress credential up under that key.
-2. **Mint the channel token.** `POST /channels/token` with the platform key returns a
-   scoped `chn` token for that one binding. It refuses with 409 for a non-`slack`
-   binding that has no reply route, which is why the binding comes first.
+2. **Mint the channel token.** `curie cluster channel-token <agent> --kind email --address <inbox>`
+   mints through `POST /channels/token` with the platform key, writes the token
+   into the Secret the adapter actually reads (the chart Secret, or
+   `mailAdapter.channelTokenExistingSecret` when that is set), rolls the adapter,
+   and prints `exp`. It never prints the token and never writes it through Helm
+   values, so `helm get values` cannot undo the rotation. `--show-exp` reports
+   the installed token's `exp` and whether the platform still accepts it, the
+   same observation `curie doctor` uses. The mint refuses with 409 for a
+   non-`slack` binding that has no reply route, which is why the binding comes
+   first.
 
 Then turn the adapter on. Keep all three credentials out of `--set`, Helm
 values, and release history by having a secret manager materialize an
@@ -568,6 +645,8 @@ independently; the chart cannot safely infer IP ranges from a hostname:
 ```yaml
 api:
   deploy: false
+ui:
+  apiBaseUrl: https://api.example.com:8443
 mailAdapter:
   apiBaseUrl: https://api.example.com:8443
   apiEgress:
@@ -632,7 +711,14 @@ The PVC is PII-bearing application data: it can hold email addresses, message an
 thread identifiers, recovery text, and delivery receipts, though never the three
 credentials or a platform database credential. Back up with a storage snapshot
 that is consistent for SQLite, or stop the Deployment before copying the file.
-Restore the claim before starting the writer. An older image refuses a newer
+Restore the claim before starting the writer.
+
+A disposable synthetic restore of postgres records, immutable bundle objects,
+that SQLite delivery state, and a Valkey dump is `curie dev restore-drill`
+(#2427). It uses those existing export/restore mechanisms, requires operator
+keys and config to be supplied separately, and refuses an omitted or corrupt
+component before serving. It does not establish a recurring production backup,
+an RPO/RTO target, or Valkey stream replay. An older image refuses a newer
 schema; restore the pre-upgrade snapshot or roll forward rather than
 deleting state to force a rollback. A chart-managed PVC is deleted by Helm
 uninstall, subject to the StorageClass reclaim policy; an `existingClaim` is not

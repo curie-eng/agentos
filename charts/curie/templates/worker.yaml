@@ -301,6 +301,15 @@ spec:
             # name is knowable only here.
             - name: CURIE_RELEASE
               value: {{ .Release.Name | quote }}
+            # Stable identity for this Helm installation's claim gate. It is
+            # always owned by the release-managed Secret, independently of any
+            # BYO store or provider credential Secret.
+            - name: CURIE_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: installationId
+                  optional: false
 {{- if .Values.worker.connectorReconciler.enabled }}
             # Connector reconciler (ADR-0090, #1184). It reuses CURIE_NAMESPACE
             # and CURIE_RELEASE above deliberately: the runner dials a connector
@@ -318,7 +327,7 @@ spec:
               value: {{ .Values.worker.connectorReconciler.intervalSeconds | quote }}
 {{- end }}
             - name: LANGFUSE_HOST
-              value: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
+              value: {{ include "curie.langfuse.url" . }}
             - name: LANGFUSE_PUBLIC_KEY
               value: {{ .Values.langfuse.init.projectPublicKey | quote }}
             - name: LANGFUSE_SECRET_KEY
@@ -461,9 +470,7 @@ spec:
             - name: BUNDLE_BUCKET
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
-            {{- with (include "curie.worker.extraEnv" . | trim) }}
-            {{- . | nindent 12 }}
-            {{- end }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv) | nindent 12 }}
           # No HTTP port on the worker, so an exec probe checks a heartbeat file
           # the asyncio event loop touches each tick. A wedged loop stops
           # touching it -> the file goes stale -> the probe fails -> restart.

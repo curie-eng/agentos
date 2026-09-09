@@ -17,12 +17,15 @@
 # everyone on 2026-07-27, which broke every runner-image build repo-wide: curl
 # failed, nodejs never installed, and the next line died with `npm: not found`.
 # Copying from the official image removes the third-party apt repo from the build
-# path entirely, pins the version by tag, and is architecture-correct by
-# construction (Docker resolves the matching platform, so an arm64 dev box and an
-# amd64 CI runner both work -- a hardcoded tarball URL would not).
-FROM node:22-bookworm-slim AS node
+# path entirely, pins the version by tag plus digest so a rebuild at this commit
+# is the same image (#2320), and is architecture-correct by construction (Docker
+# resolves the matching platform from the multi-arch index, so an arm64 dev box
+# and an amd64 CI runner both work -- a hardcoded tarball URL would not).
+# Floating tags would still pick up upstream OS security patches without a
+# commit; Dependabot's docker ecosystem raises those base moves as PRs instead.
+FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node
 
-FROM python:3.13-slim-bookworm
+FROM python:3.13.15-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e
 
 # Only the Node bits, never all of /usr/local: the python base keeps its own
 # interpreter there, so a blanket copy would clobber it.
@@ -45,32 +48,35 @@ RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
 
 WORKDIR /app
 
-# The five source trees the runner needs: the two frozen workspace packages, the
-# shared telemetry implementation and schema, and the runner itself. Copied by path so the image is
-# reproducible from the lockfile above them (root pyproject/uv.lock are the
-# workspace source of truth).
+# Registry dependency layer: the lockfile plus the pin exporter, and nothing
+# else, so this ~322 MB install (claude_agent_sdk dominates) is invalidated
+# only by a lock or exporter change -- never by a runner/src edit.
+# export_dependency_pins.py remains the pin source (#1436 is pin correctness,
+# not layer placement). --no-deps keeps the closure on those exact pins;
+# local workspace projects are installed by path after the source copy so
+# they resolve to the copied trees, not same-named PyPI distributions.
 COPY uv.lock ./uv.lock
+COPY runner/export_dependency_pins.py ./runner/export_dependency_pins.py
+RUN python3 -m venv /app/.venv \
+    && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
+    && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
+    && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt
+
+# The five source trees the runner needs: the two frozen workspace packages,
+# the shared telemetry implementation and schema, and the runner itself.
+# Copied by path so the image is reproducible from the lockfile above them
+# (root pyproject/uv.lock are the workspace source of truth).
 COPY packages/aci-protocol ./packages/aci-protocol
 COPY packages/plugin-format ./packages/plugin-format
 COPY packages/telemetry ./packages/telemetry
 COPY packages/telemetry-schema ./packages/telemetry-schema
 COPY runner ./runner
-
-# One venv. Install every local project without dependencies, then install the
-# full registry dependency closure exported from the tested workspace uv.lock.
-# The local packages are installed by path first so the
-# workspace requirements resolve to the copied trees, not same-named PyPI
-# distributions.
-RUN python3 -m venv /app/.venv \
-    && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps \
+RUN /app/.venv/bin/pip install --no-cache-dir --no-deps \
         ./packages/aci-protocol \
         ./packages/plugin-format \
         ./packages/telemetry \
         ./packages/telemetry-schema \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
-    && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt
+    && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner
 
 # Run as a non-root user. The claude-agent-sdk spawns
 # `claude --dangerously-skip-permissions` (permission_mode=bypassPermissions),

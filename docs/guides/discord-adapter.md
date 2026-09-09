@@ -46,8 +46,9 @@ The command returns all surfaces on the agent. Seeing both `slack` and
 `discord` under the same agent name proves this is one bot identity rather than
 two copies of its source.
 
-Mint a token scoped to the Discord binding using the existing channel-token
-endpoint, then configure the adapter:
+Mint a token scoped to the Discord binding (`POST /channels/token`, or
+`curie cluster channel-token` when the install's adapter reads a Kubernetes
+Secret), then configure the adapter:
 
 ```bash
 export DISCORD_BOT_TOKEN='replace-with-the-discord-bot-token'

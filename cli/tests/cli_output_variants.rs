@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use curie::api::{
     ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, Version,
 };
+use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
     OverridesOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
@@ -197,9 +198,11 @@ fn cluster_status() -> Box<ClusterStatus> {
         ready: 0,
         total: 0,
         unhealthy: Vec::new(),
+        warnings: Vec::new(),
         pods_listed: true,
         urls: Vec::new(),
         upgrade: curie::ops::UpgradeStatusView::idle(None),
+        delivery: curie::completion_outbox::Report::unknown(),
     })
 }
 
@@ -412,6 +415,28 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => GithubAppOutput::DryRun(plan()),
             "Done" => GithubAppOutput::Done { configured: true },
+        ],
+    );
+    m.insert(
+        "ChannelTokenOutput",
+        samples![
+            "DryRun" => ChannelTokenOutput::DryRun(plan()),
+            "Minted" => ChannelTokenOutput::Minted {
+                agent: "acme-bot".to_string(),
+                kind: "email".to_string(),
+                address: "ops@example.com".to_string(),
+                exp: 1_800_000_000,
+                expires_at: "2027-01-15T08:00:00Z".to_string(),
+                secret_name: "acme-curie-secrets".to_string(),
+                secret_key: "mailChannelToken".to_string(),
+            },
+            "ShowExp" => ChannelTokenOutput::ShowExp {
+                exp: Some(1_800_000_000),
+                expires_at: Some("2027-01-15T08:00:00Z".to_string()),
+                accepted: true,
+                state: "ok".to_string(),
+                detail: "mail channel token: ok; expires at 2027-01-15T08:00:00Z; present: true; last ingress status: none".to_string(),
+            },
         ],
     );
     m.insert(

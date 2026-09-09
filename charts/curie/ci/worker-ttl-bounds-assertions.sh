@@ -437,10 +437,12 @@ assert_env k \
 assert_refused k runnerTotalTimeoutSeconds \
   --set worker.deploy=false \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set worker.runnerTotalTimeoutSeconds=0
 assert_refused k runnerTotalTimeoutSeconds \
   --set worker.deploy=false \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set-json worker.runnerTotalTimeoutSeconds=1800.1
 
 # Individually valid scalar values, relationally invalid together. Capture the
@@ -464,12 +466,9 @@ for token in \
   $(head -3 <<<"$K_RELATIONSHIP_OUT")"
 done
 
-# (m) Retained extraEnv must not duplicate the first-class runner timeout.
-# --set-json so Helm sees a real list rather than a stringified overlay.
-assert_env m \
-  --set-json 'worker.extraEnv=[{"name":"CURIE_RUNNER_TOTAL_TIMEOUT_S","value":"1700"},{"name":"CURIE_UPGRADE_FIXTURE","value":"kept"}]' \
-  -- \
-  CURIE_RUNNER_TOTAL_TIMEOUT_S=600 \
-  CURIE_UPGRADE_FIXTURE=kept
+# (m) A retained extraEnv copy of a chart-owned timeout is refused at render.
+# Fail-closed reserved-env (#2442) replaces the earlier silent drop.
+assert_refused m "CURIE_RUNNER_TOTAL_TIMEOUT_S" \
+  --set-json 'worker.extraEnv=[{"name":"CURIE_RUNNER_TOTAL_TIMEOUT_S","value":"1700"},{"name":"CURIE_UPGRADE_FIXTURE","value":"kept"}]'
 
 echo "worker-ttl-bounds-assertions: all twelve assertions passed"

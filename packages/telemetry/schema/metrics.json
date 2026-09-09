@@ -54,10 +54,11 @@
           "classified_failure",
           "side_effect_halted",
           "idle",
-          "interrupted"
+          "interrupted",
+          "deadline_halted"
         ]
       },
-      "cardinality_bound": 168
+      "cardinality_bound": 192
     },
     "curie.turn.duration": {
       "type": "histogram",
@@ -86,10 +87,11 @@
           "classified_failure",
           "side_effect_halted",
           "idle",
-          "interrupted"
+          "interrupted",
+          "deadline_halted"
         ]
       },
-      "cardinality_bound": 168
+      "cardinality_bound": 192
     },
     "curie.history.resume.cache_read": {
       "type": "histogram",
@@ -690,7 +692,8 @@
           "steer",
           "interrupt",
           "reset",
-          "status"
+          "status",
+          "timeout"
         ],
         "role": [
           "client"
@@ -702,7 +705,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 20
+      "cardinality_bound": 24
     },
     "curie.runner.rpc.result": {
       "type": "counter",
@@ -718,7 +721,8 @@
           "steer",
           "interrupt",
           "reset",
-          "status"
+          "status",
+          "timeout"
         ],
         "role": [
           "client"
@@ -730,7 +734,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 20
+      "cardinality_bound": 24
     },
     "curie.approval.lifecycle": {
       "type": "counter",
@@ -795,6 +799,44 @@
         ],
         "outcome": [
           "pending"
+        ]
+      },
+      "cardinality_bound": 1
+    },
+    "curie.completion.outbox": {
+      "type": "gauge",
+      "unit": "{completion}",
+      "description": "Completion-outbox records by inflight, retry, or terminal-delivery state.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "operation": [
+          "observe"
+        ],
+        "outcome": [
+          "inflight",
+          "retry",
+          "terminal"
+        ]
+      },
+      "cardinality_bound": 3
+    },
+    "curie.completion.outbox.age": {
+      "type": "gauge",
+      "unit": "s",
+      "description": "Age of the oldest owed completion still retrying delivery.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "operation": [
+          "observe"
+        ],
+        "outcome": [
+          "retry"
         ]
       },
       "cardinality_bound": 1
@@ -961,6 +1003,7 @@
           "/git-flow/routing-check",
           "/github/webhook",
           "/health",
+          "/ready",
           "/hooks/{agent_id}/{hook}",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
@@ -1067,6 +1110,7 @@
           "/git-flow/routing-check",
           "/github/webhook",
           "/health",
+          "/ready",
           "/hooks/{agent_id}/{hook}",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
@@ -1173,6 +1217,7 @@
           "/git-flow/routing-check",
           "/github/webhook",
           "/health",
+          "/ready",
           "/hooks/{agent_id}/{hook}",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",

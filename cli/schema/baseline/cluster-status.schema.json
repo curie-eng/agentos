@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.4.json",
   "title": "curie cluster status --json",
-  "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), an overall `healthy` verdict, and the current upgrade phase plus last known-good version.",
+  "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), any `warnings` (diagnoses that could not be made, which never affect `healthy`), completion-delivery health, an overall `healthy` verdict, and the current upgrade phase plus last known-good version.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -74,6 +74,75 @@
                   },
                   "status": {
                     "type": "string"
+                  },
+                  "mail_channel": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "pod": {
+                        "type": "string"
+                      },
+                      "channel_token": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "present": {
+                                "type": "boolean"
+                              },
+                              "exp": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "state": {
+                                "enum": [
+                                  "ok",
+                                  "expiring",
+                                  "expired",
+                                  "rejected",
+                                  "missing",
+                                  "invalid",
+                                  "disabled"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "present",
+                              "exp",
+                              "state"
+                            ]
+                          }
+                        ]
+                      },
+                      "last_ingress_status": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "detail": {
+                        "type": "string"
+                      },
+                      "fix": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "pod",
+                      "channel_token",
+                      "last_ingress_status",
+                      "detail",
+                      "fix"
+                    ]
                   }
                 },
                 "required": [
@@ -154,6 +223,59 @@
             "status",
             "known_good_version",
             "target_version"
+          ]
+        },
+        "warnings": {
+          "description": "Diagnoses the command could not make, as opposed to defects it found. A mail adapter whose /statusz could not be read appears here. Never affects `healthy` or the exit code.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "delivery": {
+          "description": "Completion-outbox inventory from the worker. Count, oldest age, and retry/terminal state. Identifiers are omitted. A retrying owed completion makes `healthy` false even when pods are ready and stream lag is zero.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "count": {
+              "type": "integer"
+            },
+            "oldest_age_s": {
+              "type": "number"
+            },
+            "inflight": {
+              "type": "integer"
+            },
+            "retry": {
+              "type": "integer"
+            },
+            "terminal": {
+              "type": "integer"
+            },
+            "state": {
+              "enum": [
+                "empty",
+                "inflight",
+                "retry",
+                "unknown"
+              ]
+            },
+            "degraded": {
+              "type": "boolean"
+            },
+            "detail": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "count",
+            "oldest_age_s",
+            "inflight",
+            "retry",
+            "terminal",
+            "state",
+            "degraded",
+            "detail"
           ]
         }
       },

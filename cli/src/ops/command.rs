@@ -4,8 +4,10 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
+use std::process::Stdio;
 #[cfg(unix)]
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 #[allow(unused_imports)]
@@ -42,8 +44,16 @@ pub struct OpsCommand {
 pub enum CmdArg {
     Plain(String),
     HelmSetExpression(String),
-    SecretSet { key: String, value: String },
+    SecretSet {
+        key: String,
+        value: String,
+    },
     SecretValuesFile(Vec<(String, String)>),
+    PrivateJsonValuesFile(PrivateHelmValues),
+    SecretPatchFile {
+        keys: Vec<String>,
+        document: serde_json::Value,
+    },
 }
 
 impl CmdArg {
@@ -57,7 +67,9 @@ impl CmdArg {
             CmdArg::Plain(s) => vec![s.clone()],
             CmdArg::HelmSetExpression(expression) => vec![expression.clone()],
             CmdArg::SecretSet { key, value } => vec![format!("{key}={value}")],
-            CmdArg::SecretValuesFile(_) => {
+            CmdArg::SecretValuesFile(_)
+            | CmdArg::PrivateJsonValuesFile(_)
+            | CmdArg::SecretPatchFile { .. } => {
                 debug_assert!(
                     false,
                     "SecretValuesFile must be materialized before argv(); \
@@ -78,6 +90,13 @@ impl CmdArg {
                 vec![mask_helm_set_expression(expression)]
             }
             CmdArg::SecretSet { key, value } => vec![format!("{key}={}", mask_secret(value))],
+            CmdArg::PrivateJsonValuesFile(values) => vec![
+                "-f".to_string(),
+                format!(
+                    "<private retained mail values: {}>",
+                    values.keys().join(", ")
+                ),
+            ],
             CmdArg::SecretValuesFile(pairs) => {
                 let masked: Vec<String> = pairs
                     .iter()
@@ -88,6 +107,10 @@ impl CmdArg {
                     format!("<secret values file: {}>", masked.join(", ")),
                 ]
             }
+            CmdArg::SecretPatchFile { keys, .. } => vec![
+                "--patch-file".to_string(),
+                format!("<secret patch: {}>", keys.join(", ")),
+            ],
         }
     }
 }
@@ -161,6 +184,18 @@ impl OpsCommand {
                 CmdArg::SecretValuesFile(pairs) => {
                     let guard = SecretValuesFileGuard::write(pairs)?;
                     new_args.push(plain("-f"));
+                    new_args.push(plain(guard.path.to_string_lossy().into_owned()));
+                    guards.push(guard);
+                }
+                CmdArg::PrivateJsonValuesFile(values) => {
+                    let guard = SecretValuesFileGuard::write_document(&values.0)?;
+                    new_args.push(plain("-f"));
+                    new_args.push(plain(guard.path.to_string_lossy().into_owned()));
+                    guards.push(guard);
+                }
+                CmdArg::SecretPatchFile { document, .. } => {
+                    let guard = SecretValuesFileGuard::write_document(document)?;
+                    new_args.push(plain("--patch-file"));
                     new_args.push(plain(guard.path.to_string_lossy().into_owned()));
                     guards.push(guard);
                 }
@@ -307,10 +342,12 @@ impl SecretValuesFileGuard {
     /// with restrictive permissions atomically so the secret is never briefly
     /// world-readable.
     fn write(pairs: &[(String, String)]) -> Result<Self> {
-        ensure_secret_signal_cleanup()?;
+        Self::write_document(&nest_dotted_keys(pairs))
+    }
 
-        let doc = nest_dotted_keys(pairs);
-        let body = serde_json::to_vec(&doc).context("serializing secret helm values")?;
+    fn write_document(doc: &serde_json::Value) -> Result<Self> {
+        ensure_secret_signal_cleanup()?;
+        let body = serde_json::to_vec(doc).context("serializing secret helm values")?;
 
         let mut path = std::env::temp_dir();
         path.push(format!("curie-helm-values-{}.yaml", uuid::Uuid::new_v4()));
@@ -422,6 +459,10 @@ pub(crate) fn secret_set(key: &str, value: &str) -> CmdArg {
     }
 }
 
+pub(crate) fn secret_patch_file(keys: Vec<String>, document: serde_json::Value) -> CmdArg {
+    CmdArg::SecretPatchFile { keys, document }
+}
+
 /// Mask a secret for display. Values of eight characters or fewer are fully
 /// masked; longer values retain the first eight characters for recognition.
 pub fn mask_secret(value: &str) -> String {
@@ -501,6 +542,40 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
         .output()
         .await
         .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+pub(crate) async fn run_capture_with_stdin(
+    cmd: &OpsCommand,
+    input: &[u8],
+) -> Result<(bool, String, String)> {
+    let (cmd, _secret_files) = cmd.materialize_secret_files()?;
+    let mut child = Command::new(&cmd.program)
+        .args(cmd.argv())
+        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(input).await,
+        None => Err(std::io::Error::other("child stdin pipe was unavailable")),
+    };
+    if let Err(error) = write_result {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error).with_context(|| format!("writing input to `{}`", cmd.program));
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .with_context(|| format!("waiting for `{}`", cmd.program))?;
     Ok((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),

@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-from typing import Annotated
+from typing import Annotated, Any
 
 from aci_protocol.service_config import (
     API_KEY_ENV,
@@ -158,6 +158,10 @@ class WorkerConfig(BaseSettings):
     valkey_port: int = 6379
     valkey_password: str = ""
     valkey_db: int = 0
+    # TLS transport for a BYO Valkey (VALKEY_TLS, rendered by the chart from
+    # valkey.tls). Off by default: the in-chart store and the compose lane are
+    # both cleartext by design (#2315).
+    valkey_tls: bool = False
 
     # Slack
     slack_bot_token: str = ""
@@ -311,6 +315,26 @@ class WorkerConfig(BaseSettings):
         validation_alias="CURIE_BOOTING_TEXT",
     )
 
+    # Edited onto the placeholder when a delivery's handler RAISED and the entry
+    # was left pending for the bounded retry, so the thread is never silent while
+    # the redelivery is waited out (#2433).
+    #
+    # The wording is load-bearing, because this branch is reachable in three
+    # shapes, not one: the turn that never started; the turn that streamed partial
+    # text and then raised; and the turn that persisted a side-effect marker,
+    # where the next delivery escalates to a person rather than re-running (kernel
+    # rule 4). "I could not finish" and "picked up again" are true in all three;
+    # "I could not start" and "I will retry" are each a product lie on two of
+    # them. Kept free of internal vocabulary and of any id (#717): there is
+    # nothing here a person can look up, so naming one only leaks architecture.
+    turn_not_started_text: str = Field(
+        default=(
+            "I ran into a problem and could not finish this request, so if no "
+            "answer appears here shortly, please send it again."
+        ),
+        validation_alias="CURIE_TURN_NOT_STARTED_TEXT",
+    )
+
     # Stream / consumer group (must match the dispatcher's CURIE_STREAM). The
     # defaults are the shared declarations (#492) so a rename cannot drift this
     # lane out of sync with the dispatcher/API/CLI; the validation_alias keeps
@@ -459,6 +483,47 @@ class WorkerConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _lease_expiry_idle_sits_between_the_lease_and_the_backstop(self) -> WorkerConfig:
+        """Bound an EXPLICIT lease-expiry threshold on both sides (#2433).
+
+        Each end is a distinct silent failure. Below one lease TTL the scan can
+        select an entry between a healthy owner's heartbeats, before its lease
+        has actually expired, which reintroduces the cross-replica dup-dispatch
+        the lease exists to close. At or above the backstop the pass selects
+        nothing ``XAUTOCLAIM`` was not already claiming, so it is dead
+        configuration and ADR-0131's "recoverable after at most one short lease"
+        bound is silently off.
+
+        Only an EXPLICIT value is checked, deliberately. The derived default
+        cannot violate the lower bound because it IS the lease TTL, and
+        ``reclaim_min_idle_ms`` carries no ``validation_alias`` so no operator
+        can move the upper bound either; the only configurations that put the
+        derived default at or above the backstop are the test harnesses that
+        shorten the backstop into milliseconds, which would otherwise be
+        rejected by their own product code.
+        """
+        if self.lease_expired_idle_ms is None:
+            return self
+        idle_ms = self.lease_expired_idle_ms_value()
+        lease_ms = int(self.delivery_lease_ttl_s * 1000)
+        if idle_ms < lease_ms:
+            raise ValueError(
+                f"CURIE_LEASE_EXPIRED_IDLE_MS ({idle_ms!r}) must be at least one "
+                "delivery lease TTL, CURIE_DELIVERY_LEASE_TTL_S "
+                f"({self.delivery_lease_ttl_s!r}, {lease_ms!r}ms): a shorter "
+                "threshold can select an entry between a healthy owner's "
+                "heartbeats, before its lease has expired"
+            )
+        if idle_ms >= self.reclaim_min_idle_ms:
+            raise ValueError(
+                f"CURIE_LEASE_EXPIRED_IDLE_MS ({idle_ms!r}) must be below "
+                f"reclaim_min_idle_ms ({self.reclaim_min_idle_ms!r}): at or above "
+                "the backstop the lease-expiry pass selects nothing XAUTOCLAIM "
+                "was not already claiming, so the knob is dead configuration"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _termination_grace_covers_the_budget(self) -> WorkerConfig:
         """Fail at construction if platform grace cannot cover budget + reserve.
 
@@ -589,6 +654,26 @@ class WorkerConfig(BaseSettings):
     # entirely, but is not needed now that the lease is the primary guard, and
     # would slow crash recovery for entries the lease mechanism cannot cover.
     reclaim_min_idle_ms: int = 900000
+    # The lease-expiry reclaim threshold (#2433, ADR-0131). An ADDITION to the
+    # backstop above and never a replacement: an entry with no delivery state
+    # carries no evidence a lease was ever granted, so "the lease is gone" cannot
+    # be told apart from "there never was one", and such an entry stays on the
+    # unchanged 900 second window.
+    #
+    # It is safe at exactly the lease TTL because a healthy owner's heartbeat
+    # resets PEL idle with ``XCLAIM ... JUSTID`` every
+    # ``delivery_lease_heartbeat_s``, so a live delivery's idle never approaches
+    # it; TTL plus one heartbeat would exceed ADR-0131's "recoverable after at
+    # most one short lease" bound.
+    #
+    # ``None`` means derive ``delivery_lease_ttl_s * 1000`` at the use site, the
+    # same shape ``dead_letter_stream`` uses, because a static ``Field`` default
+    # cannot reference another field. Both consumer lanes read the resolver, not
+    # this field, so the runs/eval parity seam is structural.
+    lease_expired_idle_ms: int | None = Field(
+        default=None,
+        validation_alias="CURIE_LEASE_EXPIRED_IDLE_MS",
+    )
     # Unchanged at 30.0; now bound by ``_reclaim_scan_shorter_than_lease``,
     # which enforces the ADR's actual requirement (scan strictly shorter than
     # the lease TTL) rather than a specific number. See the delivery-lease
@@ -691,6 +776,25 @@ class WorkerConfig(BaseSettings):
     # also outlast the drain wait, which is what the validator below enforces.
     upgrade_quiesce_ttl_s: float = Field(
         default=1200.0, gt=0, validation_alias="CURIE_UPGRADE_QUIESCE_TTL_S"
+    )
+    # The Helm installation that owns upgrade pause authority (#2374). A blank
+    # value is deliberate standalone and Compose compatibility: those surfaces
+    # have no Helm installation boundary and keep using the legacy key. Cluster
+    # workers receive a nonblank value from the chart managed Secret.
+    installation_id: str = Field(
+        default="", validation_alias="CURIE_INSTALLATION_ID"
+    )
+    # Hook revisions fence delayed drain and release Jobs numerically. Ordinary
+    # worker processes only read marker state, so this hook-only value may be
+    # absent there. An explicitly supplied revision must be positive.
+    upgrade_revision: int | None = Field(
+        default=None, gt=0, validation_alias="CURIE_UPGRADE_REVISION"
+    )
+    # True only for the first upgrade from a chart that predates installation
+    # IDs. That hook atomically bridges the scoped marker to the legacy key so
+    # old and new worker replicas pause together during the transition.
+    upgrade_legacy_quiesce: Bool = Field(
+        default=False, validation_alias="CURIE_UPGRADE_LEGACY_QUIESCE"
     )
 
     # The platform's voluntary termination grace, injected by the chart from
@@ -995,6 +1099,26 @@ class WorkerConfig(BaseSettings):
         """
         return self.runner_api_base_url or self.api_base_url
 
+    def valkey_client_kwargs(self) -> dict[str, Any]:
+        """The connection parts every Valkey client in the worker is built from.
+
+        One place -- the three clients in ``run.build`` and the upgrade-drain
+        hook's own client -- so they cannot drift on the transport: ``ssl``
+        reaching some of them and not the rest is a lane that goes silently
+        cleartext against a TLS-only BYO store (#2315), and for the drain hook
+        that failure blocks every ``helm upgrade`` on the install (#2010).
+        ``socket_timeout`` stays at the call sites: the drain hook deliberately
+        does not set one.
+        """
+        return {
+            "host": self.valkey_host,
+            "port": self.valkey_port,
+            "password": self.valkey_password or None,
+            "db": self.valkey_db,
+            "decode_responses": True,
+            "ssl": self.valkey_tls,
+        }
+
     @property
     def valkey_socket_timeout_s(self) -> float:
         """Socket read timeout for the Valkey clients, kept above the block interval.
@@ -1052,11 +1176,18 @@ class WorkerConfig(BaseSettings):
         return f"{self.key_prefix}:completions:pending"
 
     def upgrade_quiesce_key(self) -> str:
-        # The fleet-wide "stop taking new work" flag the pre-upgrade gate sets
-        # (issue #2010). One key for the whole release, not one per replica: the
-        # gate runs as a Job that knows nothing about how many replicas exist,
-        # and every consumer reads the same flag. Always written with a TTL --
-        # see ``upgrade_quiesce_ttl_s`` for why it must never be permanent.
+        # One authoritative "stop taking new work" marker per Helm installation
+        # (#2374), shared by every replica in that installation. Standalone and
+        # Compose deliberately have a blank installation ID and retain the
+        # legacy release-wide key. Every marker is written with a finite TTL.
+        legacy_key = self.upgrade_legacy_quiesce_key()
+        if not self.installation_id:
+            return legacy_key
+        return f"{legacy_key}:{self.installation_id}"
+
+    def upgrade_legacy_quiesce_key(self) -> str:
+        """The pre-#2374 global key used only by standalone or the bridge."""
+
         return f"{self.key_prefix}:upgrade:quiesce"
 
     def lock_key(self, thread_key: str) -> str:
@@ -1078,6 +1209,22 @@ class WorkerConfig(BaseSettings):
         this writer can never drift on the name.
         """
         return derive_dead_letter_stream_name(self.stream, self.dead_letter_stream)
+
+    def lease_expired_idle_ms_value(self) -> int:
+        """The lease-expiry reclaim threshold: the override, else one lease TTL.
+
+        ``lease_expired_idle_ms``'s Field default cannot reference
+        ``self.delivery_lease_ttl_s``, so the derivation lives here rather than at
+        the two use sites, next to ``dead_letter_stream_name()``, which resolves a
+        default the same way, and next to the validator that bounds the result.
+        Both consumer lanes read THIS method, which is what keeps ADR-0131's
+        runs/eval parity true by construction rather than by review.
+        """
+        return (
+            self.lease_expired_idle_ms
+            if self.lease_expired_idle_ms is not None
+            else int(self.delivery_lease_ttl_s * 1000)
+        )
 
     def eval_dead_letter_stream_name(self) -> str:
         """The eval lane's graveyard: ``<eval_stream>:dead`` (#535).

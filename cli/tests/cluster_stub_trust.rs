@@ -17,6 +17,8 @@ use support::{serve, Response};
 const CHANNEL: &str = "C0EXAMPLE1";
 const API_KEY: &str = "fixture-platform-key";
 const RELAY_ADAPTER: &str = "curie-cluster-message";
+const WORKER_CLAIM_SELECTION: &str = "kubectl get pods -n acme-system -l app.kubernetes.io/instance=acme-release,app.kubernetes.io/component=worker -o json";
+const WORKER_CLAIM_EXEC: &str = "kubectl exec -n acme-system worker-stable-a -- python -m curie_worker.upgrade_drain --mode status --json";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -293,6 +295,29 @@ if "get deployment acme-release-curie-dispatcher" in joined:
         print("deployment.apps/acme-release-curie-dispatcher")
     sys.exit(0)
 
+# The message diagnosis may observe the claim gate through one exact, scoped,
+# read-only worker selection followed by the worker's status-only entry point.
+worker_selector = "app.kubernetes.io/instance=acme-release,app.kubernetes.io/component=worker"
+if args == ["get", "pods", "-n", "acme-system", "-l", worker_selector, "-o", "json"]:
+    print(json.dumps({"items": [{
+        "metadata": {
+            "name": "worker-stable-a",
+            "labels": {
+                "app.kubernetes.io/instance": "acme-release",
+                "app.kubernetes.io/component": "worker",
+            },
+        },
+        "status": {"phase": "Running"},
+    }]}))
+    sys.exit(0)
+
+if args == [
+    "exec", "-n", "acme-system", "worker-stable-a", "--",
+    "python", "-m", "curie_worker.upgrade_drain", "--mode", "status", "--json",
+]:
+    print('{"state":"claims_enabled","since":null,"revision":null}')
+    sys.exit(0)
+
 # Connected mode reads the worker's configured Slack origin. This read is not a
 # rollout/trust read and must remain on the connected branch.
 if "get deployment" in joined and "app.kubernetes.io/component=worker" in joined and "jsonpath=" in joined:
@@ -469,6 +494,7 @@ fn assert_relay_turn<'a>(turn: &'a serde_json::Value, expected_text: &str) -> &'
 }
 
 fn assert_no_worker_rollout(log: &str, state: &serde_json::Value) {
+    assert_only_bounded_worker_claim_reads(log);
     let forbidden: Vec<&str> = log
         .lines()
         .filter(|line| {
@@ -476,7 +502,9 @@ fn assert_no_worker_rollout(log: &str, state: &serde_json::Value) {
                 || (line.contains("patch deployment") && line.contains("worker"))
                 || (line.contains("set env") && line.contains("worker"))
                 || (line.contains("rollout status") && line.contains("worker"))
-                || (line.contains("get pods") && line.contains("component=worker"))
+                || (line.contains("get pods")
+                    && line.contains("component=worker")
+                    && *line != WORKER_CLAIM_SELECTION)
                 || (line.starts_with("helm ") && line.contains("worker"))
         })
         .collect();
@@ -493,13 +521,16 @@ fn assert_no_worker_rollout(log: &str, state: &serde_json::Value) {
 }
 
 fn assert_no_worker_mutation(log: &str, state: &serde_json::Value) {
+    assert_only_bounded_worker_claim_reads(log);
     let forbidden: Vec<&str> = log
         .lines()
         .filter(|line| {
             (line.contains("patch deployment") && line.contains("worker"))
                 || (line.contains("set env") && line.contains("worker"))
                 || (line.contains("rollout status") && line.contains("worker"))
-                || (line.contains("get pods") && line.contains("component=worker"))
+                || (line.contains("get pods")
+                    && line.contains("component=worker")
+                    && *line != WORKER_CLAIM_SELECTION)
                 || (line.starts_with("helm ") && line.contains("worker"))
         })
         .collect();
@@ -511,6 +542,41 @@ fn assert_no_worker_mutation(log: &str, state: &serde_json::Value) {
     assert_eq!(
         state["pods"],
         serde_json::json!(["worker-stable-a", "worker-stable-b"])
+    );
+}
+
+fn assert_only_bounded_worker_claim_reads(log: &str) {
+    let unexpected: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            (line.contains("get pods")
+                && line.contains("component=worker")
+                && *line != WORKER_CLAIM_SELECTION)
+                || (line.contains("exec")
+                    && line.contains("curie_worker.upgrade_drain")
+                    && *line != WORKER_CLAIM_EXEC)
+        })
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected worker claim observation: {unexpected:#?}\n{log}"
+    );
+
+    let selections = log
+        .lines()
+        .filter(|line| *line == WORKER_CLAIM_SELECTION)
+        .count();
+    let executions = log
+        .lines()
+        .filter(|line| *line == WORKER_CLAIM_EXEC)
+        .count();
+    assert_eq!(
+        executions, selections,
+        "each scoped worker selection must have one status-only exec: {log}"
+    );
+    assert!(
+        selections <= 2,
+        "one message may observe claims only before and after its wait: {log}"
     );
 }
 

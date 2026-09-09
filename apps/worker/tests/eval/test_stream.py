@@ -1173,7 +1173,7 @@ class _TokenSubstrate:
     ) -> _FakeHandle:
         return _FakeHandle(base_url="http://sandbox.local:8080", token=self._token)
 
-    def release(self, key: str) -> None:
+    def release(self, key: str, **_: object) -> None:
         self.released.append(key)
 
 
@@ -1370,7 +1370,7 @@ class _ConcurrencyProbeSubstrate:
             self._live -= 1
         return _FakeHandle(base_url="http://sandbox.local:8080", token="t")
 
-    def release(self, _key: str) -> None:  # pragma: no cover - unused here
+    def release(self, _key: str, **_: object) -> None:  # pragma: no cover - unused here
         pass
 
 
@@ -1743,6 +1743,112 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
     asyncio.run(go())
     assert fake_k8s.created_pools == ["curie-agent-acme-a-runner-pool"]
     assert fake_k8s.created_labels[-1][AGENT_LABEL] == "acme-a"
+
+
+@dataclass
+class _DelayedDeleteK8s(_FakeK8s):
+    """Eval-plane sibling of the substrate delayed-delete fake (#2259).
+
+    The claim CR can vanish while the sandbox/pod still exists. ResourceQuota
+    charges the pod, so wait_gone must poll both.
+    """
+
+    claim_gone_after_gets: int = 2
+    sandbox_gone_after_gets: int = 4
+    claim_gets: dict[str, int] = field(default_factory=dict)
+    sandbox_gets: dict[str, int] = field(default_factory=dict)
+    lingering_sandboxes: dict[str, str] = field(default_factory=dict)
+
+    def delete_claim(self, name: str) -> None:
+        claim = self.claims.get(name)
+        if claim is None or name in self.claim_gets:
+            return
+        self.claim_gets[name] = 0
+        self.sandbox_gets[claim.sandbox_name] = 0
+        self.lingering_sandboxes[claim.sandbox_name] = name
+        self.deleted.append(name)
+
+    def get_claim(self, name: str) -> ClaimView | None:
+        if name in self.claim_gets:
+            self.claim_gets[name] += 1
+            if self.claim_gets[name] >= self.claim_gone_after_gets:
+                self.claims.pop(name, None)
+                return None
+        return super().get_claim(name)
+
+    def get_sandbox(self, name: str) -> SandboxView | None:
+        if name in self.sandbox_gets:
+            self.sandbox_gets[name] += 1
+            if self.sandbox_gets[name] >= self.sandbox_gone_after_gets:
+                self.lingering_sandboxes.pop(name, None)
+                return None
+            return SandboxView(
+                name=name, ready=True, service_fqdn="127.0.0.1", operating_mode="Running"
+            )
+        return super().get_sandbox(name)
+
+
+def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
+    """#2259: the weather ladder uses the trajectory eval plane, not run_eval_turns.
+
+    Kubernetes delete returns before the pod is gone, so a following cluster
+    message still contends for ResourceQuota unless the eval finally waits.
+    Leaving the claim listed after _run_and_report is the falsifiable negative.
+    """
+    from curie_worker.eval import stream as stream_module
+
+    async def _skip_suite(*_args: object, **_kwargs: object) -> EvalRunResult:
+        return EvalRunResult(version="deadbeef", suite="s", results=[])
+
+    monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
+    fake_k8s = _DelayedDeleteK8s(claim_gone_after_gets=2, sandbox_gone_after_gets=4)
+    sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
+    affinity = AffinityStore(
+        redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False),
+        key_prefix=sandbox_prefix,
+    )
+    substrate = SandboxSubstrate(
+        fake_k8s,  # type: ignore[arg-type]
+        affinity,
+        SubstrateConfig(
+            namespace="test-ns",
+            warm_pool="curie-runner-pool",
+            claim_timeout_seconds=3.0,
+            poll_interval_seconds=0.001,
+            poll_interval_max_seconds=0.001,
+            release_gone_timeout_seconds=2.0,
+            key_prefix=sandbox_prefix,
+        ),
+    )
+    consumer = _consumer(
+        WorkerConfig(fake_model=True),
+        bundle_store=_FakeBundleStore(
+            _suite_bundle(
+                EvalSuite(
+                    name="s",
+                    cases=[EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="a"))],
+                )
+            )
+        ),
+        substrate=substrate,
+        reporter=_FakeReporter(),
+        repo_lookup=_StubRepo(),
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
+
+    async def go() -> None:
+        await consumer._run_and_report(item, "test-stream-id")
+
+    asyncio.run(go())
+    assert fake_k8s.deleted, "eval must still issue the claim delete"
+    assert not fake_k8s.claims, (
+        "eval must wait until the deleted SandboxClaim is gone so quota is free "
+        "for the following cluster message"
+    )
+    assert not fake_k8s.lingering_sandboxes, (
+        "eval must wait until the sandbox/pod is gone; ResourceQuota charges "
+        "the pod, not the claim CR"
+    )
 
 
 def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
@@ -2973,7 +3079,7 @@ class _ProvisioningFailureSubstrate:
     def claim(self, _key: str, **_kwargs: object) -> Any:
         raise SandboxError("no capacity for an eval sandbox")
 
-    def release(self, key: str) -> None:  # pragma: no cover - must not be reached
+    def release(self, key: str, **_: object) -> None:  # pragma: no cover - must not be reached
         self.released.append(key)
 
 
@@ -3467,3 +3573,72 @@ def test_an_unfenced_eval_lane_has_no_deadline_at_all_while_a_fenced_one_does() 
         await _eval_cleanup(client, cfg)
 
     asyncio.run(go())
+
+
+# --- The lease-expiry reclaim knob, and the eval lane's dispatch bound (#2433) --
+
+
+def test_the_eval_lane_carries_the_configured_lease_expiry_threshold() -> None:
+    """AC5, the eval half of the parity seam.
+
+    ADR-0131 requires both consumer lanes to share the lease implementation by
+    construction: "a fix on only one consumer lane is incomplete." An eval
+    delivery whose owner was force-killed would otherwise wait out the 900 second
+    backstop while a runs delivery on the same fleet recovered in one lease.
+
+    Two assertions, and the second is the one that matters: the first alone
+    cannot tell "wired to the config resolver" from "hard-coded to today's
+    default", so an explicit non-default value is passed as well.
+
+    Red on omitting ``lease_expired_idle_ms`` from the eval ``DeliverySpec``.
+    Twin: ``tests/kernel/test_delivery_ownership.py``'s
+    ``test_the_runs_lane_carries_the_configured_lease_expiry_threshold``.
+    """
+    default_cfg = WorkerConfig()
+    default_consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=default_cfg,
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    assert (
+        default_consumer._delivery.lease_expired_idle_ms
+        == default_cfg.lease_expired_idle_ms_value()
+    )
+
+    explicit_cfg = WorkerConfig(lease_expired_idle_ms=60000)
+    explicit_consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=explicit_cfg,
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    assert explicit_consumer._delivery.lease_expired_idle_ms == 60000
+
+
+def test_the_eval_lane_claims_one_expired_row_at_a_time() -> None:
+    """The eval lane's transfer capacity is 1, because its handler runs inline.
+
+    ``EvalStreamConsumer._dispatch`` awaits ``asyncio.shield(task)``, so
+    ``_dispatch_reclaimed`` runs suites strictly one at a time. A second claimed
+    row would sit XCLAIMed and UNLEASED for the length of a whole eval run, where
+    every other replica reads it as an expired-lease candidate.
+
+    Red on inheriting the base's unbounded ``None``.
+    """
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    assert consumer._transfer_capacity() == 1

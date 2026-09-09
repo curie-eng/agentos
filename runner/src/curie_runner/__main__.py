@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import anyio
@@ -58,8 +58,8 @@ from .history import (
     resolve_history,
 )
 from .hooks import load_bundle_hooks
-from .mcp_tool_capability import probe_mcp_tool_capability
-from .memory import MemoryRecord, MemoryStore, format_memory_preamble, resolve_memory
+from .mcp_tool_capability import McpToolCapabilityProbe, probe_mcp_tool_capability
+from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
 from .redact import install_stdout_redaction
@@ -157,6 +157,7 @@ def build_runner(
     memory_preamble: str | None = None,
     history_store: TranscriptStore | None = None,
     conversation_replay: ConversationReplay | None = None,
+    mcp_capability: McpToolCapabilityProbe | None = None,
     harness: HarnessContribution | None = None,
     workspace_path: Path | None = None,
 ) -> SessionRunner:
@@ -299,12 +300,14 @@ def build_runner(
         # and probe failures preserve the historical fail-closed behavior. The
         # annotation remains a non-authoritative hint: it never authorizes or
         # denies tool execution.
-        capability = anyio.run(
-            probe_mcp_tool_capability,
-            config.session.plugin_dir,
-            derived_mcp_servers,
-            sdk_env,
-        )
+        capability = mcp_capability
+        if capability is None:
+            capability = anyio.run(
+                probe_mcp_tool_capability,
+                config.session.plugin_dir,
+                derived_mcp_servers,
+                sdk_env,
+            )
         observed_readonly_tools = capability.readonly_tools
         policy_hidden_tools = (
             policy_disallowed_tools(approval_gate, capability.observed_tools)
@@ -380,6 +383,7 @@ def build_runner(
             cwd=workspace_cwd,
             web_search_enabled=web_search_enabled,
             policy_disallowed_tools=policy_hidden_tools,
+            disallowed_tools=config.disallowed_tools,
         )
 
     sdk_generation = 0
@@ -400,6 +404,7 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
+                disallowed_tools=config.disallowed_tools,
             )
         assert real_options is not None
         nonlocal sdk_generation
@@ -465,22 +470,18 @@ def build_runner(
     )
 
 
-def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
+async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     """Resolve CURIE_MEMORY_REF and load prior memory into a boot preamble.
 
-    Runs synchronously at boot (before the port is up), so a bad ref or an
-    unreachable store fails the process visibly rather than after serving. A
-    transient load failure degrades to "no memory" and does NOT block boot -- an
-    agent must still be able to run when its memory store is briefly unavailable.
+    Runs at boot (before the port is up), so a bad ref or an unreachable store
+    fails the process visibly rather than after serving. A transient load
+    failure degrades to "no memory" and does NOT block boot -- an agent must
+    still be able to run when its memory store is briefly unavailable.
     """
 
     store = resolve_memory(config.session.memory_ref, os.environ)
-
-    async def _load() -> list[MemoryRecord]:
-        return await store.load()
-
     try:
-        records = anyio.run(_load)
+        records = await store.load()
     except Exception as exc:  # noqa: BLE001 - degrade to no-memory, never fail boot
         logger.warning(
             "memory load failed session=%s error_class=%s: %s (booting without memory)",
@@ -493,7 +494,7 @@ def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     return store, format_memory_preamble(records)
 
 
-def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, ConversationReplay]:
+async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, ConversationReplay]:
     """Resolve, compact when needed, and load the structured replay prefix.
 
     A configured history ref is continuity-critical. Failure is fatal: silently
@@ -517,18 +518,13 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, ConversationRe
         if config.history_max_bytes is not None
         else DEFAULT_REPLAY_MAX_BYTES
     )
-
-    async def _load() -> tuple[ConversationReplay, int, bool]:
+    try:
         records = await store.load()
         replay, summary = build_conversation_replay(
             records, max_turns=max_turns, max_bytes=max_bytes
         )
         if summary is not None:
             await store.append(summary)
-        return replay, len(records), summary is not None
-
-    try:
-        replay, record_count, compacted = anyio.run(_load)
     except Exception as exc:  # noqa: BLE001 - translate loader failures consistently
         logger.error(
             "history load failed session=%s error_class=%s: %s",
@@ -540,11 +536,75 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, ConversationRe
     logger.info(
         "history loaded session=%s records=%d messages=%d compacted=%s",
         config.session.session_id,
-        record_count,
+        len(records),
         len(replay.messages),
-        compacted,
+        summary is not None,
     )
     return store, replay
+
+
+@dataclass(frozen=True)
+class _BootFetches:
+    """Independent boot-time loads that previously ran as sequential anyio.run calls."""
+
+    memory_store: MemoryStore
+    memory_preamble: str | None
+    history_store: TranscriptStore
+    conversation_replay: ConversationReplay
+    mcp_capability: McpToolCapabilityProbe | None
+
+
+async def _load_boot_fetches(
+    config: RunnerConfig,
+    fake_model: bool,
+    sdk_env: dict[str, str] | None,
+) -> _BootFetches:
+    """Load memory, structured history, and (on the real-model path) MCP capability together."""
+
+    resolve_memory(config.session.memory_ref, os.environ)
+    resolve_history(config.history_ref, os.environ)
+
+    memory: tuple[MemoryStore, str | None] | None = None
+    history: tuple[TranscriptStore, ConversationReplay] | None = None
+    capability: McpToolCapabilityProbe | None = None
+
+    async def load_memory() -> None:
+        nonlocal memory
+        memory = await _load_memory(config)
+
+    async def load_history() -> None:
+        nonlocal history
+        history = await _load_history(config)
+
+    async def probe() -> None:
+        nonlocal capability
+        derived = derive_mcp_servers(
+            config.session.plugin_dir,
+            release=config.connector_release,
+            agent=config.connector_agent,
+            namespace=config.connector_namespace,
+        )
+        capability = await probe_mcp_tool_capability(
+            config.session.plugin_dir,
+            derived,
+            sdk_env,
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(load_memory)
+        tg.start_soon(load_history)
+        if not fake_model:
+            tg.start_soon(probe)
+
+    assert memory is not None
+    assert history is not None
+    return _BootFetches(
+        memory_store=memory[0],
+        memory_preamble=memory[1],
+        history_store=history[0],
+        conversation_replay=history[1],
+        mcp_capability=capability,
+    )
 
 
 def _serve() -> None:
@@ -585,8 +645,9 @@ def _serve() -> None:
         except UnsupportedCredentialError as exc:
             logger.error("credential resolution failed: %s", exc)
             raise
-    memory_store, memory_preamble = _load_memory(config)
-    history_store, conversation_replay = _load_history(config)
+    fetches = anyio.run(_load_boot_fetches, config, fake_model, override)
+    memory_store, memory_preamble = fetches.memory_store, fetches.memory_preamble
+    history_store, conversation_replay = fetches.history_store, fetches.conversation_replay
     workspace_candidate = Path("/workspace")
     workspace_path: Path | None = (
         workspace_candidate
@@ -601,6 +662,7 @@ def _serve() -> None:
         memory_preamble=memory_preamble,
         history_store=history_store,
         conversation_replay=conversation_replay,
+        mcp_capability=fetches.mcp_capability,
         harness=harness,
         workspace_path=workspace_path,
     )
