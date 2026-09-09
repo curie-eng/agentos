@@ -89,6 +89,7 @@ def build_options(
     mcp_servers: dict[str, McpSdkServerConfig] | None = None,
     can_use_tool: CanUseTool | None = None,
     cwd: str | None = None,
+    disallowed_tools: list[str] | tuple[str, ...] | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -138,6 +139,10 @@ def build_options(
         # In-process platform tools (the approval-request gate, ADR-0010).
         mcp_servers=cast("Any", mcp_servers or {}),
         include_partial_messages=True,
+        # Optional operator deny list (#2429). Empty/None keeps the SDK default
+        # (no tools removed). Names are removed from the model context and cannot
+        # be used even under bypassPermissions.
+        disallowed_tools=list(disallowed_tools or ()),
     )
 
 
@@ -161,9 +166,7 @@ class ClaudeAgentSession:
                 async for message in response:
                     if isinstance(message, StreamEvent):
                         event = message.event
-                        event_type = (
-                            event.get("type") if isinstance(event, dict) else None
-                        )
+                        event_type = event.get("type") if isinstance(event, dict) else None
                         if event_type == "content_block_start":
                             content_block = event.get("content_block")
                             if isinstance(content_block, dict):

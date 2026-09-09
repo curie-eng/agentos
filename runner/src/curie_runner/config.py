@@ -88,6 +88,10 @@ class RunnerConfig:
     # defaults live at the call site rather than here.
     history_max_turns: int | None
     history_max_bytes: int | None
+    # Runner-local deny list (#2429): comma-separated tool names handed to
+    # ClaudeAgentOptions.disallowed_tools. Unset/blank keeps the historical
+    # empty list so an unconfigured agent is unchanged. Not a BootEnv field.
+    disallowed_tools: tuple[str, ...]
 
     @property
     def ceiling(self) -> int:
@@ -131,6 +135,11 @@ class RunnerConfig:
         # Runner-local harness selection (ADR-0060, #844), not a BootEnv key:
         # empty/unset selects the built-in Claude harness.
         harness = env.get("CURIE_HARNESS", "").strip() or DEFAULT_HARNESS
+        disallowed_tools = tuple(
+            name.strip()
+            for name in env.get("CURIE_DISALLOWED_TOOLS", "").split(",")
+            if name.strip()
+        )
         return cls(
             session=boot.session,
             model=boot.model,
@@ -150,4 +159,5 @@ class RunnerConfig:
             runner_token=boot.runner_token,
             history_max_turns=boot.history_max_turns,
             history_max_bytes=boot.history_max_bytes,
+            disallowed_tools=disallowed_tools,
         )

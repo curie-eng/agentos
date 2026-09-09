@@ -332,6 +332,7 @@ def build_runner(
             ),
             can_use_tool=(build_can_use_tool(approval_gate) if approval_gate is not None else None),
             cwd=workspace_cwd,
+            disallowed_tools=config.disallowed_tools,
         )
 
     def factory() -> ModelSession:
@@ -349,6 +350,7 @@ def build_runner(
                 # Share the same gate so a scripted request_approval resolves its
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
+                disallowed_tools=config.disallowed_tools,
             )
         assert real_options is not None
         return ClaudeAgentSession(real_options)
