@@ -2473,12 +2473,15 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
     assert!(
         curie_values.contains("tempo.soak-obs.svc.cluster.local")
             && curie_values.contains("grafana.soak-obs.svc.cluster.local")
-            && curie_values.contains("namespace: soak-obs"),
+            && curie_values.contains("prometheus-server.soak-obs.svc.cluster.local")
+            && curie_values.contains("namespace: soak-obs")
+            && curie_values.contains("kubernetes.io/metadata.name: soak-obs"),
         "Curie integration values must point at soak-obs: {curie_values}"
     );
     assert!(
         !curie_values.contains(".observability.svc.cluster.local")
-            && !curie_values.contains("namespace: observability"),
+            && !curie_values.contains("namespace: observability")
+            && !curie_values.contains("kubernetes.io/metadata.name: observability"),
         "Curie integration values must not retain observability: {curie_values}"
     );
 

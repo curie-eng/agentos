@@ -148,6 +148,44 @@ nothing in the pipeline will flag. The node-level jobs are deliberately left
 cluster-wide -- they resolve one target per Node through the API server, so they
 cannot double count, and the bot would otherwise be blind to every kubelet.
 
+### Retained Curie metrics and reliability alerts
+
+The base chart still ships `nop/metrics`. The installer overlay
+`observability/curie-values.yaml` appends `prometheusremotewrite/soak` to that
+pipeline and opens Collector metrics ingress for the Prometheus server. The
+Prometheus overlay enables the remote-write receiver and loads the
+`curie-reliability` alert group. Alertmanager stays off: alerts fire inside
+Prometheus. This does not send notifications to people.
+
+Source files and a green `helm template` are the locally rendered class.
+A disposable install that can query series and show alert firing plus recovery
+is runtime-tested. Neither class means the permanent soak overlay is actually
+deployed. The operator procedure that keeps those classes honest is
+[docs/METRICS-ROLLOUT.md](docs/METRICS-ROLLOUT.md).
+
+### Correlate a message, run, delivery, and trace without a private body
+
+Metric labels stay bounded: operation class and outcome only. Run, session,
+sandbox, user, and deployment identifiers are correlation attributes on logs
+and traces. To diagnose a failed synthetic request:
+
+1. Take the accepted-message timestamp and the W3C `trace_id` from the
+   structured log line (not the body).
+2. In Tempo, open that `traceId`. Confirm `curie.queue.enqueue`,
+   `curie.turn.process`, `curie.runner.rpc`, `agent.run`, and
+   `curie.reply.post` on the same trace.
+3. In Prometheus, check the matching low-cardinality series
+   (`curie_turn_completed_total`, `curie_reply_delivery_total`,
+   `curie_runner_rpc_result_total`, `curie_queue_message_age_seconds`).
+   Do not add `run_id` or `trace_id` to those queries as label matchers;
+   those identities are not metric labels.
+4. If the reply is owed, use `curie_completion_outbox` /
+   `curie_completion_outbox_age_seconds` rather than reading the run queue
+   lag. Missing series is a failure, not a quiet success.
+
+Diagnose without inspecting a private message body or a credential value.
+High-cardinality identity belongs in logs and traces, not metric labels.
+
 ---
 
 ## Talk to it in Slack
