@@ -64,6 +64,8 @@ FAKE_JWT = "eyJ" + "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.FAKEFAKEFAKEFAKEFAKEFA
 FAKE_URL_WITH_TOKEN = "https://example.invalid/hook?token=" + "0000FAKEFAKEFAKEFAKE"
 FAKE_SECRET_ASSIGNMENT = "secret=" + "0000FAKEFAKEFAKEVALUE"
 FAKE_HOME_PATH = "/home/theconnman/.config/curie/settings.json"
+FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
+FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"
 
 # The sensitive substring that must be absent from every boundary's output,
 # keyed by rule name. VECTORS is derived from this so the two cannot drift.
@@ -82,6 +84,8 @@ SECRET_LITERALS: dict[str, str] = {
     "url_secret_param": FAKE_URL_WITH_TOKEN,
     "secret_assignment": FAKE_SECRET_ASSIGNMENT,
     "home_path": FAKE_HOME_PATH,
+    "channel_token": FAKE_CHANNEL_TOKEN,
+    "x_api_key": FAKE_X_API_KEY_HEADER,
 }
 
 # One frozen vector per rule: a realistic runner output line carrying that class

@@ -35,6 +35,11 @@ _SECRET_VECTORS = (
     "https://example.invalid/hook?token=" + "0000FAKEFAKEFAKEFAKE",
     "secret=" + "0000FAKEFAKEFAKEVALUE",
     "/home/example-user/.config/curie/settings.json",
+    "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000",
+    "am_" + "FAKEFAKEFAKEFAKEFAKE0000",
+    "CURIE_CHANNEL_TOKEN=" + "FAKEFAKEFAKEHEADERVALUE0000",
+    "CURIE_EGRESS_SECRET=" + "FAKEFAKEFAKEEGRESS0000",
+    "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000",
 )
 
 
@@ -360,6 +365,52 @@ def test_exception_keeps_redacted_stderr_traceback_but_closes_otlp_fields() -> N
         assert "exception.message" not in attributes
         assert "exception.stacktrace" not in attributes
         assert redaction_probe not in repr(attributes)
+    finally:
+        logger.handlers[:] = original_handlers
+        logger.setLevel(original_level)
+        logger.propagate = original_propagate
+        logger_provider.shutdown()
+
+
+def test_curie_credential_in_exception_is_redacted_on_the_service_logger() -> None:
+    redaction_probe = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
+    resource = build_resource(
+        "curie-mail-adapter",
+        service_version="0.8.8",
+        service_instance_id="acme-mail-exception",
+        deployment_environment="test",
+    )
+    exporter = InMemoryLogRecordExporter()
+    logger_provider = LoggerProvider(resource=resource)
+    logger_provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+    stderr = io.StringIO()
+    logger = logging.getLogger("curie.telemetry.curie-credential-exception")
+    original_handlers = list(logger.handlers)
+    original_level = logger.level
+    original_propagate = logger.propagate
+
+    try:
+        configure_service_logging(
+            logger,
+            service_name="curie-mail-adapter",
+            stream=stderr,
+            logger_provider=logger_provider,
+        )
+        try:
+            raise RuntimeError(f"CURIE_CHANNEL_TOKEN={redaction_probe}")
+        except RuntimeError:
+            logger.exception("request handler escaped credential=%s", redaction_probe)
+
+        stderr_record = json.loads(stderr.getvalue())
+        assert "Traceback (most recent call last)" in stderr_record["exception"]
+        assert "RuntimeError" in stderr_record["exception"]
+        assert redaction_probe not in stderr_record["message"]
+        assert redaction_probe not in stderr_record["exception"]
+        assert "[REDACTED:" in stderr_record["exception"]
+
+        (exported,) = exporter.get_finished_logs()
+        assert redaction_probe not in _body(exported)
+        assert redaction_probe not in repr(_attributes(exported))
     finally:
         logger.handlers[:] = original_handlers
         logger.setLevel(original_level)
