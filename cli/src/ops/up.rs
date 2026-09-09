@@ -133,7 +133,17 @@ impl UpOpts {
 /// Preserved the same way generated secrets are: read back from the release and
 /// re-supplied through the values file, never argv, so a bot token cannot leak
 /// into `ps` or shell history.
-const COMMS_MANAGED_KEYS: &[&str] = &["dispatcher.slack.appToken", "dispatcher.slack.botToken"];
+const COMMS_MANAGED_KEYS: &[&str] = &[
+    "dispatcher.slack.appToken",
+    "dispatcher.slack.botToken",
+    "dispatcher.slack.signingSecret",
+    "dispatcher.slack.appTokenExistingSecret",
+    "dispatcher.slack.appTokenExistingSecretKey",
+    "dispatcher.slack.botTokenExistingSecret",
+    "dispatcher.slack.botTokenExistingSecretKey",
+    "dispatcher.slack.signingSecretExistingSecret",
+    "dispatcher.slack.signingSecretExistingSecretKey",
+];
 
 /// The chart values `cluster github-app` records (ADR-0092), preserved across a
 /// plain `cluster up` for exactly the reason [`COMMS_MANAGED_KEYS`] is.
@@ -157,6 +167,7 @@ const GITHUB_APP_MANAGED_KEYS: &[&str] = &[
     "api.githubAppPrivateKey",
     "api.githubAppExistingSecret",
     "api.githubAppExistingSecretKey",
+    "api.githubCloneBase",
     "api.githubCloneBase",
 ];
 
@@ -182,6 +193,10 @@ const REQUIRED_SECRETS: &[(&str, usize)] = &[
 /// bearer token, failing auth in a way that reads like a permissions problem
 /// rather than a missing one (#1109). Preserved, never invented.
 pub(crate) const GITHUB_TOKEN_KEY: &str = "api.githubToken";
+const GITHUB_TOKEN_REFERENCE_KEYS: &[&str] = &[
+    "api.githubTokenExistingSecret",
+    "api.githubTokenExistingSecretKey",
+];
 
 /// What `cluster up` does with [`GITHUB_TOKEN_KEY`] on this run.
 ///
@@ -410,14 +425,7 @@ fn resolve_comms_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
-    let overridden = operator_set_keys(operator_sets);
-    COMMS_MANAGED_KEYS
-        .iter()
-        .filter(|key| !overridden.contains(**key))
-        .filter_map(|key| {
-            preserved_value(existing, key).map(|current| ((*key).to_string(), current))
-        })
-        .collect()
+    resolve_credential_values(existing, operator_sets, COMMS_MANAGED_KEYS)
 }
 
 /// Re-supply the [`GITHUB_APP_MANAGED_KEYS`] a previous `cluster github-app` recorded.
@@ -429,14 +437,7 @@ fn resolve_github_app_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
-    let overridden = operator_set_keys(operator_sets);
-    GITHUB_APP_MANAGED_KEYS
-        .iter()
-        .filter(|key| !overridden.contains(**key))
-        .filter_map(|key| {
-            preserved_value(existing, key).map(|current| ((*key).to_string(), current))
-        })
-        .collect()
+    resolve_credential_values(existing, operator_sets, GITHUB_APP_MANAGED_KEYS)
 }
 
 /// Supply the sealing keypair (ADR-0094), generating one only when safe.
@@ -462,6 +463,7 @@ fn resolve_github_app_values(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SealingPrivateKeyDisposition {
     OperatorSet,
+    External,
     Deferred,
     Preserved,
     Generated,
@@ -475,7 +477,17 @@ fn sealing_private_key_disposition(
     if operator_set_keys(operator_sets).contains(crate::sealing::SEALING_PRIVATE_KEY) {
         return SealingPrivateKeyDisposition::OperatorSet;
     }
-    if preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY).is_some() {
+    if effective_existing_secret(existing, operator_sets, crate::sealing::SEALING_PRIVATE_KEY) {
+        return SealingPrivateKeyDisposition::External;
+    }
+    if resolve_credential_values(
+        existing,
+        operator_sets,
+        &[crate::sealing::SEALING_PRIVATE_KEY],
+    )
+    .iter()
+    .any(|(_, value)| !value.is_empty())
+    {
         return SealingPrivateKeyDisposition::Preserved;
     }
     if dry_run {
@@ -489,25 +501,11 @@ fn resolve_preserved_sealing_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
-    let overridden = operator_set_keys(operator_sets);
-    let mut resolved = Vec::new();
-
-    if !overridden.contains(crate::sealing::SEALING_PRIVATE_KEY) {
-        if let Some(current) = preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY) {
-            resolved.push((crate::sealing::SEALING_PRIVATE_KEY.to_string(), current));
-        }
-    }
-    if !overridden.contains(crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY) {
-        if let Some(previous) =
-            preserved_value(existing, crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY)
-        {
-            resolved.push((
-                crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY.to_string(),
-                previous,
-            ));
-        }
-    }
-    resolved
+    resolve_credential_values(
+        existing,
+        operator_sets,
+        crate::sealing::SEALING_MANAGED_KEYS,
+    )
 }
 
 fn resolve_sealing_values(
@@ -743,6 +741,25 @@ mod sealing_preservation_tests {
             .map(|(_, v)| v.as_str())
     }
 
+    #[test]
+    fn comms_preservation_includes_existing_secret_refs() {
+        let existing = values(serde_json::json!({
+            "dispatcher": {"slack": {
+                "appTokenExistingSecret": "acme-credentials",
+                "appTokenExistingSecretKey": "appToken-custom"
+            }}
+        }));
+        let resolved = resolve_comms_values(Some(&existing), &[]);
+        assert_eq!(
+            get(&resolved, "dispatcher.slack.appTokenExistingSecret"),
+            Some("acme-credentials")
+        );
+        assert_eq!(
+            get(&resolved, "dispatcher.slack.appTokenExistingSecretKey"),
+            Some("appToken-custom")
+        );
+    }
+
     /// The catastrophic case. A plain `cluster up` drops anything it does not
     /// re-pass, and dropping this key makes every sealed credential in every
     /// agent repository permanently unreadable.
@@ -880,7 +897,6 @@ mod sealing_preservation_tests {
 /// The chart value holding the model credential. Named here so the secret
 /// classifier below cannot drift from the key `up_commands` actually masks.
 pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
-#[allow(dead_code)]
 const MODEL_CREDENTIAL_REFERENCE_KEYS: &[&str] = &[
     "agentSandbox.runner.credentialsExistingSecret",
     "agentSandbox.runner.credentialsExistingSecretKey",
@@ -978,6 +994,36 @@ fn helm_set_string_entries(expression: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn resolve_credential_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    keys: &[&str],
+) -> Vec<(String, String)> {
+    let overridden = operator_set_keys(operator_sets);
+    keys.iter()
+        .filter_map(|key| {
+            if overridden.contains(*key) {
+                return None;
+            }
+            let inline = key
+                .strip_suffix("ExistingSecretKey")
+                .or_else(|| key.strip_suffix("ExistingSecret"))
+                .unwrap_or(key);
+            let inline_replaced = operator_set_entries(operator_sets)
+                .into_iter()
+                .rev()
+                .find(|(name, _)| name.trim() == inline)
+                .is_some_and(|(_, value)| !value.is_empty());
+            if (*key != inline && inline_replaced)
+                || (*key == inline && effective_existing_secret(existing, operator_sets, inline))
+            {
+                return preserved_value(existing, key).map(|_| ((*key).to_string(), String::new()));
+            }
+            preserved_value(existing, key).map(|value| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
 /// Carry the runner configuration recorded by a prior real model install into
 /// a plain rerun. Explicit inputs replace their recorded family.
 fn resolve_preserved_runner_identity_values(
@@ -992,7 +1038,31 @@ fn resolve_preserved_runner_identity_values(
         && opts.credentials.is_none()
         && !overridden.contains(MODEL_CREDENTIAL_KEY)
     {
-        opts.credentials = preserved_value(existing, MODEL_CREDENTIAL_KEY);
+        opts.credentials =
+            resolve_credential_values(existing, operator_sets, &[MODEL_CREDENTIAL_KEY])
+                .into_iter()
+                .next()
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_empty());
+    }
+
+    let mut references =
+        resolve_credential_values(existing, operator_sets, MODEL_CREDENTIAL_REFERENCE_KEYS);
+    // `--fake-model` supplies nothing; clearing the recorded BYO reference on
+    // that switch destroyed operator wiring (#2459). Preserve unless an
+    // explicit credential or local model replaces the family.
+    if opts.local_model.is_some() || opts.credentials.is_some() {
+        for (_, value) in &mut references {
+            value.clear();
+        }
+    }
+    opts.secrets.extend(references);
+    if opts.credentials.is_none() {
+        opts.secrets.extend(
+            resolve_credential_values(existing, operator_sets, &[MODEL_CREDENTIAL_KEY])
+                .into_iter()
+                .filter(|(_, value)| value.is_empty()),
+        );
     }
 
     if !opts.fake_model
@@ -1201,6 +1271,10 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || MODEL_CREDENTIAL_REFERENCE_KEYS.contains(&key)
+        || GITHUB_TOKEN_REFERENCE_KEYS.contains(&key)
+        || key == GITHUB_TOKEN_KEY
+        || key == MODEL_CREDENTIAL_KEY
         || key == GVISOR_MODE_KEY
         || key == SLACK_TRUSTED_ORIGINS_KEY
 }
@@ -1816,6 +1890,20 @@ fn complete_up_opts_without_runner_egress(
     overlay_live: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    let sealing_source = format!("{}ExistingSecret", crate::sealing::SEALING_PRIVATE_KEY);
+    if preserved_value(existing, &sealing_source).is_some()
+        && final_operator_value(&opts, &sealing_source).is_some_and(str::is_empty)
+        && final_operator_value(&opts, crate::sealing::SEALING_PRIVATE_KEY)
+            .is_none_or(|value| value.is_empty())
+    {
+        return Err(crate::exit::CliError::usage(
+            "refusing to clear the active sealing private key source without an explicit replacement",
+        )
+        .with_fix(
+            "set sealing.privateKey to the replacement private key before clearing its source",
+        )
+        .into());
+    }
     opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets)?;
     let migrated_owned;
     let existing = if let Some(values) = existing {
@@ -1831,7 +1919,6 @@ fn complete_up_opts_without_runner_egress(
         stamp_target_schema(&mut opts);
         existing
     };
-    resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
@@ -1849,6 +1936,22 @@ fn complete_up_opts_without_runner_egress(
         // to the empty chart default (#1134, #1125). Preserve, never invent.
         opts.secrets
             .extend(resolve_preserved_values(existing, &operator_sets));
+    }
+    resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
+    let mut references =
+        resolve_credential_values(existing, &operator_sets, GITHUB_TOKEN_REFERENCE_KEYS);
+    if clear_github_token || github_token.is_some_and(|value| !value.is_empty()) {
+        for (_, value) in &mut references {
+            value.clear();
+        }
+    }
+    opts.secrets.extend(references);
+    if github_token.is_none_or(|value| value.is_empty()) {
+        opts.secrets.extend(
+            resolve_credential_values(existing, &operator_sets, &[GITHUB_TOKEN_KEY])
+                .into_iter()
+                .filter(|(_, value)| value.is_empty()),
+        );
     }
     opts.github_token =
         resolve_github_token(existing, &operator_sets, github_token, clear_github_token);
@@ -1896,6 +1999,17 @@ fn overlay_overridden_keys(
     let mut overridden = operator_set_keys(operator_sets);
     if let Some(values) = &opts.retained_mail_values {
         overridden.extend(values.1.keys().cloned());
+    }
+    for key in COMMS_MANAGED_KEYS
+        .iter()
+        .chain(GITHUB_APP_MANAGED_KEYS)
+        .chain(crate::sealing::SEALING_MANAGED_KEYS)
+        .chain(MODEL_CREDENTIAL_REFERENCE_KEYS)
+        .chain(GITHUB_TOKEN_REFERENCE_KEYS)
+        .chain(std::iter::once(&GITHUB_TOKEN_KEY))
+        .chain(std::iter::once(&MODEL_CREDENTIAL_KEY))
+    {
+        overridden.insert((*key).to_string());
     }
     overridden
 }
@@ -1975,7 +2089,10 @@ fn overlay_secret_refs(
         } else {
             format!("{prefix}.{key}")
         };
-        if is_external_secret_ref_key(&path) && !overridden.contains(&path) {
+        if is_external_secret_ref_key(&path)
+            && !overridden.contains(&path)
+            && !is_retained_mail_key(&path)
+        {
             match child {
                 serde_json::Value::String(raw) if raw.is_empty() => {}
                 serde_json::Value::String(raw) => opts
@@ -2045,6 +2162,9 @@ fn overlay_json(
                 return;
             }
             if prefix == "config.schemaVersion" || prefix == "config.migratedFrom" {
+                return;
+            }
+            if is_retained_mail_key(prefix) {
                 return;
             }
             if overridden.contains(prefix)
@@ -3918,8 +4038,9 @@ async fn run_prepared_up(
             SealingPrivateKeyDisposition::Deferred => {
                 ui.note("a live run discovers sealing state and preserves an existing private key or generates one when absent; skipped here to keep --dry-run offline");
             }
-            SealingPrivateKeyDisposition::OperatorSet | SealingPrivateKeyDisposition::Preserved => {
-            }
+            SealingPrivateKeyDisposition::OperatorSet
+            | SealingPrivateKeyDisposition::Preserved
+            | SealingPrivateKeyDisposition::External => {}
         }
         if existing.is_none() && !opts.common.dry_run {
             let generated_required_secrets = opts
@@ -3976,7 +4097,9 @@ async fn run_prepared_up(
             // recorded; on a fresh install (or an existing release that never
             // had one) there is nothing to remove, so the wording must not
             // claim there was.
-            if preserved_value(existing.as_ref(), GITHUB_TOKEN_KEY).is_some() {
+            if preserved_value(existing.as_ref(), GITHUB_TOKEN_KEY).is_some()
+                || effective_existing_secret(existing.as_ref(), &[], GITHUB_TOKEN_KEY)
+            {
                 // This is an incident-response verb, not a revocation: the
                 // running API keeps the old token until it restarts, and the
                 // token stays valid at GitHub until revoked there directly.
@@ -3997,6 +4120,14 @@ async fn run_prepared_up(
             } else {
                 ui.note("preserving the GitHub credential recorded by an earlier cluster up; pass --github-token to change it or --clear-github-token to remove it");
             }
+        }
+        GithubTokenPlan::Untouched
+            if opts
+                .secrets
+                .iter()
+                .any(|(key, value)| key == GITHUB_TOKEN_REFERENCE_KEYS[0] && !value.is_empty()) =>
+        {
+            ui.note("preserving the GitHub credential reference recorded by the release; pass --github-token to replace it or --clear-github-token to remove it");
         }
         GithubTokenPlan::Untouched => {
             // Distinct wording: an empty value with nothing recorded preserves
@@ -4087,7 +4218,7 @@ async fn run_prepared_up(
                     && !matches!(value.trim(), "" | "[]")
             });
     for (warn, msg) in model_egress_status_lines(
-        opts.credentials.is_some(),
+        model_credential_source_is_set(&opts),
         opts.local_model.is_some(),
         opts.fake_model,
         &opts.allow_egress_host,
@@ -8059,7 +8190,6 @@ fn ownership_labels(release: &str, install_namespace: &str) -> serde_json::Value
     serde_json::Value::Object(labels)
 }
 
-#[allow(dead_code)]
 fn model_credential_source_is_set(opts: &UpOpts) -> bool {
     opts.credentials.is_some()
         || final_operator_value(opts, MODEL_CREDENTIAL_REFERENCE_KEYS[0])
@@ -8081,7 +8211,6 @@ fn model_credential_source_is_set(opts: &UpOpts) -> bool {
             }))
 }
 
-#[allow(dead_code)]
 fn effective_existing_secret(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
