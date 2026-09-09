@@ -7284,7 +7284,6 @@ enum NamespaceProbe {
     Present(NamespaceRecord),
 }
 
-
 /// Whether the aborted gVisor preflight attempt left a Helm release that must
 /// be removed before the `security.gvisor.mode=off` retry.
 ///
@@ -7302,7 +7301,6 @@ fn should_discard_failed_gvisor_install(history: &[HelmRevision]) -> bool {
         .iter()
         .any(|row| is_eligible_rollback_status(&row.status))
 }
-
 
 /// Remove a never-deployed failed revision left by the aborted first Helm
 /// attempt so the gVisor-off retry is a clean install (#2347).
@@ -7366,7 +7364,6 @@ async fn discard_failed_gvisor_install_if_never_deployed(
         .into())
     }
 }
-
 
 async fn namespace_probe(namespace: &str) -> Result<NamespaceProbe> {
     let (ok, out, err) = run_capture(&namespace_get_cmd(namespace)).await?;
@@ -7443,7 +7440,6 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
     Ok(())
 }
 
-
 fn namespace_adoption_cmd(
     namespace: &str,
     release: &str,
@@ -7471,11 +7467,9 @@ fn namespace_adoption_cmd(
     ))
 }
 
-
 fn namespace_create_cmd() -> OpsCommand {
     OpsCommand::new("kubectl", vec![plain("create"), plain("-f"), plain("-")])
 }
-
 
 fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
     OpsCommand::new(
@@ -7491,7 +7485,6 @@ fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
     )
 }
 
-
 fn namespace_manifest(namespace: &str, release: &str) -> Result<Vec<u8>> {
     serde_json::to_vec(&serde_json::json!({
         "apiVersion": "v1",
@@ -7503,7 +7496,6 @@ fn namespace_manifest(namespace: &str, release: &str) -> Result<Vec<u8>> {
     }))
     .context("serializing the owned Namespace manifest")
 }
-
 
 fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe> {
     if output.trim().is_empty() {
@@ -7549,7 +7541,6 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
     }))
 }
 
-
 fn namespaced_resources_cmd() -> OpsCommand {
     OpsCommand::new(
         "kubectl",
@@ -7563,7 +7554,6 @@ fn namespaced_resources_cmd() -> OpsCommand {
     )
 }
 
-
 fn apiservices_cmd() -> OpsCommand {
     OpsCommand::new(
         "kubectl",
@@ -7575,7 +7565,6 @@ fn apiservices_cmd() -> OpsCommand {
         ],
     )
 }
-
 
 fn default_object_metadata(
     value: &serde_json::Value,
@@ -7637,13 +7626,11 @@ fn default_object_metadata(
         .all(|key| SERVER_METADATA.contains(&key.as_str()))
 }
 
-
 fn empty_json_value(value: &serde_json::Value) -> bool {
     value.is_null()
         || value.as_array().is_some_and(|items| items.is_empty())
         || value.as_object().is_some_and(|object| object.is_empty())
 }
-
 
 fn is_default_service_account(item: &serde_json::Value, namespace: &str) -> bool {
     let Some(object) = item.as_object() else {
@@ -7661,7 +7648,6 @@ fn is_default_service_account(item: &serde_json::Value, namespace: &str) -> bool
         matches!(key.as_str(), "apiVersion" | "kind" | "metadata") || empty_json_value(value)
     })
 }
-
 
 fn is_root_ca_config_map(item: &serde_json::Value, namespace: &str) -> bool {
     let Some(object) = item.as_object() else {
@@ -7697,7 +7683,6 @@ fn is_root_ca_config_map(item: &serde_json::Value, namespace: &str) -> bool {
     })
 }
 
-
 fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &str) -> bool {
     labels.is_empty()
         || (labels.len() == 1
@@ -7706,7 +7691,6 @@ fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &st
                 .map(String::as_str)
                 == Some(namespace))
 }
-
 
 async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
     verify_remote_apiservices_available(namespace).await?;
@@ -7777,7 +7761,6 @@ async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
     }
     Ok(())
 }
-
 
 async fn verify_remote_apiservices_available(namespace: &str) -> Result<()> {
     let (ok, output, err) = run_capture(&apiservices_cmd()).await?;
@@ -7855,7 +7838,6 @@ async fn verify_remote_apiservices_available(namespace: &str) -> Result<()> {
     Ok(())
 }
 
-
 #[allow(dead_code)]
 fn combine_install_and_bookkeeping_errors(
     install_error: anyhow::Error,
@@ -7880,7 +7862,6 @@ fn combine_install_and_bookkeeping_errors(
     .with_fix(fix)
     .into()
 }
-
 
 /// Preserve the existing create-only rule for the shared controller namespace.
 /// It is never adopted: only an object absent before Helm and present afterward
@@ -7911,7 +7892,6 @@ async fn stamp_created_controller_namespace(o: &CommonOpts, existed_before: bool
     Ok(())
 }
 
-
 #[allow(dead_code)]
 fn hook_jobs_cmd(o: &CommonOpts) -> OpsCommand {
     OpsCommand::new(
@@ -7932,7 +7912,6 @@ fn hook_jobs_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-
 #[allow(dead_code)]
 fn hook_jobs_delete_cmd(o: &CommonOpts, names: &[String]) -> OpsCommand {
     let mut args = vec![plain("delete"), plain("job")];
@@ -7944,7 +7923,6 @@ fn hook_jobs_delete_cmd(o: &CommonOpts, names: &[String]) -> OpsCommand {
     ]);
     OpsCommand::new("kubectl", args)
 }
-
 
 #[allow(dead_code)]
 fn parse_hook_job_names(output: &str, o: &CommonOpts) -> Result<Vec<String>> {
@@ -8016,7 +7994,6 @@ fn parse_hook_job_names(output: &str, o: &CommonOpts) -> Result<Vec<String>> {
     Ok(names.into_iter().collect())
 }
 
-
 /// Copy-pasteable equivalent of the dynamic hook cleanup. The selector first
 /// narrows to this release's Helm-managed Jobs; the go-template then emits only
 /// objects carrying Helm's hook annotation. Kubernetes object names cannot
@@ -8058,7 +8035,6 @@ fn hook_cleanup_resume_command(o: &CommonOpts) -> String {
     )
 }
 
-
 fn ownership_labels(release: &str, install_namespace: &str) -> serde_json::Value {
     let mut labels = serde_json::Map::new();
     labels.insert(
@@ -8071,7 +8047,6 @@ fn ownership_labels(release: &str, install_namespace: &str) -> serde_json::Value
     );
     serde_json::Value::Object(labels)
 }
-
 
 #[allow(dead_code)]
 fn model_credential_source_is_set(opts: &UpOpts) -> bool {
@@ -8095,7 +8070,6 @@ fn model_credential_source_is_set(opts: &UpOpts) -> bool {
             }))
 }
 
-
 #[allow(dead_code)]
 fn effective_existing_secret(
     existing: Option<&serde_json::Value>,
@@ -8112,4 +8086,3 @@ fn effective_existing_secret(
     }
     preserved_value(existing, &reference).is_some()
 }
-

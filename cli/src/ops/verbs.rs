@@ -690,7 +690,6 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
     }
 }
 
-
 pub(crate) enum MailVerdict {
     Fine,
     Unknown,
@@ -911,7 +910,6 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         ));
     }
     Ok(output)
-
 }
 
 /// Output of `cluster down`: the dry-run plan, an operator abort, or the removed

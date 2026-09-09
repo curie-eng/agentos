@@ -40,7 +40,12 @@ from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
-from .adapter import ModelSession, PartialMessageBoundary, StreamedToolUseBoundary, model_message_to_conversation
+from .adapter import (
+    ModelSession,
+    PartialMessageBoundary,
+    StreamedToolUseBoundary,
+    model_message_to_conversation,
+)
 from .approval import PUBLISH_TOOL_NAME, ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
