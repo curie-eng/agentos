@@ -800,9 +800,10 @@ A `local-release` rung repeats the local rung's exact round trip against the
 generated `compose.release.yaml` instead -- the artifact a release binary's
 `curie local up` actually runs -- so the CI config-only check on that file
 (`compose/generate_release_compose.py` + `docker compose config`) is not the
-only coverage it gets. It needs the release-pinned
-`ghcr.io/curie-eng/curie-api` and `-worker-local` images already built and
-tagged locally (it preflights and fails with a fix hint otherwise).
+only coverage it gets. It derives the required `ghcr.io/curie-eng/curie-*`
+image set from that artifact (including the dispatcher `local message`
+needs) and preflights that every ref is tagged locally, failing with the
+missing identity and a recovery action otherwise.
 
 Three env knobs configure it:
 

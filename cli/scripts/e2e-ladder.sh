@@ -69,11 +69,12 @@
 #                            `local-release` is a fourth, separately-named rung
 #                            (the same local round trip against the generated
 #                            compose.release.yaml instead of compose.dev.yaml);
-#                            it is NOT folded into `all` because it needs the
-#                            release-pinned images (ghcr.io/curie-eng/curie-api
-#                            and -worker-local) built and tagged locally first,
-#                            a step `all`'s existing skill/local/cluster rungs
-#                            don't require -- name it explicitly, e.g.
+#                            it is NOT folded into `all` because it needs every
+#                            curie-owned image the generated compose artifact
+#                            names (derived by compose/release_images.py)
+#                            built and tagged locally first, a step `all`'s
+#                            existing skill/local/cluster rungs don't require --
+#                            name it explicitly, e.g.
 #                            CURIE_E2E_TIERS=skill,local,local-release.
 #   CURIE_E2E_LIVE         1 = real model on every named rung, including
 #                            rung 1 (cli/scripts/e2e.sh reads this same var
@@ -4229,25 +4230,20 @@ rung_local_release() {
     # ghcr.io/curie-eng/curie-worker-local image, and curie-api/-migrate
     # were already a pull, never a build) -- every curie-owned image it needs
     # must already exist locally under the tag the generator pinned, or `local
-    # up` will try to pull a private GHCR image with no credentials. Check only
-    # the selected profile's images and
-    # only the curie-owned ones: postgres/valkey/rustfs are public and pulled
-    # on demand same as rung_local already assumes.
+    # up` will try to pull a private GHCR image with no credentials. Derive
+    # that set from this artifact (compose/release_images.py), including the
+    # slack profile: `curie local message` runs a one-shot dispatcher
+    # container from the same image with no slack profile (#1915, #2424).
+    # postgres/valkey/rustfs stay public and pulled on demand same as
+    # rung_local. Never pull a missing curie-owned tag.
     local compose_profile="core"
     if [[ -f "$WORKDIR/bundle-release/evals/trajectory.json" ]]; then
         compose_profile="full"
     fi
-    local missing=0 image
-    while IFS= read -r image; do
-        [[ "$image" == ghcr.io/curie-eng/curie-* ]] || continue
-        if ! docker image inspect "$image" >/dev/null 2>&1; then
-            echo "error: image '$image' is required by compose.release.yaml's $compose_profile profile and is not present locally." >&2
-            missing=1
-        fi
-    done < <(docker compose -f "$release_compose" \
-        --profile "$compose_profile" --profile slack config --images)
-    if (( missing )); then
-        echo "fix: build and tag the missing image(s) locally under the tag compose.release.yaml pins (see .github/workflows/ci.yaml's e2e-ladder job for the exact build+tag steps CI uses), then re-run." >&2
+    if ! python3 "$REPO_ROOT/compose/release_images.py" \
+        --compose "$release_compose" \
+        --profiles "$compose_profile,slack" \
+        --check; then
         return 1
     fi
 
