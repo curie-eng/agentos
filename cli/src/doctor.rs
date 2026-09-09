@@ -1057,6 +1057,10 @@ fn evaluate_with_worker_claims(
     // Socket mode needs BOTH tokens, and this check used to read only the bot
     // token while claiming both were recorded -- so a half-configured release
     // read as wired and the bot silently never connected.
+    //
+    // Unset Slack is different: `curie cluster message` already reaches the
+    // agent with zero Slack (#2497). Treating that as Missing made doctor
+    // report ready=false and "no way to be reached" after a live reply.
     let slack_fix = || {
         targeted("comms --slack", namespace, release) + " --app-token xapp-... --bot-token xoxb-..."
     };
@@ -1074,7 +1078,11 @@ fn evaluate_with_worker_claims(
             "only the bot token is recorded — socket mode needs both",
             slack_fix(),
         ),
-        (false, false) => missing("slack", "Slack", "no tokens recorded", slack_fix()),
+        (false, false) => skipped(
+            "slack",
+            "Slack",
+            "no tokens recorded; reachable with `curie cluster message`",
+        ),
     });
 
     out.push(match &f.clone_credential {
@@ -1227,8 +1235,8 @@ pub fn summary(checks: &[Check]) -> String {
             .to_string();
     }
     if !has("slack") {
-        return "Deployable to the cluster. Slack is not wired, so the agent has no \
-                way to be reached."
+        return "Deployable to the cluster. Slack is not wired; talk to the agent with \
+                `curie cluster message`."
             .to_string();
     }
     if !has("clone-credential") || !has("webhook") || state("repo-binding") == Some(State::Missing)
@@ -1550,7 +1558,7 @@ mod tests {
                     },
                     ..laptop()
                 },
-                "Slack is not wired",
+                "cluster message",
             ),
             (
                 Facts {
@@ -3231,8 +3239,9 @@ esac
         );
         assert_each_fix_targets(&checks, namespace, release);
 
-        // Fixture B: a release IS installed, and every downstream check is in
-        // its Missing state, so all four of the other cluster fixes fire.
+        // Fixture B: a release IS installed, and the git-push checks are in
+        // their Missing state. Unset Slack is optional (#2497), so it is not a
+        // cluster fix; half-configured Slack still is, in its own tests.
         let installed = Facts {
             target: Some((namespace.into(), release.into())),
             release: ReleaseProbe::Installed {
@@ -3248,8 +3257,8 @@ esac
         let checks = evaluate(&installed);
         assert_eq!(
             cluster_fix_ids(&checks),
-            BTreeSet::from(["clone-credential", "repo-binding", "slack", "webhook"]),
-            "an installed release produces exactly the four downstream fixes: {checks:?}"
+            BTreeSet::from(["clone-credential", "repo-binding", "webhook"]),
+            "unset Slack is not a cluster fix; git-push gaps still are: {checks:?}"
         );
         assert_each_fix_targets(&checks, namespace, release);
     }
@@ -4014,8 +4023,8 @@ esac
         assert!(out.release_not_serving());
     }
 
-    /// A deployed release with ready workloads stays ok. Missing Slack remains
-    /// a setup gap, not a serving failure, so doctor still exits 0 for that.
+    /// A deployed release with ready workloads stays ok. Unset Slack is
+    /// optional (#2497), not a serving failure, so doctor still exits 0.
     #[test]
     fn a_deployed_release_with_ready_workloads_stays_ok() {
         let mut f = probed(ReleaseProbe::Installed {
@@ -4028,7 +4037,7 @@ esac
         let checks = evaluate(&f);
         let release = find(&checks, "release");
         assert_eq!(release.state, State::Ok, "{}", release.detail);
-        assert_eq!(find(&checks, "slack").state, State::Missing);
+        assert_eq!(find(&checks, "slack").state, State::NotApplicable);
         let out = DoctorOutput {
             summary: summary(&checks),
             checks,
@@ -4287,6 +4296,21 @@ esac
             "{}",
             summary(&checks)
         );
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert_eq!(
+            out.to_json()["ready"],
+            serde_json::Value::Bool(false),
+            "broken configured Slack must still fail: {}",
+            out.to_json()
+        );
+        assert!(
+            out.summary.contains("cluster message"),
+            "the agent is still reachable without a working Slack socket: {}",
+            out.summary
+        );
     }
 
     /// The mirror case. An app token with no bot token is the same failure in
@@ -4318,6 +4342,16 @@ esac
             "{}",
             summary(&checks)
         );
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert_eq!(
+            out.to_json()["ready"],
+            serde_json::Value::Bool(false),
+            "broken configured Slack must still fail: {}",
+            out.to_json()
+        );
     }
 
     /// The positive path keeps its wording: both tokens recorded is Ok, with no
@@ -4330,17 +4364,98 @@ esac
         assert!(c.fix.is_none());
     }
 
-    /// Neither token keeps the original wording and stays fixable.
+    /// Unset Slack is optional on a serving release (#2497): cluster message
+    /// already reaches the agent, so the check is not a gap and must not force
+    /// `ready: false` or claim the agent cannot be reached.
     #[test]
-    fn no_tokens_recorded_is_reported_as_none() {
+    fn no_tokens_recorded_is_optional_and_points_at_cluster_message() {
         let f = Facts {
             slack_bot_token: false,
             slack_app_token: false,
             ..wired()
         };
-        let c = find(&evaluate(&f), "slack").clone();
-        assert_eq!(c.state, State::Missing);
-        assert_eq!(c.detail, "no tokens recorded");
+        let checks = evaluate(&f);
+        let c = find(&checks, "slack").clone();
+        assert_eq!(c.state, State::NotApplicable, "{}", c.detail);
+        assert!(
+            c.detail.contains("no tokens recorded"),
+            "still say what was observed: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("cluster message"),
+            "point at the Slack-free verb: {}",
+            c.detail
+        );
+        assert!(
+            c.fix.is_none(),
+            "do not send the operator to mint Slack: {c:?}"
+        );
+        let s = summary(&checks);
+        assert!(s.contains("cluster message"), "{s}");
+        assert!(s.contains("Slack is not wired"), "{s}");
+        assert!(
+            !s.contains("no way to be reached"),
+            "that claim is the bug: {s}"
+        );
+        assert!(
+            !s.contains("Answering in Slack"),
+            "Slack is unset, so do not claim it: {s}"
+        );
+        let out = DoctorOutput { summary: s, checks };
+        assert_eq!(
+            out.to_json()["ready"],
+            serde_json::Value::Bool(true),
+            "missing optional Slack must not force unreadiness: {}",
+            out.to_json()
+        );
+        assert_eq!(out.summary, out.to_json()["summary"]);
+    }
+
+    /// An absent release is still unready. Optional Slack must not paper over
+    /// a platform that is not there.
+    #[test]
+    fn an_absent_release_stays_unready_when_slack_is_unset() {
+        let f = Facts {
+            slack_app_token: false,
+            slack_bot_token: false,
+            release: ReleaseProbe::NotInstalled,
+            ..wired()
+        };
+        let checks = evaluate(&f);
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(false));
+        assert!(
+            !out.summary.contains("cluster message"),
+            "do not point at cluster message when there is no release: {}",
+            out.summary
+        );
+    }
+
+    /// helm/kubectl not answering is an unavailable cluster API, not optional
+    /// Slack. `ready` must stay false.
+    #[test]
+    fn a_failed_release_probe_stays_unready_when_slack_is_unset() {
+        let f = Facts {
+            slack_app_token: false,
+            slack_bot_token: false,
+            release: ReleaseProbe::ProbeFailed,
+            ..wired()
+        };
+        let checks = evaluate(&f);
+        let out = DoctorOutput {
+            summary: summary(&checks),
+            checks,
+        };
+        assert_eq!(out.to_json()["ready"], serde_json::Value::Bool(false));
+        assert!(
+            !out.summary.contains("no way to be reached"),
+            "{}",
+            out.summary
+        );
     }
 
     // -- D6b: curie.yaml precedence ------------------------------------------
