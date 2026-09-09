@@ -547,15 +547,17 @@ A BYO Postgres that enforces TLS (RDS with `rds.force_ssl=1`, Cloud SQL, Neon)
 also needs `postgres.sslMode: require` alongside `postgres.deploy: false` and
 `postgres.host`. One helper (`curie.postgres.dsnParams`) renders the per-driver
 suffix onto every DSN: `?ssl=require` for the api and worker (SQLAlchemy +
-asyncpg) and `?sslmode=no-verify` for both Langfuse Deployments (Prisma). The
+asyncpg) and `?sslmode=require&sslaccept=accept_invalid_certs` for both Langfuse
+Deployments (Prisma). Prisma accepts only `disable|prefer|require` for
+`sslmode`; `no-verify` is not in that set and is treated as `prefer`. The
 api migrate init container lifts `ssl=` out of the DSN into the asyncpg connect
 kwarg, because asyncpg's DSN parser would otherwise forward `ssl` as a server
 setting and the API would never leave init. `postgres.sslMode: require` against
 the in-chart Postgres fails the render: that StatefulSet serves no TLS
-listener. Neither suffix verifies the server certificate, so Langfuse traffic
-is encrypted but not authenticated; a `verify-full` mode needs a mounted CA
-bundle and is a second step. Leave `sslMode` empty (the default) for the
-in-cluster store: the rendered DSNs stay suffix-free.
+listener. Neither suffix verifies the server certificate, so api, worker, and
+Langfuse traffic is encrypted but not authenticated; a `verify-full` mode needs
+a mounted CA bundle and is a second step. Leave `sslMode` empty (the default)
+for the in-cluster store: the rendered DSNs stay suffix-free.
 
 Flipping `postgres.deploy` to `false` removes the in-cluster StatefulSet and
 Service. Helm does not delete a StatefulSet PVC, so if
