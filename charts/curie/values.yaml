@@ -357,14 +357,16 @@ postgres:
     password: postgres
     database: postgres
   existingSecret: ""
-  # TLS query parameter on every Postgres DSN (#2431). Empty (the default)
-  # renders no suffix, so an in-cluster install is unchanged on upgrade.
-  # "require" is for a BYO store that enforces TLS: SQLAlchemy/asyncpg gets
-  # ?ssl=require, Prisma/Langfuse gets ?sslmode=no-verify. Neither suffix
-  # verifies the server certificate; verify-full needs a mounted CA bundle
-  # and is a second step. require with deploy=true fails the render: the
-  # in-chart StatefulSet serves no TLS listener. Any other value fails at
-  # render. Read raw: Sprig default would swallow false and 0.
+  # TLS query parameter on every Postgres DSN (#2431, #2507). Empty (the
+  # default) renders no suffix, so an in-cluster install is unchanged on
+  # upgrade. "require" is for a BYO store that enforces TLS:
+  # SQLAlchemy/asyncpg gets ?ssl=require, Prisma/Langfuse gets
+  # ?sslmode=require&sslaccept=accept_invalid_certs. Neither suffix verifies
+  # the server certificate, so api, worker, and Langfuse traffic is
+  # encrypted but not authenticated; verify-full needs a mounted CA bundle
+  # and is a second step (#2508). require with deploy=true fails the render:
+  # the in-chart StatefulSet serves no TLS listener. Any other value fails
+  # at render. Read raw: Sprig default would swallow false and 0.
   sslMode: ""
   # fsGroup that owns the mounted data volume: the gid (and uid) of the
   # `postgres` user INSIDE the pinned image above, read with

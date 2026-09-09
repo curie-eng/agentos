@@ -162,11 +162,11 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
-{{/* Per-driver TLS query suffix for a Postgres DSN (#2431). ONE helper,
+{{/* Per-driver TLS query suffix for a Postgres DSN (#2431, #2507). ONE helper,
      included from BOTH curie.env.postgres (SQLAlchemy/asyncpg: ?ssl=require)
-     and curie.langfuse.env (Prisma/node-postgres: ?sslmode=no-verify): the
-     two driver families disagree on the spelling, so an operator cannot put
-     a suffix in postgres.auth.database.
+     and curie.langfuse.env (Prisma: ?sslmode=require&sslaccept=accept_invalid_certs):
+     the two driver families disagree on the spelling, so an operator cannot
+     put a suffix in postgres.auth.database.
 
      Empty (the default, and a missing key on --reuse-values of a release
      created before this existed) renders nothing, so an existing in-cluster
@@ -179,7 +179,12 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
      listener, so sslMode=require against it would break every consumer at
      once behind a healthy-looking manifest. Refuse at render, naming both
      keys. Neither rendered suffix verifies the server certificate; a
-     verify-full mode needs a mounted CA bundle and is a second step. */}}
+     verify-full mode needs a mounted CA bundle and is a second step (#2508).
+
+     Why not sslmode=no-verify for Prisma. Prisma/quaint accepts only
+     disable|prefer|require; an unknown value is logged at debug and treated
+     as prefer, so #2476's no-verify suffix did not enforce TLS. sslaccept=
+     accept_invalid_certs is the no-CA posture matching asyncpg ssl=require. */}}
 {{- define "curie.postgres.dsnParams" -}}
 {{- $root := required "curie.postgres.dsnParams requires root" .root -}}
 {{- $driver := required "curie.postgres.dsnParams requires driver" .driver -}}
@@ -193,7 +198,7 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- if $root.Values.postgres.deploy -}}
 {{- fail "postgres.sslMode is require but postgres.deploy is also true: the in-chart Postgres serves no TLS listener, so every consumer would fail to connect. Set postgres.deploy=false and point postgres.host at your external TLS store, or leave postgres.sslMode empty." -}}
 {{- end -}}
-{{- if eq $driver "asyncpg" -}}?ssl=require{{- else -}}?sslmode=no-verify{{- end -}}
+{{- if eq $driver "asyncpg" -}}?ssl=require{{- else -}}?sslmode=require&sslaccept=accept_invalid_certs{{- end -}}
 {{- else -}}
 {{- fail (printf "postgres.sslMode must be empty or \"require\", got %q" (printf "%v" $mode)) -}}
 {{- end -}}
