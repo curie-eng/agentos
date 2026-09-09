@@ -5477,6 +5477,37 @@
           "name": "wire-tolerance"
         },
         {
+          "about": "Bounded synthetic restore drill for #2427: back up postgres, bundles, mail SQLite, and Valkey from a disposable compose install, restore onto a distinct target, and refuse an omitted or corrupt component (`bash cli/scripts/restore-drill.sh`). Not a production backup product and not an RPO/RTO claim",
+          "args": [
+            {
+              "global": false,
+              "help": "Validate an existing backup directory without starting a stack",
+              "id": "check_backup",
+              "long": "check-backup",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "JSON object of separately supplied key names. Required with --check-backup",
+              "id": "supplied_config",
+              "long": "supplied-config",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Omit this required component and expect the completeness guard to refuse",
+              "id": "negative",
+              "long": "negative",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "restore-drill"
+        },
+        {
           "about": "Set the release version across cli/Cargo.toml + Chart.yaml version/appVersion (and refresh the CLI lockfile) so a release cut can't leave the three out of sync. Does not commit or tag",
           "args": [
             {

@@ -728,6 +728,7 @@ release binary has no dev scripts.
 | `curie dev field-parity` | `bash cli/scripts/check-field-parity.sh` -- assert CLI `api.rs` mirror structs cover their platform API model fields (#691), and CLI `commands.rs`/`spec.rs` mirror structs cover the frozen `packages/plugin-format` schema's fields (#701). |
 | `curie dev emit-parity` | `bash cli/scripts/check-emit-parity.sh` -- assert a `CliOutput::to_json` that hand-projects a mirror struct into a `json!` literal covers that struct's fields, one hop downstream of `field-parity` (#699). |
 | `curie dev wire-tolerance` | `bash scripts/check-wire-tolerance.sh` -- assert every direct `ClassName.model_validate*(...)` call on an `_AciModel` subclass threads `READER_CONTEXT` or is a declared exception (#625). |
+| `curie dev restore-drill` | `bash cli/scripts/restore-drill.sh` -- bounded synthetic restore of postgres, bundles, mail SQLite, and Valkey from a disposable compose install onto a distinct target (#2427). `--check-backup` is the completeness guard; `--negative` omits a required component and expects refusal. Not an RPO/RTO claim or a production backup product. |
 
 Use `curie dev verify-fix-pin <CHANGE> <SELECTOR>` from a source checkout to
 verify a fix commit or pull request. `<CHANGE>` accepts a committed change
