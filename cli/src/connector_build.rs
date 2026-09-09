@@ -1639,6 +1639,42 @@ pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// The secret NAMES a hosted connector's SANDBOX must also receive (#2503).
+///
+/// These are the names the derived `Authorization: Bearer ${NAME}` header on
+/// the mounted `.mcp.json` entry expands from: the expansion happens in the
+/// sandbox where the MCP client runs, not in the connector pod, so a name that
+/// only reaches the pod's `secretKeyRef` ships the literal `${NAME}` and the
+/// server answers 401.
+///
+/// Scope, deliberately narrower than [`hosted_secret_names`]:
+/// - A connector Curie itself runs -- one declaring `image:` or `build:` -- is
+///   the only one whose credential this box resolves and delivers. A
+///   `unhosted_url:` override still points at that same connector's image
+///   declaration, so it stays in scope; a pure `url:` remote is the MCP
+///   client's own config and is not.
+/// - `SecretDecl::Name` only. A `SecretDecl::Ref` names a Secret someone else
+///   provisioned, which ADR-0090 keeps out of the deploy path entirely -- no
+///   value for it exists here to bind.
+/// - No `secret_files` and no `sealed_secrets`: those are file mounts and
+///   out-of-band material, never a sandbox env var a header can expand.
+///
+/// Sorted and deduped. Names only; no value ever travels through this seam.
+pub fn hosted_env_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for spec in decl.connectors.values() {
+        if spec.image.is_none() && spec.build.is_none() {
+            continue;
+        }
+        for declared in &spec.secrets {
+            if let SecretDecl::Name(name) = declared {
+                names.insert(name.clone());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// The non-`CURIE_`-prefixed names a connector secret must never claim.
 ///
 /// The twin of `_CREDENTIAL_KEYS | _REDIRECT_CAPTURE_KEYS` in
@@ -1736,4 +1772,115 @@ pub fn refuse_out_of_band_secrets(connector: &str, spec: &ConnectorSpecDecl) -> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hosted_env_secret_names_tests {
+    use super::*;
+
+    fn decl(document: &str) -> ConnectorsFileDecl {
+        parse_connectors(document).expect("fixture connectors.yaml should parse")
+    }
+
+    #[test]
+    fn image_connector_yields_bare_names_only() {
+        // #2503: the sandbox must receive exactly the names the derived
+        // `Bearer ${NAME}` header expands. A `SecretRef` names a Secret
+        // somebody else provisioned, which ADR-0090 keeps out of this path,
+        // and a `secret_files` entry is a file mount, never an env var.
+        let decl = decl(
+            r#"
+connectors:
+  gh:
+    image: ghcr.io/example/gh:1
+    secrets:
+      - A
+      - name: B
+        from_secret: s
+        key: k
+    secret_files:
+      C: /x
+"#,
+        );
+        assert_eq!(hosted_env_secret_names(&decl), vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn remote_url_connector_is_excluded() {
+        // A pure `url:` remote is the MCP client's own config; Curie resolves
+        // and delivers no credential for it, so binding its name would put an
+        // unrelated value in the sandbox env.
+        let decl = decl(
+            r#"
+connectors:
+  remote:
+    url: https://mcp.example.com/sse
+    secrets:
+      - REMOTE_TOKEN
+"#,
+        );
+        assert!(hosted_env_secret_names(&decl).is_empty());
+    }
+
+    #[test]
+    fn unhosted_url_override_on_an_image_connector_stays_included() {
+        // `unhosted_url:` only points at an already-running instance of the
+        // SAME declared image, so the credential is still Curie's to deliver.
+        let decl = decl(
+            r#"
+connectors:
+  gh:
+    image: ghcr.io/example/gh:1
+    unhosted_url: http://127.0.0.1:9000/mcp
+    secrets:
+      - GITHUB_PERSONAL_ACCESS_TOKEN
+"#,
+        );
+        assert_eq!(
+            hosted_env_secret_names(&decl),
+            vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()]
+        );
+    }
+
+    #[test]
+    fn two_hosted_connectors_sharing_a_name_dedupe_and_sort() {
+        // The result keys a bind map, so a duplicate must collapse and the
+        // order must be deterministic rather than connector-declaration order.
+        let decl = decl(
+            r#"
+connectors:
+  zeta:
+    image: ghcr.io/example/zeta:1
+    secrets:
+      - SHARED
+      - ZETA_ONLY
+  alpha:
+    build:
+      context: ./alpha
+      platforms:
+        - linux/amd64
+    secrets:
+      - SHARED
+      - ALPHA_ONLY
+"#,
+        );
+        assert_eq!(
+            hosted_env_secret_names(&decl),
+            vec![
+                "ALPHA_ONLY".to_string(),
+                "SHARED".to_string(),
+                "ZETA_ONLY".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bundle_without_a_connectors_file_binds_nothing() {
+        // The overwhelmingly common bundle. It must add no names at all, so
+        // the #464 gate and the sandbox bind set are unchanged for it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let loaded = load(dir.path()).expect("a bundle with no connectors.yaml loads as empty");
+        assert!(hosted_env_secret_names(&loaded).is_empty());
+        assert!(hosted_env_secret_names(&ConnectorsFileDecl::default()).is_empty());
+    }
 }

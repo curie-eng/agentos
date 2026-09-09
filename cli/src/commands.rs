@@ -1552,7 +1552,12 @@ const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 /// fake/local model run: a bundle's authed MCP server needs its token
 /// regardless of which model drives the session. Names already present (a user
 /// passing a model-credential var as a secret) are not duplicated.
-fn merge_secret_env(mut passthrough: Vec<String>, secrets: &[String]) -> Vec<String> {
+///
+/// Also the union used for the connector-owned secret NAMES resolved from a
+/// bundle's `connectors.yaml` (#2503): same order-preserving dedupe, so the
+/// explicit `--secret` order wins and an owned name already named by a flag is
+/// bound once.
+pub fn merge_secret_env(mut passthrough: Vec<String>, secrets: &[String]) -> Vec<String> {
     for name in secrets {
         if !passthrough.contains(name) {
             passthrough.push(name.clone());
@@ -4560,14 +4565,15 @@ async fn prepare_deploy_with_commit_sha(
     // failure names the operator's own directory rather than a temp path, and
     // long before anything is applied. `opts.plugin_dir` (not the canonicalized
     // copy) is the path they typed.
+    let connector_decl = crate::connector_build::load(&plugin_dir)?;
     {
-        let decl = crate::connector_build::load(&plugin_dir)?;
+        let decl = &connector_decl;
         if decl.connectors.values().any(|spec| spec.build.is_some()) {
-            let recomputed = recompute_source_digests(&plugin_dir, &decl)?;
+            let recomputed = recompute_source_digests(&plugin_dir, decl)?;
             let lock = crate::connector_build::load_lock(&plugin_dir)?;
             lock_preflight(
                 &opts.plugin_dir,
-                &decl,
+                decl,
                 lock.as_ref(),
                 &recomputed,
                 opts.tier,
@@ -4576,7 +4582,7 @@ async fn prepare_deploy_with_commit_sha(
             // claims about it, is what a node has to pull (see
             // `registry_preflight`). Cluster only: no local deploy pulls this.
             if opts.tier == DeployTier::Cluster {
-                run_registry_preflight(&decl, lock.as_ref()).await?;
+                run_registry_preflight(decl, lock.as_ref()).await?;
             }
         }
     }
@@ -4598,9 +4604,27 @@ async fn prepare_deploy_with_commit_sha(
     // name-set diff on `opts.secret` (the bound NAME set) and needs no packed
     // bundle or resolved values, so a declared-but-unbound policy fails fast
     // without doing any of that work.
+    // The NAMES this deploy will actually bind into the agent sandbox: the
+    // explicit `--secret` flags, plus every env-var secret the bundle's hosted
+    // connectors declare (#2503). Curie resolves those itself, so a
+    // plugin.json-declared name that connectors.yaml already auto-binds is not
+    // a gap and must not be diffed against the flags alone -- the #464 gate
+    // below would otherwise refuse a deploy that needs no flag. A manifest
+    // secret nothing binds still fails, unchanged.
+    let connector_env_secret_names =
+        crate::connector_build::hosted_env_secret_names(&connector_decl);
+    // Automatic delivery of connectors.yaml secrets exists only for
+    // DeployTier::Cluster (#2503 follow-up); `local deploy` has no delivery
+    // path yet, so its effective set must stay exactly `opts.secret`.
+    let effective_secret_names = if opts.tier == DeployTier::Cluster {
+        merge_secret_env(opts.secret.clone(), &connector_env_secret_names)
+    } else {
+        opts.secret.clone()
+    };
+
     if opts.secret_binding_supported {
         let declared = read_declared_secrets(&plugin_dir)?;
-        let unbound = unbound_declared_secrets(&declared, &opts.secret);
+        let unbound = unbound_declared_secrets(&declared, &effective_secret_names);
         if !unbound.is_empty() {
             return Err(crate::exit::usage(format!(
                 "{plugin_name} declares connector secret(s) that were not bound on deploy: {}. \
@@ -4756,7 +4780,17 @@ async fn prepare_deploy_with_commit_sha(
             archive,
             &match opts.tier {
                 DeployTier::Local => secrets.clone(),
-                DeployTier::Cluster => crate::cluster_secrets::agent_record_secrets(&secrets),
+                // Names-only placeholders over the EFFECTIVE set, not just
+                // the resolved `--secret` values: the worker keys
+                // `inject_connector_secrets` -- and with it the per-agent
+                // sandbox pool routing -- off this map, so a connector secret
+                // missing from it lands the claim on the generic pool with no
+                // connector env at all (#2503). The connector's own value is
+                // resolved cluster-scoped later (#1913) and reaches the pod
+                // through the per-agent Helm Secret, never through the record.
+                DeployTier::Cluster => {
+                    crate::cluster_secrets::agent_record_secret_names(&effective_secret_names)
+                }
             },
             opts.repo.as_deref(),
             commit_sha.as_deref(),
@@ -8721,6 +8755,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gate_accepts_a_declared_name_that_connectors_yaml_auto_binds() {
+        // #2503 x #464: the gate diffs the declared names against the
+        // EFFECTIVE bind set, not the `--secret` flags alone. A name Curie
+        // itself resolves from connectors.yaml is bound, so a deploy that
+        // needs no flag must not be refused.
+        let declared = vec!["GH".to_string()];
+        let effective = super::merge_secret_env(vec![], &["GH".to_string()]);
+        assert!(
+            super::unbound_declared_secrets(&declared, &effective).is_empty(),
+            "an auto-bound connector secret is not a gap"
+        );
+    }
+
+    #[test]
+    fn gate_still_reports_a_name_bound_by_neither_source() {
+        // The gate must not go vacuous: a manifest secret that neither a
+        // `--secret` flag nor connectors.yaml binds still fails the deploy.
+        let declared = vec!["GH".to_string(), "SLACK".to_string()];
+        let effective = super::merge_secret_env(vec![], &["GH".to_string()]);
+        assert_eq!(
+            super::unbound_declared_secrets(&declared, &effective),
+            vec!["SLACK".to_string()]
+        );
+    }
+
+    #[test]
+    fn secret_env_binds_owned_connector_name_with_no_explicit_flag() {
+        // #2503: a hosted connector's declared GITHUB_PERSONAL_ACCESS_TOKEN
+        // must reach the sandbox env with zero `--secret` flags, so the
+        // derived `Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}` header (ADR-0009 /
+        // #1488 delivery path) expands instead of sending a literal `${...}`.
+        assert_eq!(
+            merge_secret_env(vec![], &["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()]),
+            vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn deploy_fails_when_declared_secret_is_not_bound() {
         // AC3: a declared secret NAME with no matching --secret binding fails the
@@ -8755,6 +8827,90 @@ mod tests {
         assert!(
             !rendered.contains("UNREACHABLE-HINT-SENTINEL"),
             "gate must fire before any network attempt (no connect hint): {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_local_tier_still_refuses_a_connectors_yaml_auto_bound_secret() {
+        // #2503 round-2 review finding: automatic hosted-connector secret
+        // delivery is Cluster-only (no sandbox delivery path on Local yet), so
+        // a bundle that declares GH in plugin.json AND connectors.yaml, with no
+        // `--secret` flag, must still be refused on `local deploy` -- the same
+        // bundle passes the gate on `cluster deploy` (see the paired test
+        // below). This drives the real gate through `deploy()`, not the pure
+        // helper functions.
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_with_secrets(dir.path(), "test-agent", &["GH"]);
+        write_manifest(
+            dir.path(),
+            "connectors.yaml",
+            "connectors:\n  gh:\n    image: ghcr.io/example/gh:1\n    secrets:\n      - GH\n",
+        );
+
+        let opts = super::DeployOpts {
+            agent: None,
+            target: None,
+            plugin_dir: dir.path().to_path_buf(),
+            api_url: "http://127.0.0.1:1".to_string(),
+            api_key: "k".to_string(),
+            slack_channel: None,
+            repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
+            env: Some(super::DeployEnv::Dev),
+            label: Some("v0".to_string()),
+            secret: vec![],
+            secret_binding_supported: true,
+            connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Local,
+        };
+        let err = super::deploy(opts).await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("GH"),
+            "local deploy has no auto-delivery path, so the gate must still name GH: {rendered}"
+        );
+        assert!(
+            !rendered.contains("UNREACHABLE-HINT-SENTINEL"),
+            "the gate must fire before any network attempt: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_cluster_tier_passes_the_gate_on_a_connectors_yaml_auto_bound_secret() {
+        // The paired case: the SAME bundle (GH declared in both plugin.json and
+        // connectors.yaml, no `--secret` flag) reaches the network on Cluster,
+        // because the effective bind set there is the union with
+        // `hosted_env_secret_names`, not `opts.secret` alone.
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_with_secrets(dir.path(), "test-agent", &["GH"]);
+        write_manifest(
+            dir.path(),
+            "connectors.yaml",
+            "connectors:\n  gh:\n    image: ghcr.io/example/gh:1\n    secrets:\n      - GH\n",
+        );
+
+        let opts = super::DeployOpts {
+            agent: None,
+            target: None,
+            plugin_dir: dir.path().to_path_buf(),
+            api_url: "http://127.0.0.1:1".to_string(),
+            api_key: "k".to_string(),
+            slack_channel: None,
+            repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
+            env: Some(super::DeployEnv::Dev),
+            label: Some("v0".to_string()),
+            secret: vec![],
+            secret_binding_supported: true,
+            connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Cluster,
+        };
+        let err = super::deploy(opts).await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("declares connector secret(s) that were not bound on deploy"),
+            "cluster's effective bind set auto-includes GH via connectors.yaml, \
+             so the gate must pass and the error must be the network path: {rendered}"
         );
     }
 

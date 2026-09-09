@@ -671,3 +671,31 @@ def test_an_agent_name_that_only_looks_like_the_join_still_mounts(tmp_path: Path
     assert servers["grafana"]["url"] == (
         "http://curie-mcp-x-mcp-grafana.curie.svc.cluster.local:8000/mcp"
     )
+
+
+# --------------------------------------------------------------------------- #
+# What the sandbox actually mounts for an authenticated hosted server -- #2503
+#
+# github-mcp-server's HTTP transport authenticates the client: GitHub's docs
+# require `Authorization: Bearer <PAT>` on every request, and without it the
+# tool-capability probe logs `MCP tool-capability probe failed` and the agent
+# lists no `mcp__github__*` tool at all. This file is the one that pins what
+# the runner hands the MCP client, so the header has to be provable here and
+# not only in plugin-format.
+# --------------------------------------------------------------------------- #
+GITHUB = (
+    "connectors:\n"
+    "  github:\n"
+    "    image: ghcr.io/github/github-mcp-server:v0.20.1\n"
+    "    secrets: [GITHUB_PERSONAL_ACCESS_TOKEN]\n"
+)
+
+_BEARER = {"Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"}
+
+
+def test_the_mounted_hosted_server_carries_the_declared_credential(tmp_path: Path) -> None:
+    # The credential name is the only thing the author writes; the header, like
+    # the URL, is derived. `${VAR}` is expanded by the MCP client from the
+    # sandbox environment, so nothing resolved is written to disk here.
+    servers = derive_mcp_servers(_bundle(tmp_path, GITHUB), **SCOPE)
+    assert servers["github"]["headers"] == _BEARER

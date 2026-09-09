@@ -683,6 +683,12 @@ pub struct PreparedConnectorSync {
     result: ConnectorSync,
     secret_name: Option<String>,
     secret_keys: Vec<String>,
+    /// The connector-owned secret VALUES as resolved for THIS cluster scope
+    /// (#1913). Retained so `cluster deploy` binds the sandbox with the very
+    /// same credential the connector pod receives rather than re-resolving the
+    /// name from the environment or unscoped host storage, which can differ.
+    /// Private: nothing outside this module may take ownership of a value.
+    secret_values: BTreeMap<String, String>,
     secret_sources: BTreeMap<String, String>,
     target: SecretScope,
     bound_target: Option<ClusterTarget>,
@@ -695,6 +701,15 @@ impl PreparedConnectorSync {
         }
         self.bound_target = Some(target);
         Ok(self)
+    }
+
+    /// The connector-owned secrets, keyed by NAME, with the cluster-scoped
+    /// value already resolved for the deploy's target. Read by `cluster deploy`
+    /// to bind those names into the agent sandbox (#2503) with the scoped value
+    /// -- one cluster, one credential (#1913) -- instead of resolving the name
+    /// a second time from a possibly stale environment.
+    pub fn owned_secret_values(&self) -> &BTreeMap<String, String> {
+        &self.secret_values
     }
 
     pub fn write_intent(&self) -> Option<String> {
@@ -765,6 +780,7 @@ pub fn prepare(
     let mut objects = Vec::new();
     let mut secret_name = None;
     let mut secret_keys = Vec::new();
+    let mut secret_values = BTreeMap::new();
     let mut secret_sources = BTreeMap::new();
 
     if let Some((name, keys)) = owned_secret(owned_secret_name, owned_secret_keys) {
@@ -772,6 +788,7 @@ pub fn prepare(
         objects.push(render_secret(&name, &target.namespace, &values));
         secret_name = Some(name);
         secret_keys = keys;
+        secret_values = values;
         secret_sources = sources;
     }
     objects.extend_from_slice(manifests);
@@ -802,6 +819,7 @@ pub fn prepare(
         result,
         secret_name,
         secret_keys,
+        secret_values,
         secret_sources,
         target: target.clone(),
         bound_target: None,
@@ -822,6 +840,7 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         mut result,
         secret_name,
         secret_keys,
+        secret_values: _,
         secret_sources,
         target,
         bound_target,
