@@ -7,7 +7,6 @@ and copied into the dated spike report. Delete this file once #2509 lands.
 
 from __future__ import annotations
 
-import os
 import shutil
 import sqlite3
 import time
@@ -29,11 +28,17 @@ NO_PREDICATE = "1=1"  # negative control: proves the tests discriminate
 
 
 def compact_terminal_completions(
-    connection: sqlite3.Connection, *, cap: int, incoming: int = 0, predicate: str = TERMINAL_PREDICATE_OR
+    connection: sqlite3.Connection,
+    *,
+    cap: int,
+    incoming: int = 0,
+    predicate: str = TERMINAL_PREDICATE_OR,
 ) -> int:
     """Oldest-first bounded eviction of terminal completion rows; returns rows evicted."""
     count = int(
-        connection.execute(f"SELECT count(*) FROM completion_events WHERE {predicate}").fetchone()[0]
+        connection.execute(f"SELECT count(*) FROM completion_events WHERE {predicate}").fetchone()[
+            0
+        ]
     )
     excess = count + incoming - cap
     if excess <= 0:
@@ -86,11 +91,15 @@ def pages(state: MailState) -> dict[str, int]:
         "freelist": fl,
         "used_bytes": ps * (pc - fl),
         "file_bytes": state.path.stat().st_size,
-        "wal_bytes": Path(f"{state.path}-wal").stat().st_size if Path(f"{state.path}-wal").exists() else 0,
+        "wal_bytes": Path(f"{state.path}-wal").stat().st_size
+        if Path(f"{state.path}-wal").exists()
+        else 0,
     }
 
 
-def open_state(path: Path, *, max_bytes: int = 4 * 1024 * 1024, max_pending: int = 1000) -> MailState:
+def open_state(
+    path: Path, *, max_bytes: int = 4 * 1024 * 1024, max_pending: int = 1000
+) -> MailState:
     return MailState(str(path), max_pending=max_pending, max_bytes=max_bytes)
 
 
@@ -128,7 +137,9 @@ def test_t1_transitions_produce_distinct_row_signatures(tmp_path: Path) -> None:
     assert state.claim_event("ev-expired", "thr", "msg", "ownerA") == "claimed"
     set_lease = time.time() - 1
     with state.transaction() as c:
-        c.execute("UPDATE completion_events SET lease_until=? WHERE event_id='ev-expired'", (set_lease,))
+        c.execute(
+            "UPDATE completion_events SET lease_until=? WHERE event_id='ev-expired'", (set_lease,)
+        )
     assert state.claim_event("ev-expired", "thr", "msg", "ownerB") == "claimed"
 
     table = rows(state)
@@ -330,7 +341,9 @@ def test_t3c_evicted_delivered_row_with_lost_witness_sends_an_empty_duplicate(
     assert len(client.replies) == 3  # ev2 sent once only
 
 
-def test_t3d_evicted_delivered_row_and_evicted_reply_state_is_502_no_send(stub_adapter: Any) -> None:
+def test_t3d_evicted_delivered_row_and_evicted_reply_state_is_502_no_send(
+    stub_adapter: Any,
+) -> None:
     adapter, client = stub_adapter
     _admit_turn(adapter, "thr", "msg")
     assert adapter.send_reply("ev1", "thr", "msg") == 200
@@ -340,7 +353,7 @@ def test_t3d_evicted_delivered_row_and_evicted_reply_state_is_502_no_send(stub_a
         c.execute("DELETE FROM reply_state WHERE conversation_id='thr'")
     assert adapter.send_reply("ev1", "thr", "msg") == 502
     assert len(client.replies) == 1
-    print("\nT3d evicted row + evicted reply_state + no witness: 502, no send (worker retries forever)")
+    print("\nT3d evicted row + evicted reply_state + no witness: 502, no send")
 
 
 def test_t3e_retained_tombstone_is_410_without_provider(stub_adapter: Any) -> None:
@@ -375,7 +388,7 @@ def test_t3f_evicted_tombstone_replays_through_provider_404(stub_adapter: Any) -
     client.thread_status, client.thread_messages = 200, []
     assert adapter.send_reply("ev1", "thr", "msg") == 200
     assert len(client.replies) == 1
-    print("\nT3f evicted tombstone: provider 404 -> 410; ambiguity -> 502; thread resurrected -> empty send")
+    print("\nT3f evicted tombstone: 404 -> 410; ambiguity -> 502; resurrected -> empty send")
 
 
 # --------------------------------------------------------------------------
@@ -393,7 +406,9 @@ def _fill_until_full(state: MailState, prefix: str) -> int:
         # Withdraw the probe so only completion rows fill the file.
         with state.transaction() as c:
             c.execute("DELETE FROM deliveries WHERE message_id=?", (f"{prefix}-probe-{n}",))
-        state.claim_event(f"{prefix}-{n:07d}", "conversation-" + "x" * 40, "reply-" + "y" * 40, "owner")
+        state.claim_event(
+            f"{prefix}-{n:07d}", "conversation-" + "x" * 40, "reply-" + "y" * 40, "owner"
+        )
         state.finish_event(f"{prefix}-{n:07d}")
         n += 1
         assert n < 200_000
@@ -502,7 +517,9 @@ def test_t4c_offline_copy_recovery_procedure_leaves_the_live_file_untouched(tmp_
     print("\nT4c copy recovered:", copy.stat().st_size, "bytes; live still", live.stat().st_size)
 
 
-def test_t4d_auto_vacuum_full_shrinks_without_vacuum_but_only_on_a_fresh_file(tmp_path: Path) -> None:
+def test_t4d_auto_vacuum_full_shrinks_without_vacuum_but_only_on_a_fresh_file(
+    tmp_path: Path,
+) -> None:
     """Candidate alternative: auto_vacuum=FULL set before the schema is created."""
     fresh = tmp_path / "fresh.sqlite3"
     raw = sqlite3.connect(fresh)
@@ -553,7 +570,9 @@ def test_t5_per_turn_growth_by_table(tmp_path: Path) -> None:
         state.accept_ingress(mid)
     after_deliveries = used()
     for i in range(n):
-        state.record_text(f"thr-{i:06d}", f"msg-{i:06d}", "answer " * 20, append=False, max_bytes=1 << 20)
+        state.record_text(
+            f"thr-{i:06d}", f"msg-{i:06d}", "answer " * 20, append=False, max_bytes=1 << 20
+        )
         state.finish_reply(f"thr-{i:06d}", f"msg-{i:06d}")
     after_reply_state = used()
     for i in range(n):
@@ -568,6 +587,11 @@ def test_t5_per_turn_growth_by_table(tmp_path: Path) -> None:
     retained_turn = state.connection.execute(
         "SELECT length(turn_json) FROM deliveries WHERE state='accepted' LIMIT 1"
     ).fetchone()[0]
-    print("\nT5 bytes per turn by table:", per, "| accepted row still holds turn_json bytes:", retained_turn)
+    print(
+        "\nT5 bytes per turn by table:",
+        per,
+        "| accepted row still holds turn_json bytes:",
+        retained_turn,
+    )
     assert retained_turn > 2000  # the mail body survives acceptance
     state.close()
