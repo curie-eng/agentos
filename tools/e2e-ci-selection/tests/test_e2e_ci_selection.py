@@ -706,7 +706,6 @@ def test_released_upgrade_candidate_images_opt_into_forward_only_migrations() ->
     candidate_upgrade_steps = (
         "Upgrade the legacy release to the candidate chart",
         "Upgrade a second time and preserve the generated attester",
-        "Upgrade the v0.8.4 release to the candidate chart",
         "Existing cluster rung smoke on the upgraded candidate",
     )
     for name in candidate_upgrade_steps:
@@ -714,6 +713,13 @@ def test_released_upgrade_candidate_images_opt_into_forward_only_migrations() ->
         assert "helm upgrade curie charts/curie -n curie" in run
         assert "--set api.image.tag=upgrade-candidate" in run
         assert "--set api.migrate.forwardOnly=true" in run
+
+    migrated_upgrade = named_steps[
+        "Upgrade the v0.8.4 release to the candidate chart"
+    ]["run"]
+    assert '"$CURIE_BIN" cluster up' in migrated_upgrade
+    assert "--forward-only" in migrated_upgrade
+    assert "--set api.image.tag=upgrade-candidate" in migrated_upgrade
 
 
 def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> None:
@@ -767,12 +773,25 @@ def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> Non
 
     upgrade_run = named_steps["Upgrade the v0.8.4 release to the candidate chart"]["run"]
     assert "kubectl delete deploy/curie-worker -n curie" in upgrade_run
-    assert "helm upgrade curie charts/curie -n curie" in upgrade_run
-    assert "--reset-then-reuse-values" in upgrade_run
+    assert '"$CURIE_BIN" cluster up' in upgrade_run
+    assert "--chart charts/curie --namespace curie --release curie" in upgrade_run
+    assert "--forward-only" in upgrade_run
+    assert "--reset-then-reuse-values" not in upgrade_run
+    assert "--set worker.deliveryBudgetSeconds=1800" in upgrade_run
+    assert "--set worker.terminationGracePeriodSeconds=1860" in upgrade_run
     assert (
         "--set worker.image.repository=curie-worker "
         "--set worker.image.tag=upgrade-candidate"
     ) in upgrade_run
+    assert "helm get values curie -n curie -o json" in upgrade_run
+    for migration_assertion in (
+        ".worker.runnerTotalTimeoutSeconds == 1700",
+        ".worker.deliveryBudgetSeconds == 1800",
+        '.name == "CURIE_RUNNER_TOTAL_TIMEOUT_S"',
+        '.config.schemaVersion == "0.9.0"',
+        '.config.migratedFrom | startswith("0.8")',
+    ):
+        assert migration_assertion in upgrade_run
 
     parity_run = named_steps[
         "Verify live-manifest parity and target-version convergence"

@@ -383,6 +383,7 @@ def build_runner(
             cwd=workspace_cwd,
             web_search_enabled=web_search_enabled,
             policy_disallowed_tools=policy_hidden_tools,
+            disallowed_tools=config.disallowed_tools,
         )
 
     sdk_generation = 0
@@ -403,6 +404,7 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
+                disallowed_tools=config.disallowed_tools,
             )
         assert real_options is not None
         nonlocal sdk_generation

@@ -795,7 +795,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
 
     let helm_status = helm_status_cmd(&opts);
     let pods = pods_cmd(&opts);
-    let (helm, pods_read, observed, fullname, host, computed, worker_claim_probe) = tokio::join!(
+    let (helm, pods_read, observed, fullname, host, computed, worker_claim_probe, mut upgrade) = tokio::join!(
         run_capture(&helm_status),
         run_capture(&pods),
         convergence::observe(&opts),
@@ -806,6 +806,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
             fetch_release_computed_values(&opts),
         ),
         crate::worker_claims::select_cluster(&opts.namespace, &opts.release),
+        super::upgrade::load_upgrade_status(&opts.namespace, &opts.release, None),
     );
     let computed = computed.unwrap_or_else(|_| {
         Err(crate::exit::CliError::failure("timed out reading computed Helm values").into())
@@ -929,13 +930,10 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         None => crate::completion_outbox::Report::unknown(),
     };
 
-    let chart_version = helm_ok.then(|| field("CHART:", "").trim().to_string());
-    let upgrade = super::upgrade::load_upgrade_status(
-        &opts.namespace,
-        &opts.release,
-        chart_version.filter(|v| !v.is_empty()),
-    )
-    .await;
+    if upgrade.known_good_version.is_none() && helm_ok {
+        upgrade.known_good_version =
+            Some(field("CHART:", "")).filter(|version| !version.trim().is_empty());
+    }
 
     let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
@@ -3678,6 +3676,19 @@ async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentD
     preferred_probe_outcome(api, worker)
 }
 
+/// The per-process memo behind [`release_fullname`]. One
+/// [`tokio::sync::OnceCell`] per `(namespace, release)`, handed out under a std
+/// mutex that is never held across an await.
+type ReleaseFullnameCache = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String),
+        std::sync::Arc<tokio::sync::OnceCell<ReleaseFullname>>,
+    >,
+>;
+
+static RELEASE_FULLNAME_CACHE: std::sync::LazyLock<ReleaseFullnameCache> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// The release's fullname: discovered from the cluster, falling back to the
 /// chart's no-override rule.
 ///
@@ -3701,17 +3712,53 @@ async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentD
 /// and `--dry-run` paths, which are contractually cluster-offline
 /// (`cli/tests/cluster_connection_transport.rs`). Under `--dry-run`, call
 /// [`chart_fullname`] directly and make no cluster call at all.
+///
+/// MEMOIZED for the lifetime of the process, keyed by `(namespace, release)`.
+/// A single verb resolves the same release's fullname from several places --
+/// `doctor` asks once through `discover_api_url` and again through
+/// `api_nodeport`, and `cluster status` needs it for two Service reads -- and
+/// each of those was a separate kubectl round trip for an answer the process
+/// already had. The [`tokio::sync::OnceCell`] also dedups CONCURRENT callers,
+/// so two probes joined into one stage issue one discovery between them rather
+/// than racing to make the same call twice.
+///
+/// Two consequences, both deliberate:
+///
+/// - The fallback warning is emitted ONCE per process instead of once per
+///   call. It says the rendered name could not be discovered, which is a fact
+///   about the run, not about the call site; repeating it per caller was noise.
+/// - Every outcome is cached, the [`chart_fullname`] fallback included. That is
+///   safe because no verb resolves a fullname both BEFORE and AFTER mutating
+///   the cluster within one process: `cluster up` and `cluster down` never call
+///   this (they name chart resources through the chart's own templates), so
+///   there is no window in which a cached miss could outlive the install that
+///   would have turned it into a hit.
 pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname {
-    match discover_release_fullname(namespace, release).await {
-        ComponentDiscovery::Found(fullname) => fullname,
-        outcome => {
-            let fallback = chart_fullname(release);
-            if let Some(warning) = outcome.fallback_warning(namespace, release, &fallback) {
-                crate::ui::ui().warn(&warning);
+    // The std mutex is held only long enough to hand back this key's cell --
+    // never across the await below, which is what would deadlock the runtime.
+    let cell = {
+        let mut cache = RELEASE_FULLNAME_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entry((namespace.to_string(), release.to_string()))
+            .or_default()
+            .clone()
+    };
+    cell.get_or_init(|| async {
+        match discover_release_fullname(namespace, release).await {
+            ComponentDiscovery::Found(fullname) => fullname,
+            outcome => {
+                let fallback = chart_fullname(release);
+                if let Some(warning) = outcome.fallback_warning(namespace, release, &fallback) {
+                    crate::ui::ui().warn(&warning);
+                }
+                fallback
             }
-            fallback
         }
-    }
+    })
+    .await
+    .clone()
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
@@ -3878,10 +3925,14 @@ pub async fn discover_api_url(namespace: &str, release: &str) -> Result<String> 
     // This function is only reached when no `--api-url` was supplied, so it is
     // already a cluster path: resolving the fullname here keeps the explicit
     // `--api-url` and `--dry-run` routes free of any kubectl call.
-    let fullname = release_fullname(namespace, release).await;
+    //
+    // The host lookup needs no fullname, so it runs alongside the resolution
+    // rather than behind it -- the same idiom as
+    // `cluster_observability_endpoints`. Only the Service reads below have to
+    // wait for the name.
+    let (fullname, host) = tokio::join!(release_fullname(namespace, release), resolve_node_host());
     let ui_svc = fullname.resource("ui");
     let api_svc = fullname.resource("api");
-    let host = resolve_node_host().await;
 
     if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, &fullname, "ui")).await {
         return ui_api_url_from_parts(&ui_json, host.as_deref());

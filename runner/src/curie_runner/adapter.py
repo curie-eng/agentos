@@ -348,10 +348,17 @@ def build_options(
     # install has always said and must keep saying.
     thinking_option: dict[str, Any] = {"thinking": cast("Any", thinking)} if thinking else {}
     cwd_option: dict[str, Any] = {"cwd": cwd} if cwd is not None else {}
-    merged_disallowed = set(policy_disallowed_tools)
-    if disallowed_tools:
-        merged_disallowed.update(disallowed_tools)
-    disallowed_tools = sorted(merged_disallowed)
+    # The explicit operator denylist is an ordered configuration surface. Keep
+    # its order stable, then append the policy projection deterministically.
+    # A set-only merge reordered CURIE_DISALLOWED_TOOLS and broke parity with
+    # the fake session; filtering the policy tail also deduplicates names that
+    # both sources deny without changing the operator's declared order.
+    explicit_disallowed = list(dict.fromkeys(disallowed_tools or ()))
+    explicit_names = set(explicit_disallowed)
+    disallowed_tools = [
+        *explicit_disallowed,
+        *sorted(set(policy_disallowed_tools) - explicit_names),
+    ]
     if not web_search_enabled:
         disallowed_tools = [
             "WebSearch",

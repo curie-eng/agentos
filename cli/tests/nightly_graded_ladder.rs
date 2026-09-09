@@ -146,7 +146,7 @@ fn validate_bundle_json(dir: &Path) -> serde_json::Value {
             "-c",
             "import sys\n\
              from plugin_format import validate_bundle\n\
-             print(validate_bundle(sys.argv[1]).model_dump_json())\n",
+             print(validate_bundle(sys.argv[1], enforces_tool_policy='curie/mcp-tool-policy@1').model_dump_json())\n",
         ])
         .arg(dir)
         .output()
@@ -2892,8 +2892,8 @@ fn mcp_receipt_setup_leaves_a_valid_owned_weather_bundle_and_refuses_a_rerun() {
 
 /// #2423: the connector-fixture setup overwrites connectors.yaml on the
 /// sre-bot scratch copy. It must also own the matching approval gates so the
-/// scratch bundle stays valid; dangling k8s-scale / self-upgrade gates are
-/// the live connector-lane boot failure.
+/// scratch bundle stays valid. The self-upgrade fixture must retain both of
+/// its gates while gates for every unhosted connector are removed.
 #[test]
 fn connector_fixture_setup_owns_consistent_approval_gates() {
     if Command::new("uv").arg("--version").output().is_err() {
@@ -2929,15 +2929,13 @@ fn connector_fixture_setup_owns_consistent_approval_gates() {
         .iter()
         .map(|gate| gate["gate"].as_str().expect("gate name").to_string())
         .collect();
-    assert!(
-        gates.iter().any(|gate| gate.contains("k8s-write")),
-        "the fixture still hosts k8s-write, so its gate must remain: {gates:?}"
-    );
-    assert!(
-        gates
-            .iter()
-            .all(|gate| !gate.contains("k8s-scale") && !gate.contains("self-upgrade")),
-        "gates for connectors the fixture does not host must be dropped from the owned scratch copy: {gates:?}"
+    assert_eq!(
+        gates,
+        vec![
+            "mcp__self-upgrade__upgrade_self".to_string(),
+            "mcp__self-upgrade__upgrade_platform".to_string(),
+        ],
+        "the owned scratch copy must retain exactly the gates for the hosted self-upgrade connector"
     );
 
     let result = validate_bundle_json(&bundle);
