@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.2.json",
+  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.3.json",
   "title": "curie cluster status --json",
   "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), any `warnings` (diagnoses that could not be made, which never affect `healthy`), and an overall `healthy` verdict.",
   "$defs": {
@@ -195,6 +195,33 @@
           "items": {
             "type": "string"
           }
+        },
+        "delivery": {
+          "description": "Completion-outbox inventory from the worker. Count, oldest age, and retry/terminal state. Identifiers are omitted. A retrying owed completion makes `healthy` false even when pods are ready and stream lag is zero.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "count": { "type": "integer" },
+            "oldest_age_s": { "type": "number" },
+            "inflight": { "type": "integer" },
+            "retry": { "type": "integer" },
+            "terminal": { "type": "integer" },
+            "state": {
+              "enum": ["empty", "inflight", "retry", "unknown"]
+            },
+            "degraded": { "type": "boolean" },
+            "detail": { "type": "string" }
+          },
+          "required": [
+            "count",
+            "oldest_age_s",
+            "inflight",
+            "retry",
+            "terminal",
+            "state",
+            "degraded",
+            "detail"
+          ]
         },
         "healthy": {
           "type": "boolean"

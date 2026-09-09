@@ -48,9 +48,9 @@
 //!    the deploy/sts ready-replica listing and the exact-label worker pod
 //!    selection;
 //! 5. the api Service NodePort read, which needs the fullname (a cache hit, so
-//!    no second discovery), alongside the worker status exec, which needs the
-//!    selected Running pod. The NodePort read only happens because the values
-//!    carry no ingress.
+//!    no second discovery), alongside the worker claim-status exec and the
+//!    completion-outbox exec, which need the selected Running pod. The NodePort
+//!    read only happens because the values carry no ingress.
 //!
 //! Step 2's helm hop is the second rung of `ops::discover_api_key`'s ladder:
 //! the Secret name listing answers empty, so the key is looked for in Helm's
@@ -148,6 +148,9 @@ RULES = {
     ("kubectl", ("exec", "-n", "curie", "curie-worker-current", "--", "python", "-m",
                  "curie_worker.upgrade_drain", "--mode", "status", "--json")):
         '{"state":"claims_enabled","since":null,"revision":null}\n',
+    ("kubectl", ("exec", "-n", "curie", "curie-worker-current", "--", "python", "-m",
+                 "curie_worker.completion_health", "--json")):
+        '{"count":0,"oldest_age_s":0.0,"inflight":0,"retry":0,"terminal":0,"state":"empty","degraded":false}\n',
     # -- resolve_node_host fallback (defensive; must not fire) -------------
     ("kubectl", ("get", "nodes", "-o", "json")): '{"items":[]}\n',
 
@@ -326,7 +329,7 @@ fn probe_stages(log: &str) -> (usize, usize, Vec<String>, Vec<String>) {
     (intervals.len(), stages, duplicates, unexpected)
 }
 
-/// `expected_calls` pins the documented probe set from the module doc (14 for
+/// `expected_calls` pins the documented probe set from the module doc (16 for
 /// `doctor`, 10 for `cluster status`) exactly, so a probe silently added or
 /// dropped fails here rather than only showing up as a stage-count wobble.
 fn assert_fanout(
@@ -447,7 +450,7 @@ fn doctor_fans_out_independent_probes() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    assert_fanout("doctor", &fixture, 5, 15, wall_ms);
+    assert_fanout("doctor", &fixture, 5, 16, wall_ms);
 }
 
 /// `curie cluster status` must issue helm status, the pod list, convergence,

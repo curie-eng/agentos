@@ -207,6 +207,16 @@ selector_pods = {
     ]
 }
 
+is_outbox_exec = "exec" in args and has_sequence([
+    "python", "-m", "curie_worker.completion_health", "--json"
+])
+if is_outbox_exec:
+    if tool == "kubectl" and "acme-claims-worker-current" not in args:
+        print("outbox probe selected a hook or non-running pod", file=sys.stderr)
+        sys.exit(64)
+    sys.stdout.write('{"count":0,"oldest_age_s":0.0,"inflight":0,"retry":0,"terminal":0,"state":"empty","degraded":false}\n')
+    sys.exit(0)
+
 is_claim_exec = "exec" in args and has_sequence([
     "python", "-m", "curie_worker.upgrade_drain", "--mode", "status", "--json"
 ])
@@ -558,6 +568,7 @@ fn assert_existing_cluster_status_shape(value: &serde_json::Value) {
     assert_eq!(
         keys,
         BTreeSet::from([
+            "delivery",
             "healthy",
             "namespace",
             "pods",

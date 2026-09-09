@@ -13,6 +13,7 @@ pub mod chat;
 pub mod cluster_secrets;
 pub mod commands;
 pub mod comms;
+pub mod completion_outbox;
 pub mod connector_build;
 pub mod connectors;
 pub mod credcheck;

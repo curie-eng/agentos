@@ -177,6 +177,7 @@ pub struct Facts {
     /// unreachable, since a load balancer or tunnel in front is invisible here.
     pub api_exposure: Option<String>,
     pub mail_channels: Vec<crate::mail_channel::Report>,
+    pub completion_outbox: Option<crate::completion_outbox::Report>,
 }
 
 fn ok(id: &'static str, title: &'static str, detail: impl Into<String>) -> Check {
@@ -865,6 +866,7 @@ fn evaluate_with_worker_claims(
             ("clone-credential", "Clone credential"),
             ("webhook", "Webhook exposure"),
             ("repo-binding", "Repo binding"),
+            ("completion-outbox", "Completion delivery"),
         ] {
             out.push(skipped(id, title, "needs a cluster"));
         }
@@ -965,6 +967,7 @@ fn evaluate_with_worker_claims(
             ("clone-credential", "Clone credential"),
             ("webhook", "Webhook exposure"),
             ("repo-binding", "Repo binding"),
+            ("completion-outbox", "Completion delivery"),
         ] {
             out.push(skipped(id, title, reason));
         }
@@ -1031,6 +1034,25 @@ fn evaluate_with_worker_claims(
             fix: report.fix.clone(),
         });
     }
+
+    out.push(match &f.completion_outbox {
+        None => skipped(
+            "completion-outbox",
+            "Completion delivery",
+            "completion outbox not observed",
+        ),
+        Some(report) if report.healthy() => ok(
+            "completion-outbox",
+            "Completion delivery",
+            report.detail.clone(),
+        ),
+        Some(report) => missing(
+            "completion-outbox",
+            "Completion delivery",
+            report.detail.clone(),
+            "inspect worker completion delivery; do not clear the outbox to make this check pass",
+        ),
+    });
 
     // Socket mode needs BOTH tokens, and this check used to read only the bot
     // token while claiming both were recorded -- so a half-configured release
@@ -4424,6 +4446,49 @@ esac
     /// #1663 established that a floating pin is Ok-with-a-fix and must never
     /// make a working install read as unready.
     #[test]
+    fn an_owed_completion_outbox_is_missing_and_an_empty_one_is_ok() {
+        let empty = crate::completion_outbox::Report {
+            count: 0,
+            oldest_age_s: 0.0,
+            inflight: 0,
+            retry: 0,
+            terminal: 0,
+            state: crate::completion_outbox::State::Empty,
+            degraded: false,
+            detail: "completion outbox: state empty; count 0".into(),
+        };
+        let owed = crate::completion_outbox::Report {
+            count: 4,
+            oldest_age_s: 3600.0,
+            inflight: 0,
+            retry: 4,
+            terminal: 0,
+            state: crate::completion_outbox::State::Retry,
+            degraded: true,
+            detail: "completion outbox: state retry; count 4".into(),
+        };
+        let ok_checks = evaluate(&Facts {
+            completion_outbox: Some(empty),
+            ..wired()
+        });
+        let ok_check = find(&ok_checks, "completion-outbox");
+        assert_eq!(ok_check.state, State::Ok);
+        let missing_checks = evaluate(&Facts {
+            completion_outbox: Some(owed),
+            agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
+            ..wired()
+        });
+        let missing = find(&missing_checks, "completion-outbox");
+        assert_eq!(missing.state, State::Missing);
+        assert!(missing.detail.contains("retry"));
+        assert!(missing
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("do not clear the outbox"));
+    }
+
+    #[test]
     fn ready_is_false_when_any_check_is_missing() {
         let clean = Facts {
             agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
@@ -4809,7 +4874,8 @@ async fn gather_with_worker_claims(
     // values, and worker exec needs the selected pod. Run them together so no
     // independent subprocess waits behind another.
     let needs_api_nodeport = api_values_needing_nodeport.is_some();
-    let (mail_channels, nodeport, worker_claims) = tokio::join!(
+    let selected_worker = worker_claim_probe.selected_pod().map(str::to_string);
+    let (mail_channels, nodeport, worker_claims, completion_outbox) = tokio::join!(
         async {
             if !mail_enabled {
                 return None;
@@ -4828,10 +4894,17 @@ async fn gather_with_worker_claims(
             }
         },
         worker_claim_probe.observe(),
+        async {
+            match selected_worker.as_deref() {
+                Some(pod) => Some(crate::completion_outbox::observe_exec(namespace, pod).await),
+                None => None,
+            }
+        },
     );
     if let Some(reports) = mail_channels {
         f.mail_channels = reports;
     }
+    f.completion_outbox = completion_outbox;
     if let Some(values) = api_values_needing_nodeport.as_ref() {
         f.api_exposure = api_exposure_from_values(values, nodeport);
     }

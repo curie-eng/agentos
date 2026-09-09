@@ -1886,6 +1886,7 @@ fn doctor_output_validates() {
         slack_bot_token: true,
         clone_credential: Some("github app (app_id=1234567)".to_string()),
         mail_channels: vec![],
+        completion_outbox: None,
         api_exposure: None,
         agents: Some(vec![("bot".to_string(), None)]),
     };
@@ -1959,6 +1960,7 @@ fn doctor_ready_tracks_the_checks() {
         slack_bot_token: true,
         clone_credential: Some("github app (secret=gh-app)".to_string()),
         mail_channels: vec![],
+        completion_outbox: None,
         api_exposure: Some("NodePort 30799".to_string()),
         agents: Some(vec![("bot".to_string(), Some("acme/bot".to_string()))]),
     };
@@ -2404,6 +2406,7 @@ fn cluster_status_output_validates_both_variants() {
         warnings: vec![],
         pods_listed: true,
         urls: vec![],
+        delivery: curie::completion_outbox::Report::unknown(),
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());

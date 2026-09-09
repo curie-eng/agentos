@@ -7,6 +7,7 @@ MISS  Bundle in this directory   no .claude-plugin/plugin.json
 ok    Cluster                    doctor-stub-context (reached)
 ok    Curie release              curie (curie-0.8.2)
 --    Mail channel token         mail adapter not deployed
+ok    Completion delivery        completion outbox: state empty; count 0; inflight 0; retry 0; terminal 0; oldest age 0s
 MISS  Slack                      no tokens recorded
       → curie cluster comms --slack --namespace curie --release curie --app-token xapp-... --bot-token xoxb-...
 MISS  Clone credential           none — a private repo cannot be cloned, so git-push deploys will fail

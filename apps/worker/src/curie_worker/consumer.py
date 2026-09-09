@@ -52,10 +52,12 @@ from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
 from redis.asyncio import Redis
 
+from .completion_health import observe_completion_outbox
 from .config import WorkerConfig
 from .consumer_liveness import ConsumerLivenessStore
 from .delivery_lease import DeliveryLeaseStore, LeaseLostError
 from .kernel import Kernel, _thread_key_for
+from .markers import Markers
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 from .upgrade_drain import UpgradeDrainGate
 
@@ -625,7 +627,14 @@ class Consumer(StreamConsumer):
             # It still runs when an unrelated maintenance action fails; the
             # observer contains and logs its own failures.
             await self._observe_queue_state()
+            await self._observe_completion_outbox()
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    async def _observe_completion_outbox(self) -> None:
+        """Publish completion-outbox gauges; observation never settles records."""
+
+        markers = Markers(self._valkey, self._config)
+        await observe_completion_outbox(markers, self._valkey, self._config)
 
     async def _drain_thread_reset_requests(self) -> None:
         """Force-release any thread whose sandbox an operator requested reset
